@@ -150,6 +150,30 @@ def build_voiceover(plan: dict):
     return b.tl
 
 
+def build_montage(plan: dict):
+    """Shots on V1, the soundtrack (music from its chosen start, or the reference's sound) on A1."""
+    fps = float(plan["fps"])
+    audio = plan.get("audio") or {}
+    name = Path(audio.get("path") or plan.get("reference") or "montage").stem
+    b = _Builder(f"{name} ({plan.get('kind', 'montage')})", plan["width"], plan["height"], fps)
+    for c in plan.get("clips", []):
+        b.durations[c["path"]] = float(c.get("duration", 0))
+    v1 = b.track("V1", "video")
+    total = 0
+    for s in plan.get("shots", []):
+        frames = int(s.get("frames", 0))
+        if frames <= 0:
+            continue
+        c = b.clip(s["clip"], float(s["in"]), frames / fps)
+        c.source_range = b.otio.opentime.TimeRange(b.rt(round(float(s["in"]) * fps)), b.rt(frames))
+        v1.append(c)
+        total += frames
+    if audio.get("path"):
+        a1 = b.track("Soundtrack", "audio")
+        a1.append(b.clip(audio["path"], float(audio.get("start", 0)), total / fps))
+    return b.tl
+
+
 def captions_srt(plan: dict) -> str | None:
     cap = plan.get("captions")
     if not cap or not cap.get("words"):
@@ -168,13 +192,15 @@ def build(plan: dict):
         return build_autocut(plan)
     if mode == "voiceover":
         return build_voiceover(plan)
+    if mode == "montage":
+        return build_montage(plan)
     raise ac.AutocutError(f"unknown plan mode {mode!r}")
 
 
 def export_plan_file(plan_path: Path, out: Path | None = None) -> Path:
     plan = json.loads(plan_path.read_text())
     tl = build(plan)
-    stem = plan_path.name.replace(".vo.plan.json", "").replace(".plan.json", "").replace(".json", "")
+    stem = plan_path.name.replace(".montage.json", "").replace(".vo.plan.json", "").replace(".plan.json", "").replace(".json", "")
     out = out or plan_path.with_name(stem + ".otio")
     _otio().adapters.write_to_file(tl, str(out))
     ac.log(f"OTIO written: {out}")

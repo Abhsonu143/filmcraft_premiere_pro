@@ -1,4 +1,4 @@
-//! FilmCraft desktop app.
+//! EI desktop app.
 //!
 //! Usage: `filmcraft [--control <port>] [--demo|--empty] [--recover|--no-recover] [--data-dir <dir>]
 //! [project.fcproj | media files…]`; `--help` prints the options, `--version` the version. An
@@ -67,7 +67,7 @@ fn tell(text: &str, error: bool) {
     #[cfg(all(target_os = "windows", not(debug_assertions)))]
     {
         let level = if error { rfd::MessageLevel::Error } else { rfd::MessageLevel::Info };
-        let _ = rfd::MessageDialog::new().set_level(level).set_title("FilmCraft").set_description(text).show();
+        let _ = rfd::MessageDialog::new().set_level(level).set_title("EI").set_description(text).show();
     }
 }
 
@@ -92,7 +92,7 @@ fn main() -> eframe::Result {
         }
     };
     let log_dir = data_dir.clone().or_else(default_data_dir).map(|d| d.join(logging::LOG_DIR));
-    log::info!("FilmCraft {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    log::info!("EI {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
     // The log file lives next to the crash logs; opened after the arguments, so `--help`,
     // `--version` and usage errors leave no file behind. Records logged until now go in first.
     if let Some(logger) = logger {
@@ -114,7 +114,7 @@ fn main() -> eframe::Result {
     register_hardware_decoders();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("FilmCraft")
+            .with_title("EI")
             .with_inner_size([1600.0, 980.0])
             .with_min_inner_size([900.0, 560.0])
             .with_drag_and_drop(true)
@@ -137,7 +137,7 @@ fn main() -> eframe::Result {
         options
     };
     let started = eframe::run_native(
-        "FilmCraft",
+        "EI",
         options,
         Box::new(move |cc| {
             let mut session = Session::default();
@@ -211,7 +211,7 @@ fn main() -> eframe::Result {
             }));
             app.hooks.pick_save = Some(Box::new(|name: &str| {
                 rfd::FileDialog::new()
-                    .add_filter(filmcraft_ui_egui::i18n::t("FilmCraft Project"), &["fcproj"])
+                    .add_filter(filmcraft_ui_egui::i18n::t("EI Project"), &["fcproj"])
                     .set_file_name(name)
                     .save_file()
                     .map(|p| p.to_string_lossy().to_string())
@@ -236,10 +236,7 @@ fn main() -> eframe::Result {
                 rfd::FileDialog::new().add_filter(filmcraft_ui_egui::i18n::t(filter), exts).pick_file().map(|p| p.to_string_lossy().to_string())
             }));
             app.hooks.pick_open_project = Some(Box::new(|| {
-                rfd::FileDialog::new()
-                    .add_filter(filmcraft_ui_egui::i18n::t("FilmCraft Project"), &["fcproj"])
-                    .pick_file()
-                    .map(|p| p.to_string_lossy().to_string())
+                rfd::FileDialog::new().add_filter(filmcraft_ui_egui::i18n::t("EI Project"), &["fcproj"]).pick_file().map(|p| p.to_string_lossy().to_string())
             }));
             #[cfg(target_os = "macos")]
             {
@@ -258,10 +255,10 @@ fn main() -> eframe::Result {
     // The window could not be created (no usable GPU / graphics driver, no display): say so
     // instead of exiting silently, and keep the reason in the crash log.
     if let Err(e) = &started {
-        let msg = format!("FilmCraft could not start its window: {e}\n\nUpdating the graphics driver usually fixes this.");
+        let msg = format!("EI could not start its window: {e}\n\nUpdating the graphics driver usually fixes this.");
         log::error!("{msg}");
         filmcraft_ui_egui::crash::record(&msg);
-        let _ = rfd::MessageDialog::new().set_title("FilmCraft").set_description(&msg).set_level(rfd::MessageLevel::Error).show();
+        let _ = rfd::MessageDialog::new().set_title("EI").set_description(&msg).set_level(rfd::MessageLevel::Error).show();
     }
     started
 }

@@ -96,7 +96,7 @@ fn is_mogrt(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".mogrt")
 }
 
-const MOGRT: &str = "FilmCraft does not open Adobe .mogrt files (or other applications' template packages); it reads only its own .fcgt graphics templates";
+const MOGRT: &str = "EI does not open Adobe .mogrt files (or other applications' template packages); it reads only its own .fcgt graphics templates";
 
 /// Find a template by id, name (case-insensitive) or `.fcgt` path.
 pub fn find_template(s: &Session, key: &str) -> Result<LibraryEntry> {

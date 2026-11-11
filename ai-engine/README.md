@@ -40,7 +40,43 @@ ffmpeg -hide_banner -filters  | grep -w subtitles    # burned-in captions (libas
 The first run that uses captions downloads Whisper small (~480 MB). The first footage match
 downloads CLIP ViT-B/32 (~350 MB). Both land in `~/.cache/huggingface`. After that, everything works offline.
 
+## In the EI app
+
+Everything below is also on EI's **AI** menu (dialogs, progress window, results opened in the
+timeline). Build and set-up steps are in [docs/building-ei.md](docs/building-ei.md). The app runs
+`ei_engine.py`, the single entry point that wraps all the tools in this folder.
+
 ## Modes
+
+### 0. Split a long video: `split_video.py`
+
+```sh
+.venv/bin/python split_video.py long.mp4 --out-dir clips/ --clip-len 60          # same quality, no re-encode
+.venv/bin/python split_video.py long.mp4 --out-dir clips/ --quality exact        # exact lengths
+```
+
+`same` (default) copies the streams, so quality is identical and it's very fast (a 10-minute 1080p file
+splits in under a second). Each cut lands on the next keyframe, so clips can run up to one keyframe
+interval longer. `exact` re-encodes with the hardware encoder at the source bitrate for frame-exact lengths.
+`high`/`medium`/`small` re-encode at 16/8/4 Mb/s. A tail shorter than 1 s joins the last clip.
+
+### Montage: `montage.py`
+
+```sh
+# many short clips + a song -> 30 s vertical edit on the beat
+.venv/bin/python montage.py music --clips clips/ --music song.mp3 --length 30 --aspect vertical --out edit.mp4
+# same soundtrack and cut timing as a reference video, with your clips
+.venv/bin/python montage.py reference ref.mp4 --clips clips/ --out like_ref.mp4
+```
+
+- **music:** finds the beats (accurate to about 15 ms on a test track) and uses the loudest stretch of
+  the song. Shots change every 1/2/4/8 beats (`--pace fast|medium|slow`). Busy clip moments go on strong
+  beats; dark and frozen moments are skipped; no moment is used twice. The music fades in and out and is
+  loudness-normalised.
+- **reference:** detects the reference's cuts (scene changes) and keeps its audio unchanged. For each
+  reference shot it picks the clip moment that looks most like it (CLIP image similarity; `--no-clip` for
+  motion only) and moves like it. The output keeps the reference's size by default.
+- Plan: `<out>.montage.json` (edit `shots`, then `montage.py render`); `<out>.otio` for the timeline.
 
 ### 1. Talking head: `autocut.py`
 

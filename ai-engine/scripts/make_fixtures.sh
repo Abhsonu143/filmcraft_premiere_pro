@@ -37,3 +37,21 @@ rm -f "$OUT/landscape.mp4"
 ffmpeg -hide_banner -loglevel error -y -f lavfi -i "sine=f=261.63:d=40" -f lavfi -i "sine=f=329.63:d=40" -f lavfi -i "sine=f=392:d=40" \
   -filter_complex "amix=inputs=3,volume=0.6,tremolo=f=2:d=0.3" -c:a aac -b:a 128k "$OUT/music.m4a"
 echo "fixtures in $OUT/"; ls -la "$OUT"
+
+# Montage material: a 120 BPM beat track (kick on every beat, louder second half) and short clips
+# with different motion; one nearly black and one frozen, which the editor should avoid.
+ffmpeg -hide_banner -loglevel error -y -f lavfi \
+  -i "aevalsrc='(0.5+0.4*gt(t,30))*sin(2*PI*55*t)*exp(-25*mod(t,0.5))+0.08*sin(2*PI*440*t)*(1+sin(2*PI*0.25*t))':s=44100:d=60" \
+  -c:a aac -b:a 160k "$OUT/beat120.m4a"
+mkdir -p "$OUT/shorts"
+i=0
+for src in "testsrc2=size=1280x720:rate=30" "mandelbrot=size=1280x720:rate=30" "life=size=1280x720:rate=30:mold=10:ratio=0.1" \
+           "cellauto=size=1280x720:rate=30:rule=110" "rgbtestsrc=size=1280x720:rate=30" "smptehdbars=size=1280x720:rate=30" \
+           "color=c=0x101010:size=1280x720:rate=30" "testsrc=size=720x1280:rate=30" "gradients=size=1280x720:rate=30:speed=0.05"; do
+  i=$((i+1))
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "$src" -t $((3 + i % 5)) -an -c:v h264_videotoolbox -b:v 3M "$OUT/shorts/clip$i.mp4"
+done
+# A reference edit: 4 shots with hard cuts over the beat track (stand-in for a video you like).
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=red:size=1080x1920:rate=30:d=2" -f lavfi -i "color=c=blue:size=1080x1920:rate=30:d=1.5" \
+  -f lavfi -i "testsrc2=size=1080x1920:rate=30:d=3" -f lavfi -i "color=c=green:size=1080x1920:rate=30:d=2.5" -i "$OUT/beat120.m4a" \
+  -filter_complex "[0:v][1:v][2:v][3:v]concat=n=4:v=1:a=0[v]" -map "[v]" -map 4:a -t 9 -c:v h264_videotoolbox -b:v 4M -c:a aac "$OUT/reference.mp4"

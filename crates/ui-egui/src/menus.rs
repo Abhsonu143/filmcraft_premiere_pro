@@ -124,14 +124,20 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("mode.import", "Import", [], None),
     uic!("mode.edit", "Edit", [], None),
     uic!("mode.export", "Export", ["File", "Export"], Some("Cmd+M")),
-    uic!("help.discord", "Join the ArtCraft Discord…", ["Help"], None),
-    uic!("help.website", "ArtCraft Website", ["Help"], None),
-    uic!("help.appPage", "FilmCraft on getartcraft.com", ["Help"], None),
-    uic!("help.github", "FilmCraft on GitHub", ["Help"], None),
+    uic!("help.github", "EI on GitHub", ["Help"], None),
     uic!("help.reportIssue", "Report an Issue…", ["Help"], None),
+    uic!("help.upstream", "Based on FilmCraft…", ["Help"], None),
     uic!("help.revealLogFiles", "Reveal Log Files…", ["Help"], None),
     uic!("help.systemCompatibilityReport", "System Compatibility Report…", ["Help"], None),
-    uic!("app.about", "About FilmCraft", ["Help"], None),
+    uic!("app.about", "About EI", ["Help"], None),
+    uic!("ai.split", "Split Long Video into Clips…", ["AI"], None),
+    uic!("ai.music", "Auto Edit Clips to Music…", ["AI"], None),
+    uic!("ai.reference", "Edit Like a Reference Video…", ["AI"], None),
+    uic!("ai.talk", "Talking Head Auto-Cut…", ["AI"], None),
+    uic!("ai.voiceover", "Voiceover Edit…", ["AI"], None),
+    uic!("ai.jobs", "AI Jobs", ["AI"], None),
+    uic!("ai.setup", "AI Engine Setup…", ["AI"], None),
+    uic!("ai.cancel", "Cancel AI Job", [], None),
     uic!("app.keyboardShortcuts", "Keyboard Shortcuts…", ["Edit"], Some("Cmd+Alt+K")),
     uic!("app.settings.general", "General…", ["Edit", "Preferences"], Some("Cmd+,")),
     uic!("app.settings.appearance", "Appearance…", ["Edit", "Preferences"], None),
@@ -205,6 +211,9 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params:
         if params.get("path").is_none() {
             return crate::panels::frame_export::open(app, ctx, &params);
         }
+    }
+    if let Some(r) = crate::panels::ai_tools::route(app, ctx, id, &params) {
+        return r;
     }
     if id == "perf.stats" {
         // the engine's counters plus playback, frame workers and UI timings
@@ -539,7 +548,7 @@ pub struct MenuItem {
     pub checked: Option<bool>,
 }
 
-pub const MENUS: [&str; 9] = ["File", "Edit", "Clip", "Sequence", "Markers", "Graphics and Titles", "View", "Window", "Help"];
+pub const MENUS: [&str; 10] = ["File", "Edit", "Clip", "Sequence", "Markers", "Graphics and Titles", "View", "AI", "Window", "Help"];
 
 pub fn menu_items(app: &FilmcraftApp) -> Vec<MenuItem> {
     let mut v = menu_items_for(&app.session);

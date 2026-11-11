@@ -1,5 +1,29 @@
 # Progress
 
+## 2026-11-12 (later): EI app, AI menu, split / music / reference editing
+
+- **Rebrand:** the desktop app is now **EI** (window, menus, About, macOS bundle `EI.app`,
+  `io.github.abhsonu143.ei`, its own icon drawn by `packaging/macos/ei/make_icon.py`). ArtCraft marks,
+  Discord/website links and `docs/brand/` were removed, as upstream's licence requires of forks. Internal
+  crate names, the `.fcproj` format and preference folders keep their FilmCraft names, so projects and
+  settings still load.
+- **AI menu** (`crates/ui-egui/src/panels/ai_tools.rs`): dialogs for Split, Auto Edit to Music, Edit Like a
+  Reference, Talking Head and Voiceover. A background jobs window offers progress, Cancel, Play, Show in Finder
+  and Import. An engine set-up window installs and checks the Python environment. Results are imported
+  into the project (split clips into the bin, edits as a sequence via `.otio`). Every control has an
+  automation id and every tool is a command (`ai.split {…}` etc.) for the control channel and MCP.
+- **New engine tools:** `split_video.py` (same-quality split with no re-encode, or exact/re-encoded),
+  `montage.py` (beat-cut music edits in 16:9 / 9:16 / 1:1; reference-matched edits with the reference's
+  soundtrack and cut timing), and `ei_engine.py` (the app's single entry point; `EI_RESULT` protocol).
+- **Measured on the test media:** a 10-minute 1080p video split into 10 one-minute clips in 0.6 s (no
+  re-encode). A 20 s vertical music edit from 9 clips took 8 s. A 9 s reference edit took 4 s. Beat timing was
+  within 16 ms on a 120 BPM track.
+- **Tests:** 35 Python tests; Rust tests for the AI module (argument building, hostile parameters, the job
+  runner with cancel) and a UI test that drives the real app headlessly: every dialog, plus real split
+  and music jobs whose results are imported (`crates/ui-egui/tests/ai_ui.rs`).
+- **Known upstream failure (not caused by EI):** `crates/ui-egui/tests/chrome_ui.rs`
+  `header_and_status_bar_are_shown_by_default` fails on upstream `main` too.
+
 ## 2026-11-12: Phase 1 done, Phase 2 mostly done
 
 `autocut.py` and `voiceover_cut.py` were not in the repo, so both were rebuilt from the spec

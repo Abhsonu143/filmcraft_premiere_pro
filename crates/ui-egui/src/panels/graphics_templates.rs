@@ -2,7 +2,7 @@
 //! sections of the Edit tab, and the Export As Motion Graphics Template, Install Motion Graphics
 //! Template and Replace Fonts in Projects dialogs (M10.7).
 //!
-//! The library lists the built-in templates (original FilmCraft designs) and the user's
+//! The library lists the built-in templates (original EI designs) and the user's
 //! `.fcgt` templates with thumbnails rendered by the engine, a search field and a category
 //! filter. Click selects, double-click (or Apply) places the template at the playhead, dragging a
 //! card onto the timeline places it there. Everything runs engine commands
@@ -589,7 +589,7 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
     let empty = params.as_object().is_none_or(|m| m.is_empty());
     match id {
         "graphics.template.install" if params.get("path").is_none() => {
-            let path = app.hooks.pick_open_file.as_mut().and_then(|f| f(tl!("FilmCraft Graphics Template"), &["fcgt"]))?;
+            let path = app.hooks.pick_open_file.as_mut().and_then(|f| f(tl!("EI Graphics Template"), &["fcgt"]))?;
             let r = app.session.execute(id, json!({"path": path})).map_err(|e| e.to_string());
             invalidate(ctx);
             Some(r)
@@ -669,7 +669,7 @@ fn export_dialog(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     });
                 }
             });
-            ui.label(egui::RichText::new(tl!("Saved as a FilmCraft graphics template (.fcgt) in your templates folder.")).weak().size(11.0));
+            ui.label(egui::RichText::new(tl!("Saved as an EI graphics template (.fcgt) in your templates folder.")).weak().size(11.0));
             if !d.error.is_empty() {
                 ui.colored_label(Color32::from_rgb(0xff, 0x80, 0x80), &d.error);
             }

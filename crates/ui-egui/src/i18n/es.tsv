@@ -11,10 +11,10 @@
 # Clean-room: every entry was written from the plain meaning of the English text using ordinary
 # Spanish video-editing vocabulary (pista, cabezal, secuencia, bandeja, procesar…). No proprietary
 # localisation resource, string table or product UI was consulted or copied; add entries the same
-# way. Product and technology names (FilmCraft, ArtCraft, Lumetri, ProRes, LUFS…) keep their
+# way. Product and technology names (EI, Lumetri, ProRes, LUFS…) keep their
 # spelling. "video" is written without an accent, as in the rest of this catalog.
 
-	About FilmCraft	Acerca de FilmCraft
+	About EI	Acerca de EI
 	Add Audio Submix Track	Añadir pista de submezcla de audio
 	Add Caption at Playhead	Añadir subtítulo en el cabezal
 	Add Chapter Marker…	Añadir marcador de capítulo…
@@ -40,7 +40,6 @@
 	Apply Default Transitions to Selection	Aplicar transiciones predeterminadas a la selección
 	Apply Video Transition	Aplicar transición de video
 	Arrange	Organizar
-	ArtCraft Website	Sitio web de ArtCraft
 	Assembly	Ensamblaje
 	Attach Proxies…	Adjuntar proxies…
 	Audio Channels…	Canales de audio…
@@ -133,9 +132,8 @@
 	File	Archivo
 	File…	Archivo…
 	Fill frame	Rellenar fotograma
-	FilmCraft Help…	Ayuda de FilmCraft…
-	FilmCraft on GitHub	FilmCraft en GitHub
-	FilmCraft on getartcraft.com	FilmCraft en getartcraft.com
+	EI Help…	Ayuda de EI…
+	EI on GitHub	EI en GitHub
 	Find Next	Buscar siguiente
 	Find…	Buscar…
 	Fit	Ajustar
@@ -179,7 +177,6 @@
 	Insert Frame Hold Segment	Insertar segmento de fotograma congelado
 	Install Motion Graphics Template…	Instalar plantilla de animación…
 	Interpret Footage…	Interpretar material…
-	Join the ArtCraft Discord…	Únete al Discord de ArtCraft…
 	Keyboard Shortcuts…	Atajos de teclado…
 	Label	Etiqueta
 	Labels…	Etiquetas…
@@ -303,7 +300,7 @@
 	Select Previous Graphic	Seleccionar gráfico anterior
 	Select Previous Layer	Seleccionar capa anterior
 	Selection Follows Playhead	La selección sigue al cabezal
-	Selection as FilmCraft Project…	Selección como proyecto de FilmCraft…
+	Selection as EI Project…	Selección como proyecto de EI…
 	Selection…	Selección…
 	Send Backward	Enviar atrás
 	Send to Back	Enviar al fondo
@@ -369,7 +366,6 @@
 	Master volume: use the Audio Track Mixer	Volumen maestro: usa el mezclador de pistas de audio
 	Search	Buscar
 	Quick Export	Exportación rápida
-	Join the ArtCraft Discord (discord.gg/artcraft)	Únete al Discord de ArtCraft (discord.gg/artcraft)
 	Cancel	Cancelar
 	OK	Aceptar
 	Interpret Footage	Interpretar material
@@ -408,8 +404,6 @@
 	Delete Audio Tracks	Eliminar pistas de audio
 	All Empty Tracks	Todas las pistas vacías
 	Version {version}	Versión {version}
-	A clean-room, pure-Rust non-linear video editor. Part of the ArtCraft family.	Un editor de video no lineal en Rust puro, desarrollado en sala limpia. Parte de la familia ArtCraft.
-	Join the ArtCraft Discord	Únete al Discord de ArtCraft
 	Source code on GitHub	Código fuente en GitHub
 	Report an issue	Informar de un problema
 	MIT OR Apache-2.0. Fonts: Inter, Noto Serif and JetBrains Mono (SIL OFL 1.1).	MIT OR Apache-2.0. Fuentes: Inter, Noto Serif y JetBrains Mono (SIL OFL 1.1).
@@ -429,8 +423,8 @@
 	No background jobs.	No hay tareas en segundo plano.
 	Recover Unsaved Changes	Recuperar cambios no guardados
 	Untitled	Sin título
-	FilmCraft was closed while “{name}” had unsaved changes.	FilmCraft se cerró mientras “{name}” tenía cambios sin guardar.
-	FilmCraft quit unexpectedly while “{name}” had unsaved changes.	FilmCraft se cerró de forma inesperada mientras “{name}” tenía cambios sin guardar.
+	EI was closed while “{name}” had unsaved changes.	EI se cerró mientras “{name}” tenía cambios sin guardar.
+	EI quit unexpectedly while “{name}” had unsaved changes.	EI se cerró de forma inesperada mientras “{name}” tenía cambios sin guardar.
 	Recover unsaved changes from {when}?	¿Recuperar los cambios no guardados de {when}?
 	The project had not been saved yet.	El proyecto aún no se había guardado.
 	{n} sessions have unsaved changes:	{n} sesiones tienen cambios sin guardar:
@@ -450,7 +444,6 @@
 	Bars and Tone	Barras y tono
 	SMPTE HD bars with 1 kHz reference tone	Barras SMPTE HD con tono de referencia de 1 kHz
 	Community	Comunidad
-	Join us on Discord	Únete a nosotros en Discord
 	OMF Export Settings	Ajustes de exportación OMF
 	AAF Export Settings	Ajustes de exportación AAF
 	OMF Title:	Título OMF:
@@ -953,7 +946,7 @@
 	Font family	Familia de fuentes
 	Label Colors	Colores de etiqueta
 	Decoded frames held for the monitors and thumbnails: {used} of {budget}.	Fotogramas descodificados en memoria para los monitores y miniaturas: {used} de {budget}.
-	FilmCraft keeps the rest of the RAM free for other applications.	FilmCraft deja el resto de la RAM libre para otras aplicaciones.
+	EI keeps the rest of the RAM free for other applications.	EI deja el resto de la RAM libre para otras aplicaciones.
 	not available in this session	no disponible en esta sesión
 	Currently: {loc} — {files} file(s), {size}	Actualmente: {loc} — {files} archivo(s), {size}
 	 ({ch} output channels)	 ({ch} canales de salida)
@@ -1063,7 +1056,7 @@
 	Video Frame	Fotograma de video
 	Pin To	Fijar a
 	Pinned Edges	Bordes fijados
-	FilmCraft Graphics Template	Plantilla de gráficos de FilmCraft
+	EI Graphics Template	Plantilla de gráficos de EI
 	{n} Font	{n} Fuente
 	{n} Size	{n} Tamaño
 	{n} Color	{n} Color
@@ -1073,7 +1066,7 @@
 	Export As Motion Graphics Template	Exportar como plantilla de animación
 	Category:	Categoría:
 	Editable properties:	Propiedades editables:
-	Saved as a FilmCraft graphics template (.fcgt) in your templates folder.	Se guarda como plantilla de gráficos de FilmCraft (.fcgt) en tu carpeta de plantillas.
+	Saved as an EI graphics template (.fcgt) in your templates folder.	Se guarda como plantilla de gráficos de EI (.fcgt) en tu carpeta de plantillas.
 	Exported graphics template to {path}	Plantilla de gráficos exportada a {path}
 	Replace Fonts in Projects	Reemplazar fuentes en proyectos
 	Fonts used in the project:	Fuentes usadas en el proyecto:
@@ -1437,7 +1430,7 @@
 	Center of Sphere	Centro de la esfera
 	Cents	Centésimas
 	Change to Color	Cambiar a color
-	Changes are copied in the background a moment after each edit. If FilmCraft quits unexpectedly, they are offered the next time it starts.	Los cambios se copian en segundo plano poco después de cada edición. Si FilmCraft se cierra de forma inesperada, se ofrecen la próxima vez que se inicie.
+	Changes are copied in the background a moment after each edit. If EI quits unexpectedly, they are offered the next time it starts.	Los cambios se copian en segundo plano poco después de cada edición. Si EI se cierra de forma inesperada, se ofrecen la próxima vez que se inicie.
 	Channel	Canal
 	Channel Blur	Desenfoque de canal
 	Channel Mix	Mezcla de canales
@@ -1810,7 +1803,7 @@
 	Hard Limiter	Limitador duro
 	Hard Mix	Mezcla definida
 	Hardware decoding	Descodificación por hardware
-	Hardware decoding: Auto uses the system's video decoder (VideoToolbox on macOS, Media Foundation on Windows, VA-API for H.264 and HEVC on Linux) for the streams it supports, and FilmCraft's own decoder for everything else or if the hardware fails. Media that is already open keeps its decoder until it is reopened.	Descodificación por hardware: Automático usa el descodificador de video del sistema (VideoToolbox en macOS, Media Foundation en Windows, VA-API para H.264 y HEVC en Linux) para los flujos que admite, y el descodificador propio de FilmCraft para todo lo demás o si falla el hardware. Los medios ya abiertos mantienen su descodificador hasta que se vuelven a abrir.
+	Hardware decoding: Auto uses the system's video decoder (VideoToolbox on macOS, Media Foundation on Windows, VA-API for H.264 and HEVC on Linux) for the streams it supports, and EI's own decoder for everything else or if the hardware fails. Media that is already open keeps its decoder until it is reopened.	Descodificación por hardware: Automático usa el descodificador de video del sistema (VideoToolbox en macOS, Media Foundation en Windows, VA-API para H.264 y HEVC en Linux) para los flujos que admite, y el descodificador propio de EI para todo lo demás o si falla el hardware. Los medios ya abiertos mantienen su descodificador hasta que se vuelven a abrir.
 	Head Size	Tamaño de la cabeza
 	Heart	Corazón
 	Height	Altura
@@ -2085,7 +2078,7 @@
 	Night	Noche
 	No Motion	Sin movimiento
 	No Scroll	Sin desplazamiento
-	No plugins are installed. Changes will take effect the next time you start FilmCraft.	No hay complementos instalados. Los cambios se aplicarán la próxima vez que inicies FilmCraft.
+	No plugins are installed. Changes will take effect the next time you start EI.	No hay complementos instalados. Los cambios se aplicarán la próxima vez que inicies EI.
 	Noise	Ruido
 	Noise & Grain	Ruido y grano
 	Noise (Legacy)	Ruido (heredado)
@@ -2516,7 +2509,7 @@
 	Template Properties	Propiedades de la plantilla
 	Text Animator	Animador de texto
 	Text Color	Color del texto
-	The media cache holds render previews of unsaved projects and other files FilmCraft can recreate. Deleting them is always safe; FilmCraft rebuilds them as needed.	La caché de medios guarda previsualizaciones procesadas de proyectos sin guardar y otros archivos que FilmCraft puede volver a crear. Eliminarlos siempre es seguro; FilmCraft los regenera cuando hace falta.
+	The media cache holds render previews of unsaved projects and other files EI can recreate. Deleting them is always safe; EI rebuilds them as needed.	La caché de medios guarda previsualizaciones procesadas de proyectos sin guardar y otros archivos que EI puede volver a crear. Eliminarlos siempre es seguro; EI los regenera cuando hace falta.
 	Thickness	Grosor
 	Tile Gradient	Degradado en mosaico
 	Tilt	Inclinación
@@ -2726,7 +2719,7 @@
 	System Compatibility Report	Informe de compatibilidad del sistema
 	no GPU adapter: the CPU compositor is used	no hay adaptador de GPU: se usa el compositor de CPU
 	Avid Log Exchange	Avid Log Exchange
-	FilmCraft Project	Proyecto de FilmCraft
+	EI Project	Proyecto de EI
 	{name} Selection.fcproj	{name} Selección.fcproj
 	{name} (Simplified)	{name} (simplificada)
 	Find in:	Buscar en:
@@ -2866,7 +2859,7 @@
 	Start Queue	Iniciar cola
 	Stop	Detener
 	Clear Finished	Borrar terminadas
-	Not supported by FilmCraft's encoders yet	Los codificadores de FilmCraft aún no lo admiten
+	Not supported by EI's encoders yet	Los codificadores de EI aún no lo admiten
 	Sequence name	Nombre de la secuencia
 	Folder	Carpeta
 	Preset	Ajuste preestablecido
@@ -2950,7 +2943,7 @@
 	Drag a clip to slide it between its neighbours.	Arrastra un clip para deslizarlo entre sus vecinos.
 	Drag to scroll the timeline.	Arrastra para desplazar la línea de tiempo.
 	Click to zoom in; Opt-click to zoom out.	Haz clic para acercar; Opción+clic para alejar.
-	FilmCraft hit an error	FilmCraft ha encontrado un error
+	EI hit an error	EI ha encontrado un error
 	Details: {path}	Detalles: {path}
 	Opened {url}	Abierto {url}
 	(empty)	(vacío)
@@ -3182,7 +3175,7 @@
 	QuickTime, ProRes 422 LT, 24-bit 48 kHz PCM	QuickTime, ProRes 422 LT, PCM de 24 bits y 48 kHz
 	QuickTime, ProRes 422 Proxy, 24-bit 48 kHz PCM	QuickTime, ProRes 422 Proxy, PCM de 24 bits y 48 kHz
 	QuickTime, ProRes 422, 24-bit 48 kHz PCM	QuickTime, ProRes 422, PCM de 24 bits y 48 kHz
-	Quit FilmCraft	Salir de FilmCraft
+	Quit EI	Salir de EI
 	Rate Stretch Tool	Herramienta Ajuste de velocidad
 	Razor Tool	Herramienta Cuchilla
 	Rectangle Tool	Herramienta Rectángulo
@@ -3478,8 +3471,8 @@
 	Composite in Linear Color	Componer en color lineal
 	Auto Tone Map Media (HDR and log into SDR)	Mapeo de tonos automático de medios (HDR y log a SDR)
 	Configure…	Configurar…
-	Not supported in FilmCraft yet	FilmCraft aún no lo admite
-	FilmCraft always composites in linear light	FilmCraft siempre compone en luz lineal
+	Not supported in EI yet	EI aún no lo admite
+	EI always composites in linear light	EI siempre compone en luz lineal
 	Loop marked range	Bucle del intervalo marcado
 	Play Source	Reproducir origen
 	Source Play/Stop	Reproducir/Detener origen
@@ -3494,3 +3487,17 @@
 	Gradient Angle	Ángulo del degradado
 	Linear Gradient	Degradado lineal
 	Solid	Sólido
+
+# EI: AI menu
+	AI	IA
+	Split Long Video into Clips…	Dividir un video largo en clips…
+	Auto Edit Clips to Music…	Editar clips automáticamente con música…
+	Edit Like a Reference Video…	Editar como un video de referencia…
+	Talking Head Auto-Cut…	Corte automático de video hablado…
+	Voiceover Edit…	Edición con voz en off…
+	AI Jobs	Tareas de IA
+	AI Engine Setup…	Configurar el motor de IA…
+	Cancel AI Job	Cancelar tarea de IA
+	Based on FilmCraft…	Basado en FilmCraft…
+	A video editor with local AI auto-editing, based on the open-source FilmCraft editor.	Un editor de video con edición automática por IA local, basado en el editor de código abierto FilmCraft.
+	Ai	IA
