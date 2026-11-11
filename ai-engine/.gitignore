@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.pytest_cache/
+# Test and benchmark media, renders, plans and shot caches: never commit media.
+fixtures/
+*.work/

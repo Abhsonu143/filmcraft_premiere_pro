@@ -1,0 +1,11 @@
+# Magic Movie Maker — AI engine (Python, runs locally on Apple Silicon; no API keys).
+# System dependency: ffmpeg with VideoToolbox + libass (`brew install ffmpeg`).
+numpy>=1.26
+pillow>=10.0
+# Speech-to-text on the Apple GPU (MIT licence; Whisper weights are MIT).
+mlx-whisper>=0.4
+# CLIP footage search (MIT licence; ViT-B-32 "openai" weights are MIT).
+torch>=2.2
+open_clip_torch>=2.24
+# Interchange with FilmCraft / Resolve (Apache-2.0); used to validate .otio files.
+opentimelineio>=0.17
