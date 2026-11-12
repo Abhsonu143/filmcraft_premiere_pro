@@ -1,5 +1,36 @@
 # Progress
 
+## 2026-11-12 (evening): the director (edits that feel hand-made)
+
+Feedback on the first version: reference edits copied the *content* of the reference (green field ->
+green field) and held a near-frozen shot for 10 s; music edits used fixed shot lengths, any clip
+anywhere, no grade, no effects. Rebuilt as four layers, tested on the owner's 149 4K/60 drone clips:
+
+- `footage.py`: per clip (cached), at 5 fps: sharpness, exposure, shake, camera pan direction and speed
+  (phase correlation), plus CLIP shot size, subject tags and a look score from keyframes (3x faster than
+  a full decode: 149 clips index in about 2 min). It picks the usable moments in each clip.
+- `music.py`: beats, bars, energy per beat, sections (calm/mid/high), the drop, and hits. It picks the best
+  stretch of a long song. Any video works as the music source.
+- `director.py`: cut points by dynamic programming (strong accents and bar lines, with shot length
+  following the energy, an accelerating bar before the drop, and a held ending). A beam search over the
+  whole sequence covers quality, look, motion versus energy, roles (opener, drop, closer), trip order,
+  no repeats, no near-duplicate jump cuts, a subject not repeated within 5 shots, motion continuity and
+  no brightness jumps. Effects are chosen for a reason: 60 fps slow motion when calm, speed-ups (never
+  on people) and a ramp into the drop, push-ins on static shots, punch-ins on hits, a white flash on the
+  drop, dissolves only at calm section changes, whips only between shots panning the same way, and fades
+  at the ends. Reference mode borrows **style** (cut timing, transitions, flashes, punches, motion per
+  shot, optional colour match), and can use another soundtrack.
+- `render.py`: speed ramps (quadratic time mapping), zoom paths with zoompan at 1.5x resolution, a
+  look preset plus per-shot exposure matching, flashes, and transitions centred on the cut with handles
+  so the length stays frame-exact. A quality check looks for wrong length, black stretches and frozen
+  picture.
+- Results on the test media: Apsara (13.8 s, vertical) was 9 shots, calm slow-motion intro, flash and
+  punch on the drop, a held ending; rendered in 11 s. The Newbies reference (25 s) kept its long-take rhythm
+  with varied footage; rendered in 13 s.
+- Tests: 40 Python tests (drop detection, beat-aligned cuts, a held ending, frame-exact transitions and
+  ramps, flash-versus-cut in references, music from a video file) and the UI tests, which run the
+  director from the app.
+
 ## 2026-11-12 (later): EI app, AI menu, split / music / reference editing
 
 - **Rebrand:** the desktop app is now **EI** (window, menus, About, macOS bundle `EI.app`,

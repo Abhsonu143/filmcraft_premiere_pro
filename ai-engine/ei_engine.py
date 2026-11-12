@@ -87,23 +87,10 @@ def run(argv: list[str]) -> dict:
     p.add_argument("--out-dir", required=True)
     p.add_argument("--clip-len", type=float, default=60.0)
     p.add_argument("--quality", default="same", choices=["same", "exact", "high", "medium", "small"])
-    p = sub.add_parser("music")
-    p.add_argument("--clips", nargs="+", required=True)
-    p.add_argument("--music", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument("--length", type=float, default=30.0)
-    p.add_argument("--aspect", default="vertical", choices=["horizontal", "vertical", "square"])
-    p.add_argument("--pace", default="medium", choices=["fast", "medium", "slow"])
-    p.add_argument("--music-start", default="auto")
-    p.add_argument("--fps", type=float, default=30.0)
-    p = sub.add_parser("reference")
-    p.add_argument("reference")
-    p.add_argument("--clips", nargs="+", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument("--aspect", default="same", choices=["same", "horizontal", "vertical", "square"])
-    p.add_argument("--threshold", type=float, default=0.3)
-    p.add_argument("--fps", type=float)
-    p.add_argument("--no-clip", action="store_true")
+    import director
+
+    director.add_music_args(sub.add_parser("music"), workers=False)  # same options as director.py
+    director.add_reference_args(sub.add_parser("reference"), workers=False)
     p = sub.add_parser("talk")
     p.add_argument("input")
     p.add_argument("--out", required=True)
@@ -133,14 +120,9 @@ def run(argv: list[str]) -> dict:
     out = Path(a.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     if a.cmd in ("music", "reference"):
-        import montage
+        import director
 
-        a.plan_only = False
-        plan = montage.make_music_plan(a) if a.cmd == "music" else montage.make_reference_plan(a)
-        plan_path = out.with_name(out.stem + ".montage.json")
-        ac.save_plan(plan, plan_path)
-        video = montage.render_plan(plan_path, out=str(out), workers=a.workers)
-        return {"outputs": [str(video)], "plan": str(plan_path), "out_dir": str(out.parent), **otio_for(plan_path)}
+        return director.run(a)
     if a.cmd == "talk":
         plan_path = out.with_name(out.stem + ".plan.json")
         args = ["auto", a.input, "--preset", a.preset, "-o", str(plan_path), "--out", str(out), "--codec", "h264"]

@@ -109,8 +109,25 @@ fn ai_menu_and_dialogs() {
     }
     let expect: [(&str, &[&str]); 5] = [
         ("split", &["input", "clipLength", "quality.same", "quality.exact", "out", "import", "run"]),
-        ("music", &["clips.add", "clips.addFolder", "music", "length", "aspect.horizontal", "aspect.vertical", "aspect.square", "pace.fast", "run"]),
-        ("reference", &["input", "clips.add", "aspect.same", "aspect.square", "run"]),
+        (
+            "music",
+            &[
+                "clips.add",
+                "clips.addFolder",
+                "music",
+                "length",
+                "aspect.horizontal",
+                "aspect.vertical",
+                "aspect.square",
+                "pace.fast",
+                "musicStart",
+                "look",
+                "effects",
+                "order",
+                "run",
+            ],
+        ),
+        ("reference", &["input", "clips.add", "music", "aspect.same", "aspect.square", "look", "effects", "order", "run"]),
         ("talk", &["input", "preset.short", "captions", "music", "run"]),
         ("voiceover", &["input", "clips.add", "script", "captions", "run"]),
     ];

@@ -49,8 +49,8 @@ the engine (useful when you're editing the engine). Without them, the app uses t
 | AI ▸ … | You choose | You get |
 |---|---|---|
 | Split Long Video into Clips… | a video, clip length (default 60 s), quality (default *same as original*: no re-encode, cuts on the nearest keyframe; or *exact lengths*: re-encoded at the original bitrate; or High/Medium/Small), output folder | `<name>_part001.mp4`, `…002`, … in the folder; optionally imported into the project |
-| Auto Edit Clips to Music… | clips (files or a whole folder), music, length (s), Horizontal 16:9 / Vertical 9:16 / Square 1:1, pace | an `.mp4` cut on the beat, plus an `.otio` that opens as a sequence for polishing |
-| Edit Like a Reference Video… | a reference video, your clips, aspect (default same as the reference) | an `.mp4` with the reference's soundtrack and cut timing, filled with your most similar shots, plus an `.otio` |
+| Auto Edit Clips to Music… | clips (files or a whole folder), music (**any audio or video file**), length, shape (16:9 / 9:16 / 1:1), pace, music start, look, effects, story order | a director-made edit: cuts on accents, shot lengths following the music, slow motion, punch-ins, a flash on the drop, one grade; plus an `.otio` |
+| Edit Like a Reference Video… | a reference video, your clips, optional other soundtrack (audio or video), shape, look (incl. *match reference*), effects | your footage edited in the reference's style (cut timing, transitions, flashes, punches, motion), plus an `.otio` |
 | Talking Head Auto-Cut… | a video, format, captions, music | jump-cut `.mp4` (+ `.srt`) and an `.otio` |
 | Voiceover Edit… | voiceover, clips, script, music | narration-matched `.mp4` and an `.otio` |
 

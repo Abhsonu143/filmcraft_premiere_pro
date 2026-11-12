@@ -16,8 +16,10 @@
 //!
 //! Commands (all agent-drivable; without parameters they open the dialog):
 //! - `ai.split {input, outDir?, clipLength?=60, quality?=same|exact|high|medium|small, import?}`
-//! - `ai.music {clips: [..], music, out?, length?=30, aspect?=vertical|horizontal|square, pace?, import?}`
-//! - `ai.reference {input, clips: [..], out?, aspect?=same|…, import?}`
+//! - `ai.music {clips: [..], music (audio or video file), out?, length?=30, aspect?=vertical|horizontal|square,
+//!   pace?, musicStart?, look?=cinematic|natural|vivid|warm|mono, effects?=full|subtle|none, order?=time|free, import?}`
+//! - `ai.reference {input, clips: [..], audio? (another soundtrack), out?, aspect?=same|…, look? (also `match`),
+//!   effects?, order?, import?}`
 //! - `ai.talk {input, out?, preset?=long|short|travel, captions?, music?, import?}`
 //! - `ai.voiceover {input, clips: [..], out?, script?, music?, captions?, preset?, import?}`
 //! - each returns `{job}`; `ai.jobs` returns every job (and shows the window); `ai.cancel {job}`;
@@ -118,6 +120,10 @@ struct Draft {
     aspect: &'static str,
     pace: &'static str,
     preset: &'static str,
+    look: &'static str,
+    effects: &'static str,
+    order: &'static str,
+    music_start: String,
     captions: bool,
     import: bool,
     error: String,
@@ -138,6 +144,10 @@ impl Draft {
             aspect: if kind == Kind::Reference { "same" } else { "vertical" },
             pace: "medium",
             preset: if kind == Kind::Voiceover { "travel" } else { "long" },
+            look: "cinematic",
+            effects: "full",
+            order: "time",
+            music_start: String::new(),
             captions: false,
             import: kind != Kind::Split,
             error: String::new(),
@@ -149,7 +159,7 @@ impl Draft {
         let mut d = Draft::new(kind);
         let s = |k: &str| p.get(k).and_then(Value::as_str).map(str::to_string);
         d.input = s("input").unwrap_or_default();
-        d.music = s("music").unwrap_or_default();
+        d.music = s("music").or_else(|| s("audio")).unwrap_or_default();
         d.script = s("script").unwrap_or_default();
         d.out = s("out").or_else(|| s("outDir")).unwrap_or_default();
         d.clips = p.get("clips").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
@@ -166,9 +176,24 @@ impl Draft {
         d.aspect = pick("aspect", &ASPECTS.map(|a| a.0), d.aspect);
         d.pace = pick("pace", &PACES.map(|a| a.0), d.pace);
         d.preset = pick("preset", &PRESETS.map(|a| a.0), d.preset);
+        d.look = pick("look", &LOOKS.map(|a| a.0), d.look);
+        d.effects = pick("effects", &EFFECTS.map(|a| a.0), d.effects);
+        d.order = pick("order", &ORDERS.map(|a| a.0), d.order);
+        d.music_start = match p.get("musicStart") {
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(v)) => v.clone(),
+            _ => String::new(),
+        };
         d.captions = p.get("captions").and_then(Value::as_bool).unwrap_or(false);
         d.import = p.get("import").and_then(Value::as_bool).unwrap_or(d.import);
         d
+    }
+
+    fn style_args(&self, a: &mut Vec<String>) {
+        for (k, v) in [("--look", self.look), ("--effects", self.effects), ("--order", self.order)] {
+            a.push(k.into());
+            a.push(v.into());
+        }
     }
 
     /// Fill defaults (output paths) and check that the job can run; returns the engine arguments.
@@ -220,6 +245,14 @@ impl Draft {
                 push(&mut a, "--length", &format!("{}", self.length));
                 push(&mut a, "--aspect", self.aspect);
                 push(&mut a, "--pace", self.pace);
+                let start = self.music_start.trim();
+                if !start.is_empty() && start != "auto" {
+                    match start.parse::<f64>() {
+                        Ok(v) if v.is_finite() && v >= 0.0 => push(&mut a, "--music-start", &format!("{v}")),
+                        _ => return Err("Music start must be a number of seconds (or empty for automatic).".into()),
+                    }
+                }
+                self.style_args(&mut a);
             }
             Kind::Reference => {
                 a.push(self.input.trim().into());
@@ -227,6 +260,10 @@ impl Draft {
                 a.extend(self.clips.iter().cloned());
                 push(&mut a, "--out", self.out.trim());
                 push(&mut a, "--aspect", self.aspect);
+                if !self.music.trim().is_empty() {
+                    push(&mut a, "--audio", self.music.trim());
+                }
+                self.style_args(&mut a);
             }
             Kind::Talk => {
                 a.push(self.input.trim().into());
@@ -269,6 +306,18 @@ const QUALITIES: [(&str, &str); 5] = [
 ];
 const ASPECTS: [(&str, &str); 4] = [("same", "Same as reference"), ("horizontal", "Horizontal 16:9"), ("vertical", "Vertical 9:16"), ("square", "Square 1:1")];
 const PACES: [(&str, &str); 3] = [("fast", "Fast (~1 s shots)"), ("medium", "Medium (~2 s)"), ("slow", "Slow (~3 s)")];
+const LOOKS: [(&str, &str); 6] = [
+    ("cinematic", "Cinematic (contrast, teal & orange, vignette)"),
+    ("natural", "Natural (true colours, matched exposure)"),
+    ("vivid", "Vivid (rich colour)"),
+    ("warm", "Warm film"),
+    ("mono", "Black & white"),
+    ("match", "Match the reference's colours"),
+];
+const EFFECTS: [(&str, &str); 3] =
+    [("full", "Full: speed ramps, punch-ins, flashes, transitions"), ("subtle", "Subtle: slow motion, push-ins, dissolves"), ("none", "Clean cuts only")];
+const ORDERS: [(&str, &str); 2] = [("time", "Follow the trip (shooting order)"), ("free", "Best shots first")];
+
 const PRESETS: [(&str, &str); 3] = [("long", "YouTube 16:9"), ("short", "Short / Reel 9:16"), ("travel", "Travel 16:9")];
 
 const VIDEO_EXT: [&str; 9] = ["mp4", "mov", "m4v", "mkv", "avi", "mts", "m2ts", "webm", "mxf"];
@@ -715,6 +764,30 @@ fn radio_row(
     });
 }
 
+fn combo_row(ui: &mut egui::Ui, value: &mut &'static str, options: &[(&'static str, &'static str)], id: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
+    let shown = options.iter().find(|o| o.0 == *value).map(|o| o.1).unwrap_or(*value);
+    let r = egui::ComboBox::from_id_salt(id).selected_text(shown).width(330.0).show_ui(ui, |ui| {
+        for &(k, label) in options {
+            let o = ui.selectable_value(value, k, label);
+            elems.push((format!("{id}.{k}"), o.rect, label.to_string()));
+        }
+    });
+    elems.push((id.to_string(), r.response.rect, shown.to_string()));
+}
+
+fn style_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, reference: bool, elems: &mut Vec<(String, egui::Rect, String)>) {
+    ui.label("Look");
+    let looks: &[(&'static str, &'static str)] = if reference { &LOOKS } else { &LOOKS[..5] };
+    combo_row(ui, &mut d.look, looks, &format!("{p}.look"), elems);
+    ui.end_row();
+    ui.label("Effects");
+    combo_row(ui, &mut d.effects, &EFFECTS, &format!("{p}.effects"), elems);
+    ui.end_row();
+    ui.label("Story order");
+    combo_row(ui, &mut d.order, &ORDERS, &format!("{p}.order"), elems);
+    ui.end_row();
+}
+
 fn path_row(ui: &mut egui::Ui, value: &mut String, id: &str, hint: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> bool {
     let mut clicked = false;
     ui.horizontal(|ui| {
@@ -780,9 +853,14 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     });
                     ui.end_row();
                 }
-                if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover) {
-                    ui.label(if d.kind == Kind::Music { "Music" } else { "Music (optional)" });
-                    if path_row(ui, &mut d.music, &format!("{p}.music"), "song or audio file", &mut elems) {
+                if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover | Kind::Reference) {
+                    ui.label(match d.kind {
+                        Kind::Music => "Music",
+                        Kind::Reference => "Other soundtrack (optional)",
+                        _ => "Music (optional)",
+                    });
+                    let hint = if d.kind == Kind::Reference { "empty: the reference's own sound" } else { "a song, or any video: its sound is used" };
+                    if path_row(ui, &mut d.music, &format!("{p}.music"), hint, &mut elems) {
                         pick = Some(Pick::Music);
                     }
                     ui.end_row();
@@ -815,11 +893,17 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         ui.label("Pace");
                         radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
                         ui.end_row();
+                        ui.label("Music start (s)");
+                        let r = ui.add(egui::TextEdit::singleline(&mut d.music_start).hint_text("automatic: the best part of the song").desired_width(200.0));
+                        elems.push((format!("{p}.musicStart"), r.rect, d.music_start.clone()));
+                        ui.end_row();
+                        style_rows(ui, &mut d, &p, false, &mut elems);
                     }
                     Kind::Reference => {
                         ui.label("Aspect ratio");
                         radio_row(ui, &mut d.aspect, &ASPECTS, &format!("{p}.aspect"), &mut elems);
                         ui.end_row();
+                        style_rows(ui, &mut d, &p, true, &mut elems);
                     }
                     Kind::Talk | Kind::Voiceover => {
                         ui.label("Format");
@@ -891,7 +975,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             Pick::Music => {
                 let exts: Vec<&str> = AUDIO_EXT.iter().chain(VIDEO_EXT.iter()).copied().collect();
-                if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f("Audio", &exts)) {
+                if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f("Audio or video", &exts)) {
                     d.music = f;
                 }
             }
@@ -935,9 +1019,11 @@ fn description(kind: Kind) -> &'static str {
     match kind {
         Kind::Split => "Cuts a long video into clips of equal length, saved in a folder. The original is not changed.",
         Kind::Music => {
-            "Edits your clips to the beat of the music, at the length and shape you choose. Busy shots go on energetic beats; dark or frozen moments are skipped."
+            "Edits your clips like an editor would: long slow-motion shots in calm parts, quick cuts and punch-ins on the drop, the best moments of each clip, the trip in order, one colour grade. Any video can be the music source."
         }
-        Kind::Reference => "Uses the reference video's soundtrack and cut rhythm, and fills each shot with the clip moment that looks and moves most like it.",
+        Kind::Reference => {
+            "Copies the reference's style, not its content: its cut timing, transitions, flashes, zoom punches and (optionally) colour, filled with your best matching moments. Keeps its soundtrack unless you choose another (any audio or video file)."
+        }
         Kind::Talk => "Removes the pauses from a talking video (jump cuts), with optional captions and music that ducks under your voice.",
         Kind::Voiceover => "Matches your footage to what the voiceover says, shot by shot, so the edit follows the narration.",
     }
@@ -1255,7 +1341,26 @@ mod tests {
             Draft::from_params(Kind::Music, &json!({"music": video.to_string_lossy(), "clips": [dir.to_string_lossy()], "aspect": "square", "length": 15}));
         let a = music.engine_args().unwrap();
         assert!(a.windows(2).any(|w| w == ["--aspect", "square"]));
+        assert!(a.windows(2).any(|w| w == ["--look", "cinematic"]) && a.windows(2).any(|w| w == ["--order", "time"]));
         assert!(music.out.ends_with(".mp4"));
+        let mut styled = Draft::from_params(
+            Kind::Music,
+            &json!({"music": video.to_string_lossy(), "clips": [dir.to_string_lossy()], "look": "warm", "effects": "none", "musicStart": 12.5}),
+        );
+        let a = styled.engine_args().unwrap();
+        assert!(
+            a.windows(2).any(|w| w == ["--look", "warm"])
+                && a.windows(2).any(|w| w == ["--effects", "none"])
+                && a.windows(2).any(|w| w == ["--music-start", "12.5"])
+        );
+        let mut bad_start = Draft::from_params(Kind::Music, &json!({"music": video.to_string_lossy(), "clips": [dir.to_string_lossy()], "musicStart": "soon"}));
+        assert!(bad_start.engine_args().is_err());
+        let mut other = Draft::from_params(
+            Kind::Reference,
+            &json!({"input": video.to_string_lossy(), "clips": [dir.to_string_lossy()], "audio": video.to_string_lossy(), "look": "match"}),
+        );
+        let a = other.engine_args().unwrap();
+        assert!(a.windows(2).any(|w| w[0] == "--audio") && a.windows(2).any(|w| w == ["--look", "match"]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
