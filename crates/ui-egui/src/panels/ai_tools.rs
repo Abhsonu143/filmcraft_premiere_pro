@@ -69,6 +69,7 @@ pub enum Kind {
     Audio,
     Script,
     Voice,
+    Topic,
 }
 
 impl Kind {
@@ -83,6 +84,7 @@ impl Kind {
             Kind::Audio => "audio",
             Kind::Script => "script",
             Kind::Voice => "voice",
+            Kind::Topic => "topic",
         }
     }
     fn from_command(id: &str) -> Option<Kind> {
@@ -96,6 +98,7 @@ impl Kind {
             "ai.audio" => Kind::Audio,
             "ai.script" => Kind::Script,
             "ai.voice" => Kind::Voice,
+            "ai.topic" => Kind::Topic,
             _ => return None,
         })
     }
@@ -110,6 +113,7 @@ impl Kind {
             Kind::Audio => "Extract Audio from Video",
             Kind::Script => "Write Voiceover Script",
             Kind::Voice => "Voice Clone",
+            Kind::Topic => "Video from Topic",
         }
     }
     fn input_label(self) -> &'static str {
@@ -121,7 +125,7 @@ impl Kind {
         }
     }
     fn needs_input(self) -> bool {
-        !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice)
+        !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic)
     }
     fn needs_clips(self) -> bool {
         matches!(self, Kind::Music | Kind::Reference | Kind::Voiceover | Kind::Audio)
@@ -191,6 +195,12 @@ struct Draft {
     lang_mix: bool,
     source: &'static str,
     rec: Recorder,
+    // video from topic
+    make_video: bool,
+    src_free: bool,
+    src_cards: bool,
+    src_youtube: bool,
+    fresh: bool,
 }
 
 /// The sentence-by-sentence recording session of the Voice Clone dialog.
@@ -271,8 +281,8 @@ impl Draft {
             end: String::new(),
             mono: false,
             normalize: false,
-            captions: false,
-            import: !matches!(kind, Kind::Split | Kind::Audio | Kind::Script | Kind::Voice),
+            captions: kind == Kind::Topic,
+            import: !matches!(kind, Kind::Split | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic),
             error: String::new(),
             describe: "local",
             ambience: true,
@@ -296,6 +306,11 @@ impl Draft {
             lang_mix: true,
             source: "record",
             rec: Recorder { mic: "0".into(), ..Recorder::default() },
+            make_video: true,
+            src_free: true,
+            src_cards: true,
+            src_youtube: false,
+            fresh: false,
         }
     }
 
@@ -352,7 +367,7 @@ impl Draft {
             Some(Value::String(v)) => v.clone(),
             _ => String::new(),
         };
-        d.captions = p.get("captions").and_then(Value::as_bool).unwrap_or(false);
+        d.captions = p.get("captions").and_then(Value::as_bool).unwrap_or(d.captions);
         d.import = p.get("import").and_then(Value::as_bool).unwrap_or(d.import);
         d.describe = pick("describe", &DESCRIBERS.map(|a| a.0), d.describe);
         d.ambience = p.get("ambience").and_then(Value::as_bool).unwrap_or(d.ambience);
@@ -385,6 +400,12 @@ impl Draft {
         if let Some(a) = p.get("styleSources").and_then(Value::as_array) {
             d.style_sources = a.iter().filter_map(Value::as_str).map(str::to_string).collect();
         }
+        let flag = |k: &str, cur: bool| p.get(k).and_then(Value::as_bool).unwrap_or(cur);
+        d.make_video = flag("video", d.make_video);
+        d.src_free = flag("free", d.src_free);
+        d.src_cards = flag("cards", d.src_cards);
+        d.src_youtube = flag("youtube", d.src_youtube);
+        d.fresh = flag("fresh", d.fresh);
         if let Some(a) = p.get("takesFile").and_then(Value::as_str) {
             d.script = a.to_string();
         }
@@ -583,6 +604,57 @@ impl Draft {
                     a.extend(self.clips.iter().cloned());
                 }
             }
+            Kind::Topic => {
+                if self.topic.trim().is_empty() {
+                    return Err("Write a topic, or paste a link to a post or article.".into());
+                }
+                if !(5.0..=1800.0).contains(&self.seconds) {
+                    return Err("Length must be 5 seconds to 30 minutes.".into());
+                }
+                if self.make_video && self.voice.trim().is_empty() {
+                    return Err("Choose the voice for the video (or untick “Make the video” for the script only).".into());
+                }
+                if self.make_video && !self.src_free && !self.src_cards && !self.src_youtube && self.clips.is_empty() {
+                    return Err("Allow at least one source of pictures, or add your own footage.".into());
+                }
+                a = vec!["topic".into(), self.topic.trim().into()];
+                push(&mut a, "--seconds", &format!("{}", self.seconds));
+                push(&mut a, "--language", self.language);
+                push(&mut a, "--aspect", if self.aspect == "same" { "horizontal" } else { self.aspect });
+                push(&mut a, "--writer", self.writer);
+                if !self.style.trim().is_empty() {
+                    push(&mut a, "--style", self.style.trim());
+                }
+                if !self.out.trim().is_empty() {
+                    push(&mut a, "--out-dir", self.out.trim());
+                }
+                if self.fresh {
+                    a.push("--fresh".into());
+                }
+                if self.make_video {
+                    push(&mut a, "--voice", self.voice.trim());
+                    push(&mut a, "--takes", &format!("{}", self.takes.round()));
+                    push(&mut a, "--pace", self.pace);
+                    a.push("--sources".into());
+                    for (on, k) in [(self.src_free, "free"), (self.src_cards, "cards"), (self.src_youtube, "youtube")] {
+                        if on {
+                            a.push(k.into());
+                        }
+                    }
+                    if !self.clips.is_empty() {
+                        a.push("--footage".into());
+                        a.extend(self.clips.iter().cloned());
+                    }
+                    if !self.music.trim().is_empty() {
+                        push(&mut a, "--music", self.music.trim());
+                    }
+                    if !self.captions {
+                        a.push("--no-captions".into());
+                    }
+                } else {
+                    a.push("--script-only".into());
+                }
+            }
             Kind::Voice => {
                 let name = self.voice_name.trim();
                 if name.is_empty() {
@@ -704,6 +776,13 @@ const SCRIPT_LANGUAGES: [(&str, &str); 3] = [("hinglish", "Hinglish (Hindi + Eng
 const WRITERS: [(&str, &str); 2] = [("claude", "Claude (through Claude Code; best quality)"), ("local", "Local model (offline)")];
 const VOICE_SOURCES: [(&str, &str); 2] =
     [("record", "Record with the microphone (EI gives the sentences)"), ("files", "Recordings I already have (audio or video)")];
+const MAC_VOICES: [(&str, &str); 5] = [
+    ("mac:Rishi", "Rishi: Indian English (macOS voice, quick preview)"),
+    ("mac:Tara", "Tara: Indian English (macOS voice)"),
+    ("mac:Aman", "Aman: Indian English (macOS voice)"),
+    ("mac:Lekha", "Lekha: Hindi (macOS voice)"),
+    ("mac", "macOS voice for the script's language"),
+];
 const PRESETS: [(&str, &str); 3] = [("long", "YouTube 16:9"), ("short", "Short / Reel 9:16"), ("travel", "Travel 16:9")];
 
 const VIDEO_EXT: [&str; 9] = ["mp4", "mov", "m4v", "mkv", "avi", "mts", "m2ts", "webm", "mxf"];
@@ -744,6 +823,7 @@ fn default_output(d: &Draft) -> String {
         Kind::Audio => d.clips.first().map(|c| parent_dir(c).to_string_lossy().to_string()).unwrap_or_else(|| movies_dir().to_string_lossy().to_string()),
         Kind::Script => movies_dir().join("Scripts").join(slug(if d.topic.trim().is_empty() { "script" } else { &d.topic })).to_string_lossy().to_string(),
         Kind::Voice => voices_dir().join(slug(&d.voice_name)).to_string_lossy().to_string(),
+        Kind::Topic => String::new(), // the engine names the folder after the topic (Movies/EI/Topics/…)
     }
 }
 
@@ -1152,6 +1232,7 @@ fn run_draft(d: &mut Draft) -> Result<u64, String> {
         Kind::Split | Kind::Reference | Kind::Talk | Kind::Voiceover | Kind::Clips => format!("{}: {}", d.kind.title(), file_stem(&d.input)),
         Kind::Script => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Voice => format!("{}: {}", d.kind.title(), d.voice_name.trim()),
+        Kind::Topic => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
     };
     Ok(start_job(title, Some(d.kind), vec![step], d.import, Some(engine)))
 }
@@ -1337,10 +1418,10 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     }
                     ui.end_row();
                 }
-                if d.kind.needs_clips() || d.kind == Kind::Script || (d.kind == Kind::Voice && d.source == "files") {
+                if d.kind.needs_clips() || d.kind == Kind::Script || (d.kind == Kind::Voice && d.source == "files") || (d.kind == Kind::Topic && d.make_video) {
                     ui.label(match d.kind {
                         Kind::Audio => "Videos",
-                        Kind::Script => "Footage (optional)",
+                        Kind::Script | Kind::Topic => "Your footage (optional)",
                         Kind::Voice => "Your recordings",
                         Kind::Voiceover => "Footage",
                         _ => "Clips",
@@ -1372,7 +1453,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     });
                     ui.end_row();
                 }
-                if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover | Kind::Reference | Kind::Clips) {
+                if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover | Kind::Reference | Kind::Clips) || (d.kind == Kind::Topic && d.make_video) {
                     ui.label(match d.kind {
                         Kind::Music => "Music",
                         Kind::Reference => "Other soundtrack (optional)",
@@ -1620,6 +1701,107 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             ui.end_row();
                         }
                     }
+                    Kind::Topic => {
+                        ui.label("Topic or link");
+                        let r = ui.add(
+                            egui::TextEdit::multiline(&mut d.topic)
+                                .hint_text("e.g. GTA 6 release, or a link to a post/article")
+                                .desired_rows(2)
+                                .desired_width(380.0),
+                        );
+                        elems.push((format!("{p}.topic"), r.rect, d.topic.clone()));
+                        ui.end_row();
+                        ui.label("Length (seconds)");
+                        ui.horizontal(|ui| {
+                            let r = ui.add(egui::DragValue::new(&mut d.seconds).range(5.0..=1800.0).speed(1.0).max_decimals(0));
+                            elems.push((format!("{p}.seconds"), r.rect, d.seconds.to_string()));
+                            for (label, v) in [("Short 30 s", 30.0), ("60 s", 60.0), ("3 min", 180.0), ("8 min", 480.0)] {
+                                let b = ui.small_button(label);
+                                elems.push((format!("{p}.seconds.{}", v as u32), b.rect, label.into()));
+                                if b.clicked() {
+                                    d.seconds = v;
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Language");
+                        radio_row(ui, &mut d.language, &SCRIPT_LANGUAGES, &format!("{p}.language"), &mut elems);
+                        ui.end_row();
+                        ui.label("Talking style");
+                        let styles = saved_styles();
+                        let shown = if d.style.is_empty() { "None (a natural creator style)".to_string() } else { d.style.clone() };
+                        let r = egui::ComboBox::from_id_salt(format!("{p}.style")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+                            let o = ui.selectable_value(&mut d.style, String::new(), "None (a natural creator style)");
+                            elems.push((format!("{p}.style.none"), o.rect, "None".into()));
+                            for st in &styles {
+                                let o = ui.selectable_value(&mut d.style, st.clone(), st);
+                                elems.push((format!("{p}.style.{st}"), o.rect, st.clone()));
+                            }
+                        });
+                        elems.push((format!("{p}.style"), r.response.rect, shown));
+                        ui.end_row();
+                        ui.label("Research & writing");
+                        combo_row(ui, &mut d.writer, &WRITERS, &format!("{p}.writer"), &mut elems);
+                        ui.end_row();
+                        ui.label("");
+                        ui.vertical(|ui| {
+                            let r = ui.checkbox(&mut d.make_video, "Make the video (untick for the script and sources only)");
+                            elems.push((format!("{p}.video"), r.rect, d.make_video.to_string()));
+                            let r = ui.checkbox(&mut d.fresh, "Research again (otherwise the last research of this topic is reused)");
+                            elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
+                        });
+                        ui.end_row();
+                        if d.make_video {
+                            ui.label("Voiceover");
+                            let mut voices: Vec<(String, String)> = saved_voices().into_iter().map(|v| (v.clone(), format!("{v} (your clone)"))).collect();
+                            for (k, l) in MAC_VOICES {
+                                voices.push((k.to_string(), l.to_string()));
+                            }
+                            let shown = voices.iter().find(|v| v.0 == d.voice).map(|v| v.1.clone()).unwrap_or_else(|| "Choose a voice…".into());
+                            let r = egui::ComboBox::from_id_salt(format!("{p}.voice")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+                                for (k, l) in &voices {
+                                    let o = ui.selectable_value(&mut d.voice, k.clone(), l);
+                                    elems.push((format!("{p}.voice.{k}"), o.rect, l.clone()));
+                                }
+                            });
+                            elems.push((format!("{p}.voice"), r.response.rect, shown));
+                            ui.end_row();
+                            if !d.voice.starts_with("mac") && !d.voice.is_empty() {
+                                ui.label("Takes per line");
+                                let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
+                                elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
+                                ui.end_row();
+                            }
+                            ui.label("Shape");
+                            radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
+                            ui.end_row();
+                            ui.label("Pace");
+                            radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
+                            ui.end_row();
+                            ui.label("Pictures from");
+                            ui.vertical(|ui| {
+                                let r = ui.checkbox(&mut d.src_free, "Free-licensed photos and videos (Wikimedia Commons, Openverse; credited)");
+                                elems.push((format!("{p}.free"), r.rect, d.src_free.to_string()));
+                                let r = ui.checkbox(&mut d.src_cards, "Headline and fact cards from the research");
+                                elems.push((format!("{p}.cards"), r.rect, d.src_cards.to_string()));
+                                let r = ui.checkbox(&mut d.src_youtube, "Short clips from YouTube videos the research finds");
+                                elems.push((format!("{p}.youtube"), r.rect, d.src_youtube.to_string()));
+                                if d.src_youtube {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Only where you have the right to use them (e.g. commentary or news). Every source is listed in sources.md.",
+                                        )
+                                        .weak(),
+                                    );
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("");
+                            let r = ui.checkbox(&mut d.captions, "Captions");
+                            elems.push((format!("{p}.captions"), r.rect, d.captions.to_string()));
+                            ui.end_row();
+                        }
+                    }
                     Kind::Voice => {
                         ui.label("Voice name");
                         let r = ui.add(egui::TextEdit::singleline(&mut d.voice_name).hint_text("e.g. my voice").desired_width(240.0));
@@ -1650,15 +1832,19 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     }
                 }
                 if d.kind != Kind::Voice {
-                    let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio);
+                    let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic);
                     ui.label(if folder_out { "Output folder" } else { "Save as" });
-                    let hint = if d.kind == Kind::Script { "automatic (Movies/EI/Scripts)" } else { "automatic (next to the source)" };
+                    let hint = match d.kind {
+                        Kind::Script => "automatic (Movies/EI/Scripts)",
+                        Kind::Topic => "automatic (Movies/EI/Topics/<topic>)",
+                        _ => "automatic (next to the source)",
+                    };
                     if path_row(ui, &mut d.out, &format!("{p}.out"), hint, &mut elems) {
                         pick = Some(Pick::Out);
                     }
                     ui.end_row();
                 }
-                if !matches!(d.kind, Kind::Script | Kind::Voice) {
+                if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic) {
                     ui.label("");
                     let label = match d.kind {
                         Kind::Split | Kind::Clips => "Import the clips into the project",
@@ -1689,6 +1875,8 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Voice => "Create Voice",
                     Kind::Script if !d.voice.is_empty() => "Write and Speak",
                     Kind::Script => "Write Script",
+                    Kind::Topic if d.make_video => "Make Video",
+                    Kind::Topic => "Research and Write",
                     _ => "Run",
                 };
                 let o = ui.add(egui::Button::new(egui::RichText::new(run_label).color(egui::Color32::WHITE)).fill(app.tokens.accent));
@@ -1749,7 +1937,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 }
             }
             Pick::Out => {
-                if matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio) {
+                if matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic) {
                     if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
                         d.out = dir;
                     }
@@ -2093,6 +2281,9 @@ fn description(kind: Kind) -> &'static str {
         }
         Kind::Script => {
             "Claude (or the local model) writes a voiceover script in your talking style, line by line with emotion, pace and a shot idea for each line, ready for your cloned voice. Optionally speaks it right away."
+        }
+        Kind::Topic => {
+            "Give a topic or a link to a post. Claude researches it on the web (facts with sources), writes the script, and EI makes the video: your cloned voice (or a macOS voice), credited free-licensed photos and videos, fact cards, your own footage, optional YouTube clips. Or make only the script with its sources."
         }
         Kind::Voice => {
             "Clones your voice on this Mac (Chatterbox Multilingual, Hindi + English). Read the sentences EI shows (they cover every sound and the deliveries a video needs), or use recordings you already have. Use only your own voice, or a voice you have permission to use."
@@ -2536,6 +2727,26 @@ mod tests {
         assert!(Draft::from_params(Kind::Voice, &json!({"name": "v", "source": "record"})).engine_args().is_err());
         assert_eq!(slug("  My Voice / Hindi "), "My-Voice-Hindi");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn topic_video_arguments() {
+        let mut d = Draft::from_params(Kind::Topic, &json!({"topic": "GTA 6 release", "seconds": 45, "voice": "mac:Rishi", "youtube": true, "cards": false}));
+        let a = d.engine_args().unwrap();
+        assert_eq!(a.get(..2), Some(&["topic".to_string(), "GTA 6 release".to_string()][..]));
+        for pair in [["--seconds", "45"], ["--voice", "mac:Rishi"], ["--writer", "claude"], ["--aspect", "vertical"]] {
+            assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
+        }
+        let src = a.iter().position(|x| x == "--sources").unwrap();
+        assert_eq!(a.get(src + 1..src + 3), Some(&["free".to_string(), "youtube".to_string()][..]));
+        assert!(!a.contains(&"--no-captions".to_string()), "captions on by default");
+        // script only: no voice needed
+        let a = Draft::from_params(Kind::Topic, &json!({"topic": "https://example.com/post", "video": false})).engine_args().unwrap();
+        assert!(a.contains(&"--script-only".to_string()) && !a.contains(&"--voice".to_string()));
+        // a video needs a voice and a picture source
+        assert!(Draft::from_params(Kind::Topic, &json!({"topic": "x"})).engine_args().is_err());
+        assert!(Draft::from_params(Kind::Topic, &json!({"topic": "x", "voice": "v", "free": false, "cards": false})).engine_args().is_err());
+        assert!(Draft::from_params(Kind::Topic, &json!({"topic": " "})).engine_args().is_err());
     }
 
     #[test]

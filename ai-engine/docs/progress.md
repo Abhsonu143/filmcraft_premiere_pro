@@ -183,3 +183,16 @@ Full description: `docs/voice-and-voiceover.md`.
   Voiceover Script… (style learning, Claude/local, speak with a voice), and a reworked AI ▸ Voiceover Edit…
   (shape, pace, shot ideas, caption style, natural sound).
 - **Not changed:** Make Short Clips (highlights, clip_edit, reframe, captions): same code, same tests.
+
+## Video from Topic (2026-11-13)
+
+- `topic_video.py` + AI ▸ Video from Topic…: a topic or link goes through research (Claude with web search,
+  facts with sources) to a script (facts only) to a voice (clone, macOS voice, or script only), then to credited
+  media and the voiceover edit.
+  - **Media:** Wikimedia Commons, Openverse, fact cards, opt-in YouTube sections, your own footage.
+  - **Outputs:** `sources.md`, a paste-ready `description.txt` with credits, and `research.json`, which is
+    reused unless refreshed.
+- **voice.py:** macOS voices (`mac:<name>`) as an instant, non-clone option.
+- **narrate.py:** optional per-line media hints, and stills shown once. With neither option, behaviour is the
+  same as before.
+- Details and timings: `docs/topic-video.md`.

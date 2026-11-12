@@ -16,7 +16,8 @@ Subcommands (all paths absolute or relative to the current folder):
     script-style SOURCES... --name N       learn a talking style from .txt/.srt/.vtt or YouTube links
     script-write --topic T --out O [--language en|hi|hinglish] [--seconds 60] [--style N] [--backend claude|local]
     voice-prompts / voice-mics / voice-record --out F / voice-enroll --name N [--files F...] [--takes T.json] / voice-list
-    speak     --voice N --script S --out O.wav   a script in your cloned voice (+ .narration.json)
+    speak     --voice N --script S --out O.wav   a script in your cloned voice (+ .narration.json); N = mac:<voice> for macOS voices
+    topic     TOPIC_OR_LINK [--seconds 60] [--voice N | --script-only] [--sources free youtube cards]   researched video
     clips     VIDEO --out-dir D [--count 5] [--min 10] [--max 60] [--target 48] [--aspect vertical] [--llm KEY]
     audio     FILE... [--format mp3|m4a|wav|aiff|flac|alac|opus|ogg] [--quality original|best|high|medium|small]
     llm       [--set-default KEY]   the local language models and the saved default
@@ -111,9 +112,11 @@ def run(argv: list[str]) -> dict:
     extract_audio.add_args(sub.add_parser("audio", help="save the sound of videos as audio files"))
     import narrate
     import script_writer
+    import topic_video
     import voice
 
     script_writer.add_args(sub, "script-")
+    topic_video.add_args(sub.add_parser("topic", help="topic or link -> research -> script -> voice -> edited video"))
     voice.add_args(sub)
     pl = sub.add_parser("llm", help="list language models / set the default")
     pl.add_argument("--set-default")
@@ -136,6 +139,8 @@ def run(argv: list[str]) -> dict:
         return highlights.run_args(a)
     if a.cmd == "audio":
         return extract_audio.run_args(a)
+    if a.cmd == "topic":
+        return topic_video.run_args(a)
     if a.cmd.startswith("script-"):
         return script_writer.run_args(a)
     if a.cmd.startswith("voice-") or a.cmd == "speak":

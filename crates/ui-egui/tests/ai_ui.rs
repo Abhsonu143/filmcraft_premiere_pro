@@ -108,7 +108,7 @@ fn ai_menu_and_dialogs() {
     for id in ["ai.split", "ai.music", "ai.reference", "ai.talk", "ai.voiceover", "ai.clips", "ai.audio", "ai.jobs", "ai.setup"] {
         assert!(menu.contains(id), "{id} in the menus");
     }
-    let expect: [(&str, &[&str]); 9] = [
+    let expect: [(&str, &[&str]); 10] = [
         ("split", &["input", "clipLength", "quality.same", "quality.exact", "out", "import", "run"]),
         (
             "music",
@@ -146,6 +146,26 @@ fn ai_menu_and_dialogs() {
                 "writer",
                 "voice",
                 "clips.add",
+                "out",
+                "run",
+            ],
+        ),
+        (
+            "topic",
+            &[
+                "topic",
+                "seconds",
+                "seconds.60",
+                "language.hinglish",
+                "style",
+                "writer",
+                "video",
+                "fresh",
+                "voice",
+                "free",
+                "cards",
+                "youtube",
+                "captions",
                 "out",
                 "run",
             ],

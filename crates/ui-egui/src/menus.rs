@@ -136,6 +136,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("ai.talk", "Talking Head Auto-Cut…", ["AI"], None),
     uic!("ai.voice", "Voice Clone…", ["AI"], None),
     uic!("ai.script", "Write Voiceover Script…", ["AI"], None),
+    uic!("ai.topic", "Video from Topic…", ["AI"], None),
     uic!("ai.voiceover", "Voiceover Edit…", ["AI"], None),
     uic!("ai.clips", "Make Short Clips from Long Video…", ["AI"], None),
     uic!("ai.audio", "Extract Audio from Video…", ["AI"], None),

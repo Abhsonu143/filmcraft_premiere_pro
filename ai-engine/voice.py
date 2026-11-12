@@ -670,9 +670,59 @@ def script_segments(script: str) -> tuple[list[dict], str]:
     return segs, ("hi" if detect_lang(text) == "hi" else "en")
 
 
+MAC_VOICES = {"hi": "Lekha", "en": "Rishi"}  # built into macOS (Indian Hindi / Indian English)
+
+
+def list_mac_voices() -> list[str]:
+    """macOS voices for Hindi and Indian/US/UK English (quick, offline, not a clone)."""
+    proc = subprocess.run(["say", "-v", "?"], capture_output=True, text=True)
+    out = []
+    for line in proc.stdout.splitlines():
+        m = re.match(r"^(.+?)\s+(hi_IN|en_IN|en_US|en_GB)\s+#", line)
+        if m and not re.search(r"Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Wobble|Good News|Jester|Organ|Superstar|Trinoids|Whisper|Zarvox|Hysterical|Bells", m.group(1)):
+            out.append(f"{m.group(1).strip()} ({m.group(2)})")
+    return out
+
+
+def speak_mac(voice: str, script: str, out: str, language: str | None = None) -> dict:
+    """A script read by a macOS voice ("mac", "mac:Lekha", "mac:Rishi"…): same outputs as speak()."""
+    segs, default_lang = script_segments(script)
+    if not segs:
+        raise AutocutError("the script is empty")
+    name = voice.split(":", 1)[1].strip() if ":" in voice else ""
+    outp = Path(out).with_suffix(".wav")
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    parts, timeline, t = [], [], 0.0
+    with tempfile.TemporaryDirectory(prefix="ei-say-") as tmp:
+        for i, s in enumerate(segs):
+            lang = language or ("hi" if detect_lang(s["text"]) == "hi" else default_lang)
+            v = name or MAC_VOICES.get(lang, "Rishi")
+            rate = {"slow": 165, "fast": 205}.get(s.get("pace", "normal"), 185)
+            aiff = Path(tmp) / f"s{i}.aiff"
+            subprocess.run(["say", "-v", v, "-r", str(rate), "-o", str(aiff), s["text"]], capture_output=True, check=False)
+            y = trim_silence(read_wav(aiff), pad=0.04) if aiff.is_file() else np.zeros(int(0.5 * SR), np.float32)
+            parts.append(y)
+            dur = len(y) / SR
+            timeline.append({"start": round(t, 3), "end": round(t + dur, 3), "text": s["text"], "emotion": s.get("emotion", "neutral"),
+                             "section": s.get("section"), "visual": s.get("visual", ""), "lang": lang, "check": {"cer": None, "sim": None, "heard": "", "ref": f"mac:{v}"}})
+            t += dur
+            gap = float(s.get("pause_after", 0.35)) if i < len(segs) - 1 else 0.6
+            parts.append(np.zeros(int(gap * SR), np.float32))
+            t += gap
+        raw = Path(tmp) / "raw.wav"
+        write_wav(raw, np.concatenate(parts))
+        ac.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-af", "loudnorm=I=-16:TP=-1.5:LRA=9", "-ar", "48000", str(outp)])
+    nj = outp.with_suffix(".narration.json")
+    nj.write_text(json.dumps({"version": 1, "voice": voice, "engine": "macos", "duration": round(t, 3), "segments": timeline}, ensure_ascii=False, indent=1), encoding="utf-8")
+    log(f"narration {t:.1f}s with the macOS voice {name or 'Lekha/Rishi'}")
+    return {"outputs": [str(outp)], "narration": str(nj), "out_dir": str(outp.parent), "duration": round(t, 2)}
+
+
 def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, takes: int = 2, language: str | None = None,
           whisper_model: str | None = None) -> dict:
-    """Script -> narration in the cloned voice (wav + narration.json)."""
+    """Script -> narration in the cloned voice (wav + narration.json). `mac` / `mac:<name>` uses a macOS voice."""
+    if voice_name == "mac" or voice_name.startswith("mac:"):
+        return speak_mac(voice_name, script, out, language)
     ac.require_tools()
     prof, d = load_profile(voice_name)
     eng = engine or prof.get("engine") or DEFAULT_ENGINE
@@ -829,7 +879,7 @@ def run_args(a) -> dict:
     if a.cmd == "voice-record":
         return record(a.out, a.max, mic=a.mic, stop_file=a.stop_file)
     if a.cmd == "voice-list":
-        return {"voices": list_voices()}
+        return {"voices": list_voices(), "mac": list_mac_voices()}
     if a.cmd == "voice-enroll":
         takes = json.loads(Path(a.takes).read_text(encoding="utf-8")) if a.takes else None
         return enroll(a.name, a.files, takes, a.languages, a.engine, a.add)

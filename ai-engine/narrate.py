@@ -283,7 +283,7 @@ def shots_for_lines(lines: list[dict], total: float, pace: str, lead: float = 0.
     return [s for s in slots if s["end"] - s["start"] > 0.2]
 
 
-def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], first: bool, k: int = 30) -> list[dict]:
+def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], first: bool, k: int = 30, hinted: set[int] | None = None) -> list[dict]:
     """Best windows (clip, in) of the slot's length, with their unary score."""
     dur = slot["end"] - slot["start"]
     want_motion = EMOTION_MOTION.get(line.get("emotion", "neutral"), 0.4)
@@ -308,6 +308,7 @@ def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], fir
             out.append({"clip": ci, "in": round(float(a), 2), "sem": sem, "qual": qual, "look": look, "mot": mot, "size": size})
     if not out:
         return []
+    any_stills = any(c.get("still") for c in clips)
     # meaning first: how much better than the footage's typical match for this line
     sems = np.asarray([x["sem"] for x in out])
     mu, sd = float(np.median(sems)), float(sems.std() + 1e-6)
@@ -315,6 +316,12 @@ def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], fir
         s = 1.0 * (x["sem"] - mu) / sd + 0.5 * x["qual"] + 0.2 * float(np.clip(x["look"], -1, 1)) - 0.3 * abs(min(1.0, x["mot"]) - want_motion)
         if first and x["size"] in ("aerial", "wide"):
             s += 0.2  # establish the place first
+        if hinted and x["clip"] in hinted:
+            s += 1.2  # media found for exactly this line (topic videos)
+        if clips[x["clip"]].get("card"):
+            s -= 0.6  # text cards are seasoning: real pictures first
+        elif any_stills and not clips[x["clip"]].get("still"):
+            s += 0.3  # moving footage beats a photo
         x["score"] = float(s)
     out.sort(key=lambda x: -x["score"])
     # keep variety in the shortlist: at most 4 windows per clip
@@ -331,7 +338,8 @@ def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], fir
 
 
 def choose(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_order: bool, beam: int = 12) -> list[dict]:
-    """The whole edit at once (beam search over slots)."""
+    """The whole edit at once (beam search over slots). A still (photo, title card: `clip["still"]`)
+    is one moment: shown once, never in two slots."""
     State = tuple  # (score, picks list, used {clip: [(a,b)]})
     beams: list[tuple[float, list[dict], dict]] = [(0.0, [], {})]
     for si, (slot, cs) in enumerate(zip(slots, cands)):
@@ -343,6 +351,13 @@ def choose(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_
                 spans = used.get(c["clip"], [])
                 if any(not (c["in"] + dur + 0.5 <= a or c["in"] >= b + 0.5) for a, b in spans):
                     continue  # never show the same moment twice
+                if spans and clips[c["clip"]].get("still"):
+                    continue  # a photo or card is one moment however long its clip
+                if clips[c["clip"]].get("card"):
+                    if prev is not None and clips[prev["clip"]].get("card"):
+                        continue  # never two text cards in a row
+                    if sum(1 for q in picks if clips[q["clip"]].get("card")) >= max(1, len(slots) // 4):
+                        continue  # cards: at most about a quarter of the shots
                 s = c["score"]
                 if prev is not None:
                     if prev["clip"] == c["clip"]:
@@ -468,7 +483,8 @@ def build_sound(voice: str, shots: list[dict], clips: list[dict], fps: float, to
 def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = None, script: str | None = None, aspect: str = "horizontal",
          pace: str = "medium", captions: bool = False, caption_style: str = "clean", music: str | None = None, music_db: float = -20.0,
          ambience_db: float = -24.0, describe: str = "local", model: str | None = None, story_order: bool = True, look: str = "natural",
-         whisper_model: str = ac.DEFAULT_WHISPER, workers: int = 2, plan_only: bool = False) -> dict:
+         whisper_model: str = ac.DEFAULT_WHISPER, workers: int = 2, plan_only: bool = False, hints: dict[str, list[int]] | None = None,
+         stills: set[str] | None = None, cards: set[str] | None = None) -> dict:
     import render
     import voiceover_cut as vc
 
@@ -506,7 +522,14 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
     clips = index_footage(vc.collect_clips(clips_in))
     q = line_embeddings(lines)
     slots = shots_for_lines(lines, total, pace)
-    cands = [candidates(s, lines[s["line"]], q[s["line"]], clips, first=(i == 0)) for i, s in enumerate(slots)]
+    for c in clips:
+        c["still"] = c["path"] in (stills or set()) or c["path"] in (cards or set())
+        c["card"] = c["path"] in (cards or set())
+    by_line: dict[int, set[int]] = {}
+    for ci, c in enumerate(clips):
+        for li in (hints or {}).get(c["path"], []):
+            by_line.setdefault(int(li), set()).add(ci)
+    cands = [candidates(s, lines[s["line"]], q[s["line"]], clips, first=(i == 0), hinted=by_line.get(s["line"])) for i, s in enumerate(slots)]
     picks = choose(slots, cands, clips, story_order)
     shots = build_shots(slots, picks, lines, clips, fps, W, H)
     outp = Path(out).resolve()

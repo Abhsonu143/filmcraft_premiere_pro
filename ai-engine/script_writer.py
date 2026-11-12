@@ -435,13 +435,13 @@ def clean_segment(s: dict) -> dict | None:
 
 def write_script(topic: str, out: str, *, niche: str = "", seconds: float = 60, language: str = "en", tone: str = "", audience: str = "",
                  notes: str = "", style: str | None = None, footage: list[str] | None = None, backend: str = "claude",
-                 model: str | None = None, voice: str | None = None, speak_takes: int = 2) -> dict:
+                 model: str | None = None, voice: str | None = None, speak_takes: int = 2, pace_voice: str | None = None) -> dict:
     if language not in LANGUAGES:
         raise AutocutError(f"language must be one of {', '.join(LANGUAGES)}")
     if not (5 <= seconds <= 1800):
         raise AutocutError("length must be 5–1800 seconds")
     prof = load_style(style)
-    wpm = voice_wpm(voice, language)
+    wpm = voice_wpm(voice or pace_voice, language)
     prompt = build_prompt(topic, niche=niche, seconds=seconds, language=language, tone=tone, audience=audience, notes=notes, style=prof, footage=footage, wpm=wpm)
     t0 = time.time()
     if backend == "claude":
