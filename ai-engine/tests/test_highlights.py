@@ -84,7 +84,7 @@ def test_pieces_teaser_and_caption_remap():
     assert [w["word"].strip() for w in out] == ["hello", "world"]
     assert out[1]["start"] == pytest.approx(1.2 + 0.5)
     ass = hl.build_ass(out, "My Title", 1080, 1920, 2.7)
-    assert "Title,,0,0,0,,My Title" in ass and "HELLO" in ass
+    assert "My Title" in ass and "HELLO" in ass
 
 
 def test_model_settings(tmp_path, monkeypatch):
@@ -117,7 +117,7 @@ def test_action_mode_builds_multi_piece_clips(tmp_path):
     spans = sorted(p for c in clips for p in c["pieces"])
     assert all(b <= c for (_, b), (c, _) in zip(spans, spans[1:]))  # never reuse material
     for c in clips:
-        d = sum(b - a for a, b in c["pieces"])
+        d = sum(s["len"] for s in c["shots"])
         assert 10 <= d <= 25 and len(c["pieces"]) >= 2
         mid = np.mean([(a + b) / 2 for a, b in c["pieces"]])
         assert any(a - 15 <= mid <= a + 35 for a in (20, 80, 140)), c["pieces"]
@@ -167,5 +167,5 @@ def test_clips_from_long_talk_end_to_end(tmp_path, capsys):
     for c, out in zip(res["clips"], res["outputs"]):
         info = ac.probe(out)
         assert (info.width, info.height) == (1080, 1920) and info.has_audio
-        assert 10 <= info.duration <= 30.5 and c["pieces"] >= 2
+        assert 10 <= info.duration <= 30.5 and c["shots"] >= 2
         assert out.endswith(".mp4") and (tmp_path / "clips" / (out.rsplit("/", 1)[1][:-4] + ".srt")).is_file()

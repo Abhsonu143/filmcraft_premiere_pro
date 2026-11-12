@@ -23,7 +23,8 @@
 //! - `ai.talk {input, out?, preset?=long|short|travel, captions?, music?, import?}`
 //! - `ai.voiceover {input, clips: [..], out?, script?, music?, captions?, preset?, import?}`
 //! - `ai.clips {input, outDir?, count?=5, min?=10, target?=48, max?=60, aspect?=vertical|square|horizontal|same,
-//!   content?=auto|talk|gameplay, framing?=auto|crop|fit, captionMode?=auto|on|off, llm?=default|<model>|none, title?, hook?, import?}`
+//!   content?=auto|talk|gameplay, framing?=auto|center|blur|bars, captionMode?=auto|on|off, captionStyle?=pop|clean|boxed,
+//!   titleMode?=off|intro|always, pace?=fast|medium|slow, music?, llm?=default|<model>|none, hook?, import?}`
 //! - `ai.audio {clips: [files or folders], outDir?, format?=mp3|m4a|wav|aiff|flac|alac|opus|ogg,
 //!   audioQuality?=original|best|high|medium|small, start?, end?, mono?, normalize?, import?}`
 //! - each returns `{job}`; `ai.jobs` returns every job (and shows the window); `ai.cancel {job}`;
@@ -145,7 +146,8 @@ struct Draft {
     framing: &'static str,
     caption_mode: &'static str,
     hook: bool,
-    title_on: bool,
+    title_mode: &'static str,
+    caption_style: &'static str,
     llm: &'static str,
     format: &'static str,
     audio_quality: &'static str,
@@ -185,7 +187,8 @@ impl Draft {
             framing: "auto",
             caption_mode: "auto",
             hook: true,
-            title_on: true,
+            title_mode: "off",
+            caption_style: "pop",
             llm: "default",
             format: "mp3",
             audio_quality: "high",
@@ -227,7 +230,8 @@ impl Draft {
         d.framing = pick("framing", &FRAMINGS.map(|a| a.0), d.framing);
         d.caption_mode = pick("captionMode", &CAPTION_MODES.map(|a| a.0), d.caption_mode);
         d.hook = p.get("hook").and_then(Value::as_bool).unwrap_or(d.hook);
-        d.title_on = p.get("title").and_then(Value::as_bool).unwrap_or(d.title_on);
+        d.title_mode = pick("titleMode", &TITLE_MODES.map(|a| a.0), d.title_mode);
+        d.caption_style = pick("captionStyle", &CAPTION_STYLES.map(|a| a.0), d.caption_style);
         d.llm = pick("llm", &LLMS.map(|a| a.0), d.llm);
         d.format = pick("format", &AUDIO_FORMATS.map(|a| a.0), d.format);
         d.audio_quality = pick("audioQuality", &AUDIO_QUALITIES.map(|a| a.0), d.audio_quality);
@@ -350,12 +354,15 @@ impl Draft {
                 push(&mut a, "--content", self.content);
                 push(&mut a, "--framing", self.framing);
                 push(&mut a, "--captions", self.caption_mode);
+                push(&mut a, "--caption-style", self.caption_style);
+                push(&mut a, "--title", self.title_mode);
+                push(&mut a, "--pace", self.pace);
+                if !self.music.trim().is_empty() {
+                    push(&mut a, "--music", self.music.trim());
+                }
                 push(&mut a, "--llm", self.llm);
                 if !self.hook {
                     a.push("--no-hook".into());
-                }
-                if !self.title_on {
-                    a.push("--no-title".into());
                 }
             }
             Kind::Audio => {
@@ -438,9 +445,15 @@ const CONTENTS: [(&str, &str); 3] = [
     ("talk", "Talk: podcast, vlog, interview (built from sentences)"),
     ("gameplay", "Gameplay / action (built from the most intense moments)"),
 ];
-const FRAMINGS: [(&str, &str); 3] =
-    [("auto", "Automatic (follow faces, else fit over blur)"), ("crop", "Crop to fill (follow the face)"), ("fit", "Whole frame over a blurred background")];
-const CAPTION_MODES: [(&str, &str); 3] = [("auto", "Automatic (on for talk)"), ("on", "On"), ("off", "Off")];
+const FRAMINGS: [(&str, &str); 4] = [
+    ("auto", "Fill the shape, following the action and faces"),
+    ("center", "Fill the shape, centred crop"),
+    ("blur", "Whole picture over a blurred copy"),
+    ("bars", "Whole picture with black bars"),
+];
+const CAPTION_MODES: [(&str, &str); 3] = [("auto", "Automatic (when the clip has clear speech)"), ("on", "On"), ("off", "Off")];
+const CAPTION_STYLES: [(&str, &str); 3] = [("pop", "Bold, word by word (Shorts / TikTok)"), ("clean", "Clean sentence case"), ("boxed", "Text on a dark box")];
+const TITLE_MODES: [(&str, &str); 3] = [("off", "Off (the title is in the file name)"), ("intro", "First 3 seconds"), ("always", "Whole clip")];
 const LLMS: [(&str, &str); 6] = [
     ("default", "Default (set in AI Engine Setup)"),
     ("qwen3-4b", "Qwen3 4B: best for 8 GB (2.3 GB)"),
@@ -1044,7 +1057,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     });
                     ui.end_row();
                 }
-                if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover | Kind::Reference) {
+                if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover | Kind::Reference | Kind::Clips) {
                     ui.label(match d.kind {
                         Kind::Music => "Music",
                         Kind::Reference => "Other soundtrack (optional)",
@@ -1121,17 +1134,24 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         ui.label("Framing");
                         combo_row(ui, &mut d.framing, &FRAMINGS, &format!("{p}.framing"), &mut elems);
                         ui.end_row();
+                        ui.label("Pace");
+                        radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
+                        ui.end_row();
                         ui.label("Captions");
                         combo_row(ui, &mut d.caption_mode, &CAPTION_MODES, &format!("{p}.captions"), &mut elems);
+                        ui.end_row();
+                        ui.label("Caption style");
+                        combo_row(ui, &mut d.caption_style, &CAPTION_STYLES, &format!("{p}.captionStyle"), &mut elems);
+                        ui.end_row();
+                        ui.label("Title in the video");
+                        combo_row(ui, &mut d.title_mode, &TITLE_MODES, &format!("{p}.titleMode"), &mut elems);
                         ui.end_row();
                         ui.label("Language model");
                         combo_row(ui, &mut d.llm, &LLMS, &format!("{p}.llm"), &mut elems);
                         ui.end_row();
                         ui.label("");
                         ui.vertical(|ui| {
-                            let r = ui.checkbox(&mut d.title_on, "Title at the top (written by the language model)");
-                            elems.push((format!("{p}.title"), r.rect, d.title_on.to_string()));
-                            let r = ui.checkbox(&mut d.hook, "Open talk clips with their strongest line");
+                            let r = ui.checkbox(&mut d.hook, "Open each clip with a teaser of its best moment");
                             elems.push((format!("{p}.hook"), r.rect, d.hook.to_string()));
                         });
                         ui.end_row();
@@ -1289,7 +1309,7 @@ fn description(kind: Kind) -> &'static str {
         Kind::Talk => "Removes the pauses from a talking video (jump cuts), with optional captions and music that ducks under your voice.",
         Kind::Voiceover => "Matches your footage to what the voiceover says, shot by shot, so the edit follows the narration.",
         Kind::Clips => {
-            "Finds the best moments of a long video and edits each clip from several pieces (no filler, no dead air), reframed, with a title and captions. Talk is built from sentences and topics; gameplay from the most intense moments."
+            "Edits each clip from a whole scene of a long video: only its best beats, cut on the action, a teaser first, slow motion on the climax, punch-ins on the big hits. Reframed to truly fill the shape (following the action and faces). Talk clips are built from sentences and topics. Optional captions, title card and music (cuts move onto its beats)."
         }
         Kind::Audio => "Saves the sound of videos as audio files in the format you choose. The videos are not changed.",
     }
@@ -1650,12 +1670,26 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("long.mov");
         std::fs::write(&video, b"x").unwrap();
-        let mut c = Draft::from_params(Kind::Clips, &json!({"input": video.to_string_lossy(), "count": 10, "llm": "qwen2.5-7b", "framing": "fit"}));
+        let mut c = Draft::from_params(
+            Kind::Clips,
+            &json!({"input": video.to_string_lossy(), "count": 10, "llm": "qwen2.5-7b", "framing": "blur", "titleMode": "intro", "captionStyle": "clean", "music": video.to_string_lossy()}),
+        );
         let a = c.engine_args().unwrap();
         assert_eq!(a.first().map(String::as_str), Some("clips"));
-        for pair in [["--count", "10"], ["--min", "10"], ["--target", "48"], ["--max", "60"], ["--llm", "qwen2.5-7b"], ["--framing", "fit"]] {
+        for pair in [
+            ["--count", "10"],
+            ["--min", "10"],
+            ["--target", "48"],
+            ["--max", "60"],
+            ["--llm", "qwen2.5-7b"],
+            ["--framing", "blur"],
+            ["--title", "intro"],
+            ["--caption-style", "clean"],
+            ["--pace", "medium"],
+        ] {
             assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
         }
+        assert!(a.windows(2).any(|w| w[0] == "--music" && w[1].ends_with("long.mov")), "{a:?}");
         assert!(c.out.ends_with("long - EI clips"), "{}", c.out);
         for bad in [json!({"count": 0}), json!({"count": 2.5}), json!({"min": 50, "target": 40}), json!({"max": 9000})] {
             let mut p = bad.clone();

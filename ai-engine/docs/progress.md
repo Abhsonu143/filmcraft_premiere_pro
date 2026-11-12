@@ -134,3 +134,23 @@ anywhere, no grade, no effects. Rebuilt as four layers, tested on the owner's 14
 1. Owner: run the FilmCraft import check (10 minutes) and one real project through both modes.
 2. CLIP indexing speed-up (keyframe-only decode) and per-shot caption burn (see benchmarks).
 3. Phase 3: mode auto-detection (cheap), then Shorts hook + face-follow crop, then gaming highlights.
+
+## Short clips v3: edited clips, true-fill framing, better captions (2026-11-12)
+
+- **Edited, not cut out** (`clip_edit.py`): each clip takes one scene of 2–4x its length and keeps only the beats.
+  - Pieces are cut on action: in 0.4–1.4 s before an impact, out after the reaction. Cuts never land inside a spoken phrase.
+  - Structure: a 2 s teaser of the best moment with a flash cut, then story order with pieces shortening as it builds (6 s → 3 s caps). The climax plays in real-frame slow motion (0.5x from 60 fps), and the payoff is held at the end.
+  - Effects: punch-ins on the biggest hits and slow push-ins on calm pieces.
+  - Fades, black frames and frozen frames are skipped.
+  - Optional music: cuts snap to its beats and it is ducked under the clip's sound.
+  - Gameplay test (92 min): 15–22 shots per 50 s clip, drawn from 110–158 s of source. The old version gave 4–7 near-contiguous pieces.
+- **True vertical, square and horizontal** (`reframe.py`, renderer `track` and `active`):
+  - Apple Vision (faces, people, salient objects, attention) at 4 fps drives a crop that fills the shape. It holds still, pans smoothly at limited speed, and jumps only on picture cuts.
+  - Cinematic letterbox bars are detected (even with subtitles inside them) and cropped away.
+  - Other framings: `center`, `blur` (the old look) and `bars`.
+- **Captions** (`captions.py`):
+  - Styles: pop (heavy font, word-by-word highlight), clean, boxed. Placement sits clear of platform buttons.
+  - Whisper junk is removed: loops, stutters, lone grunts, stock phrases.
+  - Captions: auto/on/off; auto turns them on only when the clip has clear speech.
+  - Title card: off by default, or intro/always. The title is always in the file name; duplicate titles are re-asked.
+- Timing (M3 8 GB, cached analysis): planning 10 clips takes ~100 s; rendering takes 13–22 s per 50 s clip. `quality_check` is clean on all 10.

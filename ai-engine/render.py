@@ -107,20 +107,62 @@ def grade_filters(plan: dict, shot: dict) -> str:
     return ",".join(out)
 
 
+def track_expr(keys: list, axis: int, pre: float) -> str:
+    """Piecewise-linear crop position over output time (keys: [t, fx, fy], t in seconds from the cut)."""
+    pts = sorted((float(k[0]), float(k[axis])) for k in keys)
+    if not pts:
+        return "0.5"
+    T = f"(t-{_f(pre)})"
+    expr = _f(pts[-1][1])
+    for (t0, v0), (t1, v1) in reversed(list(zip(pts, pts[1:]))):
+        seg = _f(v0) if t1 - t0 < 1e-6 else f"({_f(v0)}+{_f(v1 - v0)}*({T}-{_f(t0)})/{_f(t1 - t0)})"
+        expr = f"if(lt({T},{_f(t1)}),{seg},{expr})"
+    return f"if(lt({T},{_f(pts[0][0])}),{_f(pts[0][1])},{expr})"
+
+
+def frame_filters(shot: dict, W: int, H: int, zw: int, zh: int, pre: float) -> list[str]:
+    """Source picture -> zw x zh canvas: the active picture (black bars removed), then a tracked
+    crop that fills the shape ("smart"/"center"), or the whole picture fitted over a blurred copy
+    ("blur") or between black bars ("bars")."""
+    out = []
+    act = shot.get("active")
+    if act and len(act) == 4:
+        x0, y0, x1, y1 = (float(v) for v in act)
+        out.append(f"crop=w='trunc(iw*{_f(x1 - x0)}/2)*2':h='trunc(ih*{_f(y1 - y0)}/2)*2':x='iw*{_f(x0)}':y='ih*{_f(y0)}'")
+    fit = shot.get("fit")
+    if fit == "bars":
+        out.append(f"scale={zw}:{zh}:force_original_aspect_ratio=decrease:flags=bicubic,pad={zw}:{zh}:(ow-iw)/2:(oh-ih)/2:black,setsar=1")
+        return out
+    if fit == "blur":
+        bw, bh = max(2, W // 8 // 2 * 2), max(2, H // 8 // 2 * 2)
+        out.append(
+            f"split[bg][fg];[bg]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},boxblur=6:2,"
+            f"scale={zw}:{zh},eq=brightness=-0.12:saturation=1.15[bb];"
+            f"[fg]scale={zw}:{zh}:force_original_aspect_ratio=decrease:flags=bicubic[ff];"
+            f"[bb][ff]overlay=x='(W-w)/2':y='(H-h)/2',setsar=1"
+        )
+        return out
+    track = shot.get("track")
+    if track:
+        fx, fy = track_expr(track, 1, pre), track_expr(track, 2, pre)
+    else:
+        f = shot.get("focus") or [0.5, 0.5]
+        fx, fy = _f(float(f[0])), _f(float(f[1]))
+    out.append(f"crop=w='min(iw,ih*{W}/{H})':h='min(ih,iw*{H}/{W})':x='(iw-ow)*({fx})':y='(ih-oh)*({fy})'")
+    out.append(f"scale={zw}:{zh}:flags=bicubic,setsar=1")
+    return out
+
+
 def shot_filter(plan: dict, shot: dict, pre: int, post: int) -> str:
     W, H, fps = int(plan["width"]), int(plan["height"]), float(plan["fps"])
     total = shot["frames"] + pre + post
-    # Work at 1.5x the output size: zoom paths stay smooth (sub-pixel) without 4K-sized frames.
-    zw, zh = int(W * 1.5) // 2 * 2, int(H * 1.5) // 2 * 2
-    fx, fy = (shot.get("focus") or [0.5, 0.5])
-    chain = [
-        f"setpts='{pts_expr(shot, pre / fps)}'",
-        f"fps={_f(fps)}",
-        f"crop=w='min(iw,ih*{W}/{H})':h='min(ih,iw*{H}/{W})':x='(iw-ow)*{_f(fx)}':y='(ih-oh)*{_f(fy)}'",
-        f"scale={zw}:{zh}:flags=bicubic,setsar=1",
-        f"zoompan=z='{zoom_expr(shot, pre, fps)}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={W}x{H}:fps={_f(fps)}",
-        grade_filters(plan, shot),
-    ]
+    zoomed = bool(shot.get("punches")) or any(abs(float((shot.get("zoom") or {}).get(k, 1.0)) - 1.0) > 1e-6 for k in ("from", "to"))
+    # Work at 1.5x the output size when zooming: zoom paths stay smooth (sub-pixel) without 4K-sized frames.
+    zw, zh = (int(W * 1.5) // 2 * 2, int(H * 1.5) // 2 * 2) if zoomed else (W, H)
+    chain = [f"setpts='{pts_expr(shot, pre / fps)}'", f"fps={_f(fps)}", *frame_filters(shot, W, H, zw, zh, pre / fps)]
+    if zoomed:
+        chain.append(f"zoompan=z='{zoom_expr(shot, pre, fps)}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={W}x{H}:fps={_f(fps)}")
+    chain.append(grade_filters(plan, shot))
     t = f"(t-{_f(pre / fps)})"
     for tf in shot.get("flash", []):
         chain.append(f"eq=brightness='0.55*exp(-max(0,{t}-{_f(tf)})*9)*gte({t},{_f(tf)})':eval=frame")
@@ -169,7 +211,7 @@ def render_shot(plan: dict, shot: dict, pre: int, post: int, dst: Path, codec: s
 def shot_key(plan: dict, shot: dict, pre: int, post: int) -> str:
     st = os.stat(shot["clip"])
     keys = {k: v for k, v in shot.items() if k not in ("score", "why", "tags", "energy")}
-    raw = json.dumps([keys, st.st_size, int(st.st_mtime), pre, post, plan["width"], plan["height"], plan["fps"], plan.get("look"), plan.get("match"), "r2"], sort_keys=True)
+    raw = json.dumps([keys, st.st_size, int(st.st_mtime), pre, post, plan["width"], plan["height"], plan["fps"], plan.get("look"), plan.get("match"), "r3"], sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
 

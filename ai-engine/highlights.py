@@ -311,38 +311,6 @@ def loudness_per_sentence(src: str, sents: list[dict]) -> list[float]:
     return [float((d - mu_) / sd) for d in db]
 
 
-def face_centres(src: str, ranges: list[tuple[float, float]]) -> list[tuple[float, float] | None]:
-    """Normalised face centre (x, y) per time range via Apple Vision; None when no face."""
-    try:
-        import Vision
-        from Foundation import NSURL
-    except ImportError:
-        return [None] * len(ranges)
-    out = []
-    with tempfile.TemporaryDirectory(prefix="ei-faces-") as tmp:
-        for k, (a, b) in enumerate(ranges):
-            xs = []
-            n = max(1, min(4, int((b - a) / 0.8)))
-            for j in range(n):
-                t = a + (b - a) * (j + 0.5) / n
-                img = Path(tmp) / f"f{k}_{j}.jpg"
-                subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{t:.3f}", "-i", src, "-frames:v", "1", "-vf", "scale=640:-2", str(img)], capture_output=True)
-                if not img.is_file():
-                    continue
-                req = Vision.VNDetectFaceRectanglesRequest.alloc().init()
-                handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(NSURL.fileURLWithPath_(str(img)), None)
-                ok = handler.performRequests_error_([req], None)
-                if not (ok[0] if isinstance(ok, tuple) else ok):
-                    continue
-                faces = req.results() or []
-                if faces:
-                    f = max(faces, key=lambda r: r.boundingBox().size.width * r.boundingBox().size.height)
-                    bb = f.boundingBox()
-                    xs.append((bb.origin.x + bb.size.width / 2, 1 - (bb.origin.y + bb.size.height / 2)))
-            out.append((float(np.median([x for x, _ in xs])), float(np.median([y for _, y in xs]))) if xs else None)
-    return out
-
-
 def llm_judge(texts: list[str], model: str | None) -> list[tuple[str | None, float | None]]:
     """(title, standalone score 0–1) per transcript excerpt from the local model, or Nones."""
     import llm
@@ -460,264 +428,194 @@ def fallback_title(sents: list[dict], idx: list[int]) -> str:
 
 
 # ---------------------------------------------------------------------------------------------
-# Captions (ASS: word-by-word highlight + title)
+# Captions (see captions.py)
 # ---------------------------------------------------------------------------------------------
 
 
-def ass_time(t: float) -> str:
-    cs = max(0, int(round(t * 100)))
-    h, cs = divmod(cs, 360000)
-    m, cs = divmod(cs, 6000)
-    s, cs = divmod(cs, 100)
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+def build_ass(words_out: list[dict], title: str | None, W: int, H: int, total: float, style: str = "pop", title_mode: str = "always") -> str:
+    import captions
 
-
-def ass_escape(t: str) -> str:
-    return t.replace("\\", "").replace("{", "(").replace("}", ")").replace("\n", " ")
-
-
-def build_ass(words_out: list[dict], title: str | None, W: int, H: int, total: float) -> str:
-    big = H > W
-    fs = int(H * (0.05 if big else 0.06))
-    tfs = int(H * (0.034 if big else 0.05))
-    margin_v = int(H * (0.24 if big else 0.08))
-    head = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: {W}
-PlayResY: {H}
-WrapStyle: 0
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Cap,Helvetica Neue,{fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,{max(3, fs // 12)},2,2,60,60,{margin_v},1
-Style: Title,Helvetica Neue,{tfs},&H00FFFFFF,&H00FFFFFF,&H00000000,&HB4000000,1,0,0,0,100,100,0,0,3,{max(8, tfs // 3)},0,8,80,80,{int(H * 0.08)},1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-    ev = []
-    if title:
-        ev.append(f"Dialogue: 1,{ass_time(0)},{ass_time(total)},Title,,0,0,0,,{ass_escape(title)}")
-    cues = ac.group_words(words_out, max_words=3 if big else 6, max_chars=18 if big else 34, max_gap=0.5)
-    for cue in cues:
-        ws = [w for w in words_out if cue["start"] - 1e-3 <= w["start"] < cue["end"] + 1e-3]
-        if not ws:
-            ev.append(f"Dialogue: 0,{ass_time(cue['start'])},{ass_time(cue['end'])},Cap,,0,0,0,,{ass_escape(cue['text'].upper())}")
-            continue
-        for k, w in enumerate(ws):
-            a = w["start"] if k else cue["start"]
-            b = ws[k + 1]["start"] if k + 1 < len(ws) else cue["end"]
-            if b <= a:
-                continue
-            parts = []
-            for j, x in enumerate(ws):
-                t = ass_escape(x["word"].strip().upper())
-                parts.append("{\\c&H00E6FF&}" + t + "{\\c&HFFFFFF&}" if j == k else t)
-            ev.append(f"Dialogue: 0,{ass_time(a)},{ass_time(b)},Cap,,0,0,0,,{' '.join(parts)}")
-    return head + "\n".join(ev) + "\n"
+    return captions.build_ass(words_out, title, W, H, total, style, title_mode)
 
 
 def remap_to_pieces(words: list[dict], pieces: list[tuple[float, float]]) -> list[dict]:
+    import captions
+
+    fps = 1000.0
+    return captions.remap_to_shots([w for w in words if norm_word(w["word"]) not in FILLERS],
+                                   [{"in": a, "frames": round((b - a) * fps), "speed": 1.0} for a, b in pieces], fps)
+
+
+# ---------------------------------------------------------------------------------------------
+# Shots, framing and rendering one clip
+# ---------------------------------------------------------------------------------------------
+
+FRAMINGS = ("auto", "smart", "center", "blur", "bars")
+
+
+def talk_shots(pieces: list[tuple[float, float]], teaser: bool) -> list[dict]:
+    """Shots for a talk clip: jump cuts alternate between a wide and a closer framing (so a cut
+    inside one take reads as intentional); a teaser is followed by a flash cut."""
+    shots: list[dict] = []
+    z = 1.0
+    prev_end = None
+    teaser_done = not teaser
+    for k, (a, b) in enumerate(pieces):
+        sh: dict = {"in": a, "len": b - a, "speed": 1.0, "role": "talk"}
+        if not teaser_done and k > 0 and a < pieces[k - 1][0]:
+            teaser_done = True
+            sh["transition_in"] = {"type": "fadewhite", "frames": 6}
+            for prev in shots:
+                prev["role"] = "hook"
+            z = 1.0
+        elif prev_end is not None and 0 <= a - prev_end < 4.0:
+            z = 1.12 if z == 1.0 else 1.0
+        if z != 1.0:
+            sh["zoom"] = {"from": z, "to": z}
+        elif b - a >= 4.0:
+            sh["zoom"] = {"from": 1.0, "to": 1.05}  # a slow push-in keeps a long take alive
+        shots.append(sh)
+        prev_end = b
+    if shots:
+        shots[-1]["fade_out_s"] = 0.3
+    return shots
+
+
+def finalise_shots(shots: list[dict], fps: float) -> list[dict]:
+    """Exact frame counts (the edit never drifts) and source lengths that match them."""
     out = []
-    acc = 0.0
-    for a, b in pieces:
-        for w in words:
-            if norm_word(w["word"]) in FILLERS:
-                continue
-            ws, we = float(w["start"]), float(w["end"])
-            if ws >= a - 0.02 and ws < b:
-                out.append({"word": w["word"], "start": acc + max(0.0, ws - a), "end": acc + min(b, we) - a})
-        acc += b - a
-    out.sort(key=lambda w: w["start"])
+    for s in shots:
+        frames = max(1, int(round(s["len"] * fps)))
+        sh = {k: v for k, v in s.items() if k != "len"}
+        sh["frames"] = frames
+        if s.get("fade_out_s"):
+            sh["fade_out"] = max(1, int(round(float(s["fade_out_s"]) * fps)))
+            sh.pop("fade_out_s", None)
+        out.append(sh)
     return out
 
 
-# ---------------------------------------------------------------------------------------------
-# Rendering one clip
-# ---------------------------------------------------------------------------------------------
+def frame_shots(src: str, shots: list[dict], src_w: int, src_h: int, W: int, H: int, fps: float, framing: str, talk: bool) -> str:
+    """Adds framing to each shot (`track`/`active` for a true fill, `fit` for blur/bars). Returns
+    the framing actually used."""
+    import reframe
+
+    same_shape = abs(W / H - src_w / max(src_h, 1)) < 0.03
+    mode = "smart" if framing == "auto" else framing
+    if mode in ("blur", "bars"):
+        for s in shots:
+            s["fit"] = mode
+        return mode
+    if mode == "center" or same_shape:
+        for s in shots:
+            s["focus"] = [0.5, 0.5]
+        if same_shape:
+            return "same shape"
+        return mode
+    ranges = [(float(s["in"]), float(s["in"]) + s["frames"] / fps * float(s.get("speed", 1.0))) for s in shots]
+    frames = reframe.reframe_pieces(src, ranges, src_w, src_h, W, H, talk)
+    for s, fr in zip(shots, frames):
+        track, active = reframe.track_for_shot(fr, float(s["in"]), float(s.get("speed", 1.0)), s["frames"] / fps)
+        if track:
+            s["track"] = track
+        if active:
+            s["active"] = active
+    return "smart"
 
 
-def piece_video_chain(k: int, a: float, b: float, f, z: float, W: int, H: int, fps: float, framing: str) -> str:
-    frames = max(1, round((b - a) * fps))
-    head = f"[{k}:v]setpts=PTS-STARTPTS,fps={fps:g}"
-    tail = f"setsar=1,format=yuv420p,trim=end_frame={frames},setpts=PTS-STARTPTS[v{k}]"
-    if framing == "fit":
-        # the whole frame, over a blurred, darkened copy of itself filling the shape
-        return (
-            f"{head},split=2[bg{k}][fg{k}];"
-            f"[bg{k}]scale={W // 8}:{H // 8}:force_original_aspect_ratio=increase,crop={W // 8}:{H // 8},boxblur=6:2,"
-            f"scale={W}:{H},eq=brightness=-0.12:saturation=1.15[bb{k}];"
-            f"[fg{k}]scale='if(gt(a,{W}/{H}),{W},-2)':'if(gt(a,{W}/{H}),-2,{H})':flags=lanczos,scale=trunc(iw*{z:.3f}/2)*2:trunc(ih*{z:.3f}/2)*2,"
-            f"crop='min(iw,{W})':'min(ih,{H})'[ff{k}];"
-            f"[bb{k}][ff{k}]overlay=x='(W-w)/2':y='(H-h)/2',{tail}"
-        )
-    fx = f[0] if f else 0.5
-    fy = f[1] if f else 0.4
-    cw = f"min(iw,ih*{W}/{H})/{z:.3f}"
-    ch = f"min(ih,iw*{H}/{W})/{z:.3f}"
-    return (
-        f"{head},crop=w='{cw}':h='{ch}':x='max(0,min(iw-ow,iw*{fx:.3f}-ow/2))':y='max(0,min(ih-oh,ih*{fy:.3f}-oh/2))',"
-        f"scale={W}:{H}:flags=lanczos,{tail}"
-    )
-
-
-def render_clip(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, ass_text: str | None, fade: float = 0.015) -> None:
-    pieces = clip["pieces"]
+def build_audio(src: str, shots: list[dict], fps: float, dst: Path, music: dict | None, fade: float) -> None:
+    """The clip's sound: each shot's own source audio (slow motion pitched down, like a film
+    slow-mo), tiny fades at every cut so nothing clicks, optional music ducked under it, then
+    loudness for social platforms (-14 LUFS)."""
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
-    for a, b in pieces:
-        cmd += ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", src]
     parts, labels = [], []
-    for k, ((a, b), f, z) in enumerate(zip(pieces, clip["focus"], clip["zooms"])):
-        parts.append(piece_video_chain(k, a, b, f, z, W, H, fps, clip.get("framing", "crop")))
-        d = max(1, round((b - a) * fps)) / fps
+    total = 0.0
+    for k, s in enumerate(shots):
+        d = s["frames"] / fps
+        sp = float(s.get("speed", 1.0))
+        src_len = d * sp
+        cmd += ["-ss", f"{float(s['in']):.3f}", "-t", f"{src_len + 0.25:.3f}", "-i", src]
+        chain = f"[{k}:a]aresample=48000,asetpts=PTS-STARTPTS,atrim=0:{src_len:.4f}"
+        if abs(sp - 1.0) > 1e-3:
+            chain += f",asetrate={48000 * sp:.0f},aresample=48000"
         fd = min(fade, d / 3)
-        parts.append(f"[{k}:a]aresample=48000,asetpts=PTS-STARTPTS,atrim=0:{d:.4f},afade=t=in:d={fd:.4f},afade=t=out:st={max(0.0, d - fd):.4f}:d={fd:.4f}[a{k}]")
-        labels.append(f"[v{k}][a{k}]")
-    parts.append(f"{''.join(labels)}concat=n={len(pieces)}:v=1:a=1[vc][ac]")
-    vout = "[vc]"
+        chain += f",apad,atrim=0:{d:.4f},afade=t=in:d={fd:.4f},afade=t=out:st={max(0.0, d - fd):.4f}:d={fd:.4f}[a{k}]"
+        parts.append(chain)
+        labels.append(f"[a{k}]")
+        total += d
+    parts.append(f"{''.join(labels)}concat=n={len(shots)}:v=0:a=1[mix]")
+    out = "[mix]"
+    if music:
+        m = len(shots)
+        cmd += ["-ss", f"{float(music.get('start', 0.0)):.3f}", "-t", f"{total + 0.5:.3f}", "-i", music["path"]]
+        vol = float(music.get("volume", 0.35))
+        parts.append(f"[{m}:a]aresample=48000,apad,atrim=0:{total:.4f},afade=t=in:d=0.4,afade=t=out:st={max(0.0, total - 1.2):.4f}:d=1.2,volume={vol:.3f}[mus]")
+        parts.append("[mix]asplit=2[g1][g2]")
+        parts.append("[mus][g2]sidechaincompress=threshold=0.05:ratio=4:attack=20:release=400[duck]")
+        parts.append("[g1][duck]amix=inputs=2:normalize=0:duration=first[mm]")
+        out = "[mm]"
+    parts.append(f"{out}loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000,atrim=0:{total:.4f}[ao]")
+    with tempfile.TemporaryDirectory(prefix="ei-aud-") as tmp:
+        g = Path(tmp) / "a.txt"
+        g.write_text(";\n".join(parts))
+        ac.run(cmd + ac.filter_script_args(str(g)) + ["-map", "[ao]", "-c:a", "pcm_s16le", str(dst)])
+
+
+def render_edit(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, ass_text: str | None, fade: float,
+                music: dict | None = None, workers: int = 2) -> None:
+    """Shots (effects, framing) -> picture via render.py; sound per shot; captions burned in last."""
+    import render
+
+    shots = clip["shots"]
+    total = sum(s["frames"] for s in shots)
     with tempfile.TemporaryDirectory(prefix="ei-clip-") as tmp:
+        plan = {"version": 2, "mode": "clip", "width": W, "height": H, "fps": fps, "look": clip.get("look", "natural"),
+                "shots": [{**s, "clip": src} for s in shots]}
+        plan_path = Path(tmp) / "clip.json"
+        plan_path.write_text(json.dumps(plan))
+        video = Path(tmp) / "video.mp4"
+        render.render(plan_path, str(video), workers=workers)
+        audio = Path(tmp) / "audio.wav"
+        build_audio(src, shots, fps, audio, music, fade)
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(audio)]
         if ass_text:
             ass = Path(tmp) / "caps.ass"
             ass.write_text(ass_text, encoding="utf-8")
-            esc = str(ass).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-            parts.append(f"[vc]subtitles=filename='{esc}'[vs]")
-            vout = "[vs]"
-        parts.append("[ac]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[ao]")
-        graph = Path(tmp) / "g.txt"
-        graph.write_text(";\n".join(parts))
-        cmd += ac.filter_script_args(str(graph))
-        cmd += ["-map", vout, "-map", "[ao]", "-fps_mode", "cfr", "-r", ac.rate_arg(fps), "-c:v", "h264_videotoolbox", "-b:v", "10M",
-                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(dst)]
+            e = str(ass).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+            cmd += ["-vf", f"subtitles=filename='{e}'", "-c:v", "h264_videotoolbox", "-b:v", "14M", "-profile:v", "high"]
+        else:
+            cmd += ["-c:v", "copy"]
+        tmp_out = dst.with_name(dst.stem + ".part.mp4")
+        cmd += ["-map", "0:v", "-map", "1:a", "-frames:v", str(total), "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(tmp_out)]
         ac.run(cmd)
+        tmp_out.replace(dst)
 
 
 # ---------------------------------------------------------------------------------------------
-# Action mode (gameplay, sport, vlogs with little talk)
+# Action mode (gameplay, sport, vlogs with little talk): see clip_edit.py
 # ---------------------------------------------------------------------------------------------
 
 
-def action_signals(src: str, duration: float, words: list[dict]) -> dict:
-    """Per-second loudness, attacks, motion, scene changes, brightness and dialogue (cached)."""
-    import footage as fo
-    import montage as mt
+def action_clips(src: str, duration: float, words: list[dict], count: int, target: float, mn: float, mx: float,
+                 hook: bool = True, src_fps: float = 30.0, pace: str = "medium") -> list[dict]:
+    import clip_edit as ce
 
-    key = ac.file_key(src, "action-v1")
-    cache = ac.CACHE_DIR / "action" / f"{key}.json"
-    if cache.is_file():
-        sig = json.loads(cache.read_text())
-    else:
-        t0 = time.time()
-        log("measuring action across the video (loudness, motion, scene changes); cached afterwards")
-        a = fo.analyse(src)
-        secs = max(1, int(duration))
-        mot = np.asarray(a["motion"], dtype=np.float32)
-        bright = np.asarray(a["bright"], dtype=np.float32)
-        per = lambda v: [float(v[int(i * fo.FPS) : int((i + 1) * fo.FPS)].mean()) if int(i * fo.FPS) < len(v) else 0.0 for i in range(secs)]  # noqa: E731
-        med = float(np.median(mot)) if len(mot) else 1.0
-        cut_flags = (mot > max(30.0, 5 * med)).astype(np.float32)
-        y = mt.decode_mono(src, 8000)
-        hop = 400  # 50 ms
-        nb = len(y) // hop
-        r = np.sqrt((y[: nb * hop].reshape(nb, hop) ** 2).mean(axis=1)) if nb else np.zeros(0)
-        db = 20 * np.log10(np.maximum(r, 1e-5))
-        rise = np.maximum(0, np.diff(db, prepend=db[:1] if len(db) else 0))
-        loud = [float(db[i * 20 : (i + 1) * 20].mean()) if i * 20 < len(db) else -80.0 for i in range(secs)]
-        attacks = [float((rise[i * 20 : (i + 1) * 20] > 6).sum()) if i * 20 < len(rise) else 0.0 for i in range(secs)]
-        sig = {"loud": loud, "attacks": attacks, "motion": per(mot), "cuts": per(cut_flags), "bright": per(bright)}
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps(sig))
-        log(f"action signals in {time.time() - t0:.0f}s")
-    secs = len(sig["loud"])
-    speech = np.zeros(secs)
-    for w in words:
-        for i in range(int(w["start"]), min(secs, int(w["end"]) + 1)):
-            speech[i] = 1
-    sig["speech"] = speech.tolist()
-    return sig
-
-
-def interest_curve(sig: dict) -> np.ndarray:
-    def z(v):
-        v = np.asarray(v, dtype=np.float64)
-        return (v - np.median(v)) / (v.std() + 1e-6)
-
-    loud, mot = np.asarray(sig["loud"]), np.asarray(sig["motion"])
-    s = 0.35 * z(loud) + 0.25 * z(sig["attacks"]) + 0.25 * z(np.log1p(mot)) + 0.1 * z(sig["cuts"]) + 0.15 * np.asarray(sig["speech"])
-    still = (mot < np.percentile(mot, 15)) & (loud < np.percentile(loud, 40))
-    s[still] -= 1.0  # menus, maps, loading screens
-    s[np.asarray(sig["bright"]) < 14] -= 2.0  # black
-    return np.convolve(s, np.ones(3) / 3, mode="same")
-
-
-def boundary_near(t: float, lo: float, hi: float, sig: dict, words: list[dict], prefer_late: bool) -> float:
-    """A natural cut point in [lo, hi]: a scene change, else the quietest second; never inside a line of dialogue."""
-    secs = len(sig["loud"])
-    cand = [i for i in range(max(0, int(lo)), min(secs - 1, int(hi)) + 1)]
-    if not cand:
-        return t
-    cuts = [i for i in cand if sig["cuts"][i] > 0]
-    if cuts:
-        b = float(max(cuts) if prefer_late else min(cuts))
-    else:
-        b = float(min(cand, key=lambda i: sig["loud"][i]))
-    for w in words:  # don't cut a word in half
-        if w["start"] < b < w["end"]:
-            b = w["end"] + 0.05 if prefer_late else w["start"] - 0.05
-    return b
-
-
-def action_clips(src: str, duration: float, words: list[dict], count: int, target: float, mn: float, mx: float) -> list[dict]:
-    sig = action_signals(src, duration, words)
-    score = interest_curve(sig)
-    secs = len(score)
-    # Hotspots: where a target-long stretch is most intense. Each clip is built around one
-    # (one fight, one scene), and hotspots keep apart so clips never share material.
-    R = int(np.clip(2.2 * target, 30, max(30, duration / max(count, 1))))
-    win = max(3, int(target))
-    smooth = np.convolve(score, np.ones(win) / win, mode="same")
-    used = np.zeros(secs, bool)
+    sig = ce.signals(src, duration)
+    score = ce.interest(sig, ce.speech_mask(words, len(sig["loud"])))
+    pf = ce.PACE.get(pace, 1.0)
     clips = []
-    for _ in range(count):
-        order = np.argsort(-smooth)
-        best = None
-        for c in order:
-            c = int(c)
-            s0, s1 = max(0, c - R // 2), min(secs, c + R // 2)
-            if s1 - s0 >= mn and not used[s0:s1].any():
-                best = (s0, s1)
-                break
-        if best is None:
-            break
-        s0, s1 = best
-        used[max(0, s0 - 3) : min(secs, s1 + 3)] = True
-        bv = float(smooth[(s0 + s1) // 2])
-        seg = score[s0:s1]
-        pieces: list[tuple[float, float]] = []
-        total = 0.0
-        goal = min(mx, max(mn, target))
-        for i in np.argsort(-seg):
-            t = s0 + int(i)
-            if any(a - 2 <= t <= b + 2 for a, b in pieces):
-                continue
-            span = float(np.clip(5 + 7 * (seg[i] - np.median(seg)) / (np.ptp(seg) + 1e-6), 4, 12))
-            a0 = boundary_near(t, t - span / 2 - 2, t - 2, sig, words, prefer_late=False)
-            b0 = boundary_near(t, t + 2, t + span / 2 + 2, sig, words, prefer_late=True)
-            a0, b0 = max(float(s0), a0), min(float(s1), b0)
-            if b0 - a0 < 2.5 or any(not (b0 <= a or a0 >= b) for a, b in pieces):
-                continue
-            pieces.append((a0, b0))
-            total += b0 - a0
-            if total >= goal - 2:
-                break
-        pieces.sort()
-        if total > mx and pieces:  # trim the last piece to fit
-            a0, b0 = pieces[-1]
-            pieces[-1] = (a0, max(a0 + 2.5, b0 - (total - mx)))
-        if sum(b - a for a, b in pieces) >= mn:
-            text = " ".join(w["word"].strip() for w in words if any(a <= w["start"] < b for a, b in pieces))
-            clips.append({"pieces": pieces, "value": round(bv, 3), "title": None, "text": text})
-        elif len(pieces) == 0:
+    for s0, s1 in ce.stretches(score, count, target, duration):
+        c = ce.edit_clip(ce.moments(score, sig, words, s0, s1, pf), s0, s1, target, mn, mx, hook=hook, src_fps=src_fps, words=words, pace=pf)
+        if c is None:
             continue
+        dur = sum(s["len"] for s in c["shots"])
+        if dur < mn:
+            continue
+        text = " ".join(w["word"].strip() for w in words if any(a <= w["start"] < b for a, b in c["pieces"]))
+        seg = score[int(s0 * ce.HZ) : int(s1 * ce.HZ)]
+        c.update({"value": round(float(seg.mean()) if len(seg) else 0.0, 3), "title": None, "text": text})
+        log(f"stretch {s0:.0f}–{s1:.0f}s: {ce.describe(c)}")
+        clips.append(c)
     clips.sort(key=lambda c: c["pieces"][0][0])
     return clips
 
@@ -733,8 +631,12 @@ def safe_name(t: str) -> str:
 
 
 def make_clips(src: str, out_dir: str, count: int = 5, mn: float = 10, mx: float = 60, target: float = 48, aspect: str = "vertical",
-               captions: str = "auto", title: bool = True, hook: bool = True, model: str | None = None, language: str | None = None,
-               content: str = "auto", framing: str = "auto", whisper_model: str = ac.DEFAULT_WHISPER, plan_only: bool = False) -> dict:
+               captions: str = "auto", title: str = "off", hook: bool = True, model: str | None = None, language: str | None = None,
+               content: str = "auto", framing: str = "auto", whisper_model: str = ac.DEFAULT_WHISPER, plan_only: bool = False,
+               caption_style: str = "pop", music: str | None = None, music_volume: float = 0.35, pace: str = "medium", workers: int = 2) -> dict:
+    import captions as cap
+    import clip_edit as ce
+
     ac.require_tools()
     src = str(Path(src).resolve())
     info = ac.probe(src)
@@ -744,6 +646,14 @@ def make_clips(src: str, out_dir: str, count: int = 5, mn: float = 10, mx: float
         raise AutocutError("number of clips must be 1–50")
     if not (3 <= mn <= mx <= 600):
         raise AutocutError("clip lengths must satisfy 3 ≤ min ≤ max ≤ 600 seconds")
+    framing = {"crop": "smart", "fit": "blur"}.get(framing, framing)
+    if framing not in FRAMINGS:
+        raise AutocutError(f"unknown framing {framing!r} ({', '.join(FRAMINGS)})")
+    title = {"on": "always", "true": "always", "false": "off"}.get(str(title).lower(), str(title).lower())
+    if title not in cap.TITLE_MODES:
+        raise AutocutError(f"unknown title mode {title!r} ({', '.join(cap.TITLE_MODES)})")
+    if music and not Path(music).is_file():
+        raise AutocutError(f"music file not found: {music}")
     target = float(np.clip(target, mn, mx))
     if info.duration < mn:
         raise AutocutError(f"the video ({info.duration:.0f}s) is shorter than the minimum clip length")
@@ -776,12 +686,12 @@ def make_clips(src: str, out_dir: str, count: int = 5, mn: float = 10, mx: float
         bonus = {k: 0.6 * (scv - 0.5) for k, (_, scv) in enumerate(judged) if scv is not None}
         for c in plan_clips(sents, bounds, count, target, mn, mx, bonus):
             pieces, teaser = pieces_for(sents, c["idx"], hook)
-            clips.append({"pieces": pieces, "sentences": c["idx"], "teaser": teaser, "value": round(c["value"], 3),
-                          "title": fallback_title(sents, c["idx"]), "text": " ".join(sents[i]["text"] for i in c["idx"])})
-        fade = 0.015
+            clips.append({"pieces": pieces, "shots": talk_shots(pieces, teaser is not None), "sentences": c["idx"], "teaser": teaser,
+                          "value": round(c["value"], 3), "title": fallback_title(sents, c["idx"]), "text": " ".join(sents[i]["text"] for i in c["idx"])})
+        fade = 0.012
     else:
-        clips = action_clips(src, info.duration, words, count, target, mn, mx)
-        fade = 0.12
+        clips = action_clips(src, info.duration, words, count, target, mn, mx, hook=hook, src_fps=info.fps or 30.0, pace=pace)
+        fade = 0.03
     if clips:
         if mode == "talk":
             prompts = [f"Clip transcript:\n{c['text']}" for c in clips]
@@ -797,66 +707,81 @@ def make_clips(src: str, out_dir: str, count: int = 5, mn: float = 10, mx: float
                 "Do not quote the dialogue word for word."
                 for c in clips
             ]
-        for c, t in zip(clips, llm_titles(prompts, model)):
-            t = tidy_title(t)
+        titles = [tidy_title(t) for t in llm_titles(prompts, model)]
+        seen: set[str] = set()
+        dup = []
+        for k, t in enumerate(titles):
+            if t and t.lower() in seen:
+                dup.append(k)
+            elif t:
+                seen.add(t.lower())
+        if dup:  # ask again for clips whose title repeats another one
+            avoid = "; ".join(sorted(seen))
+            again = llm_titles([prompts[k] + f"\nThe title must be different from these: {avoid}" for k in dup], model)
+            for k, t in zip(dup, again):
+                t = tidy_title(t)
+                titles[k] = t if t and t.lower() not in seen else None
+                if titles[k]:
+                    seen.add(titles[k].lower())
+        for c, t in zip(clips, titles):
             if t:
                 c["title"] = t
-            elif mode != "talk":
+            elif mode != "talk" and not c.get("title"):
                 c["title"] = " ".join(w.capitalize() for w in (c.get("tags") or ["Highlight"])[0].replace("a ", "", 1).split()) or None
     if len(clips) < count:
         log(f"only {len(clips)} clip(s) of {mn:g}–{mx:g}s fit without reusing material")
+    mus = None
+    if music:
+        import music as mu
+
+        mus = {"path": str(Path(music).resolve()), "volume": music_volume, "analysis": mu.analyse(str(Path(music).resolve()))}
+    used_framing = framing
     for c in clips:
-        want_faces = framing == "crop" or (framing == "auto" and mode == "talk")
-        faces = face_centres(src, c["pieces"]) if (want_faces and (W / H) < (dw / max(dh, 1)) - 0.05) else [None] * len(c["pieces"])
-        found = sum(1 for f in faces if f) >= max(1, len(faces) // 3)
-        same_shape = abs(W / H - dw / max(dh, 1)) < 0.05
-        if framing in ("crop", "fit"):
-            c["framing"] = framing
-        elif mode == "gameplay":
-            c["framing"] = "crop" if same_shape else "fit"  # keep the HUD and the game's subtitles
-        else:
-            c["framing"] = "crop" if found or same_shape else "fit"
-        last = None
-        for k, f in enumerate(faces):
-            faces[k] = f if f else last
-            last = faces[k]
-        c["focus"] = faces
-        z, zooms, prev_end = (1.3 if c["framing"] == "fit" and mode == "gameplay" and H > W else 1.0), [], None
-        for a, b in c["pieces"]:
-            if c["framing"] == "crop" and prev_end is not None and 0 < a - prev_end < 4.0:
-                z = 1.12 if z == 1.0 else 1.0  # alternate framing on a jump cut
-            zooms.append(z)
-            prev_end = b
-        c["zooms"] = zooms
-        c["duration"] = round(sum(b - a for a, b in c["pieces"]), 2)
-    caps = (mode == "talk") if captions == "auto" else captions == "on"
+        if mus:  # cuts onto the beat
+            length = sum(s["len"] for s in c["shots"])
+            start = mu.choose_window(mus["analysis"], length)
+            beats = [b - start for b in mus["analysis"]["beats"] if start <= b < start + length + 1]
+            ce.snap_to_beats(c["shots"], beats)
+            c["music_start"] = round(start, 3)
+        c["shots"] = finalise_shots(c["shots"], fps)
+        used_framing = frame_shots(src, c["shots"], dw, dh, W, H, fps, framing, mode == "talk")
+        c["framing"] = used_framing
+        c["duration"] = round(sum(s["frames"] for s in c["shots"]) / fps, 2)
     out = Path(out_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
     stem = Path(src).stem
-    plan = {"version": 2, "mode": "highlights", "content": mode, "input": src, "width": W, "height": H, "fps": fps, "count": count,
-            "min": mn, "max": mx, "target": target, "captions": caps, "title": title, "clips": clips}
+    plan = {"version": 3, "mode": "highlights", "content": mode, "input": src, "width": W, "height": H, "fps": fps, "count": count,
+            "min": mn, "max": mx, "target": target, "captions": captions, "caption_style": caption_style, "title": title,
+            "framing": used_framing, "music": mus and {"path": mus["path"], "volume": music_volume}, "clips": clips}
     plan_path = out / f"{stem}.clips.json"
     plan_path.write_text(json.dumps(plan, indent=2))
-    log(f"planned {len(clips)} clips in {time.time() - t0:.0f}s: " + ", ".join(f"{c['duration']:.0f}s/{len(c['pieces'])}" for c in clips))
+    log(f"planned {len(clips)} clips in {time.time() - t0:.0f}s ({used_framing} framing): "
+        + ", ".join(f"{c['duration']:.0f}s/{len(c['shots'])} shots" for c in clips))
     outputs = []
     if not plan_only:
+        clean = cap.clean_words([w for w in words if norm_word(w["word"]) not in FILLERS]) if words else []
         for k, c in enumerate(clips, 1):
             name = f"{stem} - {k:02d}" + (f" - {safe_name(c['title'])}" if c.get("title") else "")
             dst = out / f"{name}.mp4"
-            wout = remap_to_pieces(words, c["pieces"]) if words else []
-            show_title = c.get("title") if title else None
-            ass = build_ass(wout if caps else [], show_title, W, H, c["duration"]) if ((caps and wout) or show_title) else None
+            wout = cap.remap_to_shots(clean, c["shots"], fps) if clean else []
+            caps_on = captions == "on" or (captions == "auto" and cap.coverage(wout, c["duration"]) >= 0.2)
+            show_title = c.get("title") if title != "off" else None
+            ass = cap.build_ass(wout if caps_on else [], show_title, W, H, c["duration"], caption_style, title) if ((caps_on and wout) or show_title) else None
             t1 = time.time()
-            render_clip(src, c, W, H, fps, dst, ass, fade)
+            m = {"path": mus["path"], "volume": music_volume, "start": c.get("music_start", 0.0)} if mus else None
+            render_edit(src, c, W, H, fps, dst, ass, fade, m, workers)
             if wout:
                 dst.with_suffix(".srt").write_text(ac.to_srt(ac.group_words(wout, max_words=7, max_chars=40)), encoding="utf-8")
-            log(f"progress {k}/{len(clips)} clips: {dst.name} ({c['duration']:.0f}s, {len(c['pieces'])} pieces) in {time.time() - t1:.0f}s")
+            log(f"progress {k}/{len(clips)} clips: {dst.name} ({c['duration']:.0f}s, {len(c['shots'])} shots, "
+                f"captions {'on' if caps_on and wout else 'off'}) in {time.time() - t1:.0f}s")
             outputs.append(str(dst))
     return {"outputs": outputs, "out_dir": str(out), "plan": str(plan_path),
-            "clips": [{"title": c.get("title"), "duration": c["duration"], "pieces": len(c["pieces"])} for c in clips]}
+            "clips": [{"title": c.get("title"), "duration": c["duration"], "shots": len(c["shots"])} for c in clips]}
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
+    import captions as cap
+
     p.add_argument("input")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--count", type=int, default=5, help="how many clips")
@@ -865,18 +790,26 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--target", type=float, default=48.0, help="typical clip length (s)")
     p.add_argument("--aspect", default="vertical", choices=["vertical", "square", "horizontal", "same"])
     p.add_argument("--content", default="auto", choices=["auto", "talk", "gameplay"], help="talk: built from sentences; gameplay: from action moments")
-    p.add_argument("--framing", default="auto", choices=["auto", "crop", "fit"], help="crop (follow faces) or fit over a blurred background")
-    p.add_argument("--captions", default="auto", choices=["auto", "on", "off"])
-    p.add_argument("--no-title", action="store_true")
-    p.add_argument("--no-hook", action="store_true", help="don't open with the strongest line")
+    p.add_argument("--framing", default="auto", choices=[*FRAMINGS, "crop", "fit"],
+                   help="smart: fill the shape following the action/faces; center: fill, centred crop; blur: whole picture over a blurred copy; bars: whole picture with black bars")
+    p.add_argument("--captions", default="auto", choices=["auto", "on", "off"], help="auto: when the clip has clear speech")
+    p.add_argument("--caption-style", default="pop", choices=list(cap.STYLES))
+    p.add_argument("--title", default="off", choices=list(cap.TITLE_MODES), help="title card in the video (the title is always in the file name)")
+    p.add_argument("--no-title", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--no-hook", action="store_true", help="don't open with a teaser of the best moment")
+    p.add_argument("--pace", default="medium", choices=list(__import__("clip_edit").PACE))
+    p.add_argument("--music", help="optional music (audio or video file): cuts move onto its beats, it plays under the clip's sound")
+    p.add_argument("--music-volume", type=float, default=0.35)
     p.add_argument("--llm", default="default", help="language model key (see llm.py), 'default' or 'none'")
     p.add_argument("--language")
     p.add_argument("--plan-only", action="store_true")
 
 
 def run_args(a) -> dict:
-    return make_clips(a.input, a.out_dir, a.count, a.min, a.max, a.target, a.aspect, captions=a.captions, title=not a.no_title,
-                      hook=not a.no_hook, model=a.llm, language=a.language, content=a.content, framing=a.framing, plan_only=a.plan_only)
+    return make_clips(a.input, a.out_dir, a.count, a.min, a.max, a.target, a.aspect, captions=a.captions,
+                      title="off" if a.no_title else a.title, hook=not a.no_hook, model=a.llm, language=a.language, content=a.content,
+                      framing=a.framing, plan_only=a.plan_only, caption_style=a.caption_style, music=a.music, music_volume=a.music_volume,
+                      pace=a.pace, workers=getattr(a, "workers", 2))
 
 
 def main(argv: list[str] | None = None) -> int:
