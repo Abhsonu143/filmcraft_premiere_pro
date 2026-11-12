@@ -153,3 +153,12 @@ def test_hindi_check_ignores_spelling_of_english_words_and_numbers():
     assert vo.speech_error("बस 30% बैटरी बची थी", text) < 0.2  # said right, written differently
     assert vo.speech_error("मैं कुछ और ही बोल रहा हूँ", "पूरा पहाड़ golden हो गया") > 0.5
     assert vo.speech_error("Today I am here", "Today I'm here") < 0.3
+
+
+def test_speech_start_detection():
+    room = [-62.0] * 20
+    assert vo.detect_speech(room + [-30.0, -28.0]) == 20
+    assert vo.detect_speech(room) is None
+    # talking from the very first moment is still speech (the room level is the quiet end)
+    assert vo.detect_speech([-30.0] * 10 + [-60.0] * 30) == 0
+    assert vo.detect_speech([-80.0] * 10 + [-70.0] * 5) is None  # very quiet, below the floor

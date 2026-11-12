@@ -8,6 +8,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use filmcraft_engine::Session;
 use filmcraft_ui_egui::FilmcraftApp;
 use filmcraft_ui_egui::control::ControlRequest;
@@ -334,4 +335,50 @@ fn voice_recorder_follows_the_languages() {
     let text = prompt.as_array().and_then(|a| a.first()).and_then(|e| e["label"].as_str()).unwrap_or_default().to_string();
     assert!(text.is_ascii() && !text.is_empty(), "an English sentence: {text}");
     d.snapshot("voice-recorder-en");
+}
+
+/// Records one sentence through the real microphone while a test sentence plays on the speakers:
+/// the take is accepted and can be played. Opt-in (needs speakers + microphone):
+/// `EI_TEST_MIC=<wav> EI_SETTINGS=<tmp>/settings.json` (EI_SETTINGS keeps the take out of your real voices).
+#[test]
+fn voice_recorder_records_a_take() {
+    let Some(wav) = std::env::var_os("EI_TEST_MIC") else { return };
+    let Some(settings) = std::env::var_os("EI_SETTINGS").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: set EI_SETTINGS to a temporary settings.json too");
+        return;
+    };
+    if !have_tools() {
+        return;
+    }
+    let mut d = Driver::demo();
+    d.run("ai.voice", json!({}));
+    let t0 = Instant::now();
+    while !d.ids("ai.voice.record").iter().any(|x| x == "ai.voice.record") {
+        assert!(t0.elapsed() < Duration::from_secs(60), "sentences never loaded");
+        d.frames(2);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    d.ok("ui.click", json!({"id": "ai.voice.section.en"}));
+    d.frames(3);
+    d.ok("ui.click", json!({"id": "ai.voice.record"}));
+    let player = std::process::Command::new("sh").arg("-c").arg(format!("sleep 1.5; afplay '{}'", wav.to_string_lossy())).spawn().unwrap();
+    let t0 = Instant::now();
+    let mut saw_live = false;
+    loop {
+        d.frames(2);
+        let e = d.ok("ui.elements", json!({"prefix": "ai.voice.play"}));
+        let enabled = e.as_array().and_then(|a| a.first()).is_some_and(|x| x["enabled"].as_bool().unwrap_or(true));
+        saw_live |= d.harness.query_by_label_contains("hearing you").is_some();
+        if t0.elapsed() > Duration::from_secs(5) && enabled && d.harness.query_by_label_contains("Recorded").is_some() {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(45), "the take was never accepted");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut player = player;
+    let _ = player.wait();
+    assert!(saw_live, "live status shown while recording");
+    d.snapshot("voice-recorded");
+    let dir = settings.parent().unwrap().join("voices/My-voice/takes");
+    assert!(std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).any(|f| f.path().extension().is_some_and(|x| x == "wav")));
 }

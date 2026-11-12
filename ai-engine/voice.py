@@ -229,16 +229,38 @@ def list_mics() -> list[str]:
     return mics
 
 
-def record(out: str, max_s: float = 30.0, stop_after: float = 1.4, mic: str = "0", wait_s: float = 8.0) -> dict:
-    """Record from the microphone until you stop talking (stop_after seconds of silence after
-    speech), at most max_s. Returns level/noise/clipping checks."""
+MIC_DENIED = ("EI is not allowed to use the microphone (macOS gives it silence). Open System Settings ▸ Privacy & Security ▸ "
+              "Microphone, turn on EI, then quit and reopen EI.")
+
+
+def detect_speech(dbs: list[float], start_margin: float = 12.0, floor_db: float = -55.0) -> int | None:
+    """Index of the first 50-ms chunk that is clearly speech: louder than the room by `start_margin` dB.
+    The room level is the quiet end (20th percentile) of what was heard, so talking right away
+    (before any silence) is still recognised."""
+    if not dbs:
+        return None
+    room = float(np.percentile(dbs, 20))
+    for i, d in enumerate(dbs):
+        if d > max(floor_db, room + start_margin):
+            return i
+    return None
+
+
+def record(out: str, max_s: float = 30.0, stop_after: float = 1.4, mic: str = "0", wait_s: float = 12.0, stop_file: str | None = None) -> dict:
+    """Record from the microphone until you stop talking (stop_after seconds of quiet after speech),
+    until `stop_file` appears (the app's Stop button), or max_s. A take with too little speech is
+    still saved (with a warning) so it can be played back. Returns level/noise/clipping checks."""
     rate = 48000
+    stop = Path(stop_file) if stop_file else None
+    if stop and stop.exists():
+        stop.unlink()
     proc = subprocess.Popen(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "avfoundation", "-i", f":{mic}",
                              "-ac", "1", "-ar", str(rate), "-f", "s16le", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     chunk = rate // 20  # 50 ms
     buf: list[np.ndarray] = []
-    noise: list[float] = []
-    started, quiet, t = False, 0.0, 0.0
+    dbs: list[float] = []
+    started, quiet, t, peak = False, 0.0, 0.0, 0.0
+    next_report = 0.5
     log("recording: speak now")
     try:
         while t < max_s:
@@ -248,45 +270,59 @@ def record(out: str, max_s: float = 30.0, stop_after: float = 1.4, mic: str = "0
             x = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768
             buf.append(x)
             t += len(x) / rate
+            peak = max(peak, float(np.abs(x).max()) if len(x) else 0.0)
             db = 20 * math.log10(max(1e-6, float(np.sqrt((x * x).mean()))))
+            dbs.append(db)
+            if t >= 1.5 and peak == 0.0:
+                raise AutocutError(MIC_DENIED)  # exact digital silence: permission, not a quiet room
             if not started:
-                noise.append(db)
-                floor = float(np.median(noise[-40:])) if noise else -60.0
-                if t > 0.3 and db > max(-45.0, floor + 15):
+                i = detect_speech(dbs) if t > 0.25 else None
+                if i is not None:
                     started = True
-                    log("hearing you")
+                    log(f"hearing you ({db:.0f} dB)")
                 elif t > wait_s:
                     break
             else:
-                floor = float(np.median(noise)) if noise else -60.0
-                quiet = quiet + len(x) / rate if db < max(-50.0, floor + 8) else 0.0
+                room = float(np.percentile(dbs, 20))
+                quiet = quiet + len(x) / rate if db < max(-58.0, room + 6) else 0.0
                 if quiet >= stop_after:
                     break
+            if t >= next_report:  # a live level for the app
+                log(f"{'hearing you' if started else 'listening'} ({db:.0f} dB)")
+                next_report += 0.5
+            if stop and stop.exists():
+                log("stopped")
+                break
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+        if stop and stop.exists():
+            stop.unlink()
     err = (proc.stderr.read().decode(errors="replace") if proc.stderr else "").strip()
     if not buf:
-        raise AutocutError(f"no sound from the microphone{(': ' + err[:160]) if err else ''} (System Settings ▸ Privacy ▸ Microphone: allow EI)")
+        raise AutocutError(f"no sound from the microphone{(': ' + err[:160]) if err else ''}. {MIC_DENIED}")
     y = np.concatenate(buf)
-    if not started:
-        raise AutocutError("nothing was heard: check the microphone and speak a little louder")
-    y = trim_silence(y, pad=0.15)
+    if peak == 0.0:
+        raise AutocutError(MIC_DENIED)
+    issues = []
+    if started:
+        y = trim_silence(y, pad=0.15)
+    else:
+        issues.append("no clear speech heard: check the microphone choice, speak closer, then Record Again")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     write_wav(out, y, rate)
     f = features(np.interp(np.arange(0, len(y), rate / SR), np.arange(len(y)), y).astype(np.float32))
-    issues = []
     if f.get("clipped", 0) > 0.001:
         issues.append("too loud (clipping): move back from the microphone a little")
-    if f.get("level_db", -60) < -38:
+    if started and f.get("level_db", -60) < -38:
         issues.append("quiet: move closer to the microphone")
-    if f.get("snr_db", 99) < 25:
+    if started and f.get("snr_db", 99) < 25:
         issues.append("background noise: a quieter room helps the clone a lot")
     log(f"recorded {len(y) / rate:.1f}s" + (f" ({'; '.join(issues)})" if issues else ""))
-    return {"outputs": [out], "file": out, "features": f, "issues": issues}
+    return {"outputs": [out], "file": out, "seconds": round(len(y) / rate, 2), "features": f, "issues": issues, "speech": started}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -723,6 +759,7 @@ def add_args(sub) -> None:
     p.add_argument("--out", required=True)
     p.add_argument("--max", type=float, default=30.0)
     p.add_argument("--mic", default="0")
+    p.add_argument("--stop-file", help="stop (and keep the take) when this file appears")
     sub.add_parser("voice-mics", help="list microphones")
     p = sub.add_parser("voice-enroll", help="make or extend a voice from recordings")
     p.add_argument("--name", required=True)
@@ -749,7 +786,7 @@ def run_args(a) -> dict:
     if a.cmd == "voice-mics":
         return {"mics": list_mics()}
     if a.cmd == "voice-record":
-        return record(a.out, a.max, mic=a.mic)
+        return record(a.out, a.max, mic=a.mic, stop_file=a.stop_file)
     if a.cmd == "voice-list":
         return {"voices": list_voices()}
     if a.cmd == "voice-enroll":

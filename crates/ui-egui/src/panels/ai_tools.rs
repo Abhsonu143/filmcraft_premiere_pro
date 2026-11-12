@@ -205,6 +205,8 @@ struct Recorder {
     loaded: Vec<String>,
     cursor: usize,
     recording: Option<u64>,
+    /// what went wrong with the last take (shown right under the Record button)
+    message: String,
     takes: Vec<Option<Take>>,
 }
 
@@ -286,7 +288,7 @@ impl Draft {
             writer: "claude",
             voice: String::new(),
             takes: 2.0,
-            voice_name: String::new(),
+            voice_name: if kind == Kind::Voice { "My voice".into() } else { String::new() },
             lang_en: true,
             lang_hi: true,
             lang_mix: true,
@@ -1908,9 +1910,10 @@ fn recorder_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
         elems.push((format!("{p}.record"), r.rect, label.into()));
         if r.clicked() {
             if d.voice_name.trim().is_empty() {
-                d.error = "Give the voice a name first.".into();
+                d.rec.message = "Give the voice a name first (top of this window).".into();
             } else {
-                let file = voices_dir().join(slug(&d.voice_name)).join("takes").join(format!("{}.wav", pr.id));
+                let takes_dir = voices_dir().join(slug(&d.voice_name)).join("takes");
+                let file = takes_dir.join(format!("{}.wav", pr.id));
                 let max = if pr.free { "75" } else { "30" };
                 let args = vec![
                     "voice-record".into(),
@@ -1920,23 +1923,29 @@ fn recorder_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
                     d.rec.mic.clone(),
                     "--max".into(),
                     max.into(),
+                    "--stop-file".into(),
+                    takes_dir.join(".stop").to_string_lossy().to_string(),
                 ];
                 match engine_step(args) {
                     Ok((step, engine)) => {
-                        d.error.clear();
+                        d.rec.message.clear();
                         d.rec.recording = Some(start_job(format!("Recording {}", pr.id), None, vec![step], false, Some(engine)));
                     }
-                    Err(e) => d.error = e,
+                    Err(e) => d.rec.message = e,
                 }
             }
         }
         if recording {
-            let s = ui.button("Stop");
+            let s = ui.button("■ Stop");
             elems.push((format!("{p}.stop"), s.rect, "Stop".into()));
-            if s.clicked()
-                && let Some(j) = d.rec.recording.take()
-            {
-                cancel_job(j);
+            if s.clicked() {
+                // the engine finishes the take and keeps it when this file appears
+                let stop = voices_dir().join(slug(&d.voice_name)).join("takes").join(".stop");
+                if std::fs::write(&stop, b"stop").is_err()
+                    && let Some(j) = d.rec.recording.take()
+                {
+                    cancel_job(j);
+                }
             }
         }
         let pl = ui.add_enabled(take.is_some() && !recording, egui::Button::new("▶ Play"));
@@ -1952,6 +1961,17 @@ fn recorder_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
             d.rec.cursor += 1;
         }
     });
+    if let Some(j) = d.rec.recording {
+        // live status from the engine: "listening (-52 dB)", "hearing you (-28 dB)"
+        let last =
+            with_job(j, |job| job.log.iter().rev().find(|l| !l.starts_with("$ ")).cloned()).flatten().unwrap_or_else(|| "starting the microphone…".into());
+        ui.label(egui::RichText::new(format!("🎙 {last}")).strong());
+        ui.ctx().request_repaint_after(Duration::from_millis(150));
+        return;
+    }
+    if !d.rec.message.is_empty() {
+        ui.colored_label(egui::Color32::from_rgb(0xE5, 0x6B, 0x6B), &d.rec.message);
+    }
     match &take {
         Some(t) if !t.issues.is_empty() => {
             ui.colored_label(egui::Color32::from_rgb(0xE0, 0xB0, 0x40), format!("Recorded, but: {}", t.issues));
@@ -2042,7 +2062,7 @@ fn poll_recorder(d: &mut Draft) {
                 }
             }
             Status::Cancelled => {}
-            _ => d.error = err,
+            _ => d.rec.message = if err.is_empty() { "The recording failed (AI ▸ AI Jobs has the details).".into() } else { err },
         }
     }
 }
