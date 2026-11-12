@@ -11,7 +11,12 @@ Subcommands (all paths absolute or relative to the current folder):
     music     --clips C... --music M --out O.mp4 [--length 30] [--aspect vertical] [--pace medium]
     reference REF --clips C... --out O.mp4 [--aspect same]
     talk      VIDEO --out O.mp4 [--preset long] [--captions] [--music M]
-    voiceover VOICE --clips C... --out O.mp4 [--script S] [--music M] [--captions] [--preset travel]
+    voiceover VOICE --clips C... --out O.mp4 [--script S] [--narration N] [--music M] [--captions] [--aspect horizontal]
+              the voiceover editor (narrate.py): picks which footage goes under which line
+    script-style SOURCES... --name N       learn a talking style from .txt/.srt/.vtt or YouTube links
+    script-write --topic T --out O [--language en|hi|hinglish] [--seconds 60] [--style N] [--backend claude|local]
+    voice-prompts / voice-mics / voice-record --out F / voice-enroll --name N [--files F...] [--takes T.json] / voice-list
+    speak     --voice N --script S --out O.wav   a script in your cloned voice (+ .narration.json)
     clips     VIDEO --out-dir D [--count 5] [--min 10] [--max 60] [--target 48] [--aspect vertical] [--llm KEY]
     audio     FILE... [--format mp3|m4a|wav|aiff|flac|alac|opus|ogg] [--quality original|best|high|medium|small]
     llm       [--set-default KEY]   the local language models and the saved default
@@ -43,7 +48,7 @@ def result(**kw) -> None:
 def doctor() -> dict:
     out: dict = {"python": sys.version.split()[0], "executable": sys.executable, "engine": str(Path(__file__).resolve().parent)}
     pk = {}
-    for mod in ("numpy", "PIL", "opentimelineio", "mlx_whisper", "open_clip", "torch"):
+    for mod in ("numpy", "PIL", "opentimelineio", "mlx_whisper", "open_clip", "torch", "mlx_lm", "mlx_audio", "speechbrain", "yt_dlp"):
         pk[mod] = importlib.util.find_spec(mod) is not None
     out["packages"] = pk
     ff = shutil.which("ffmpeg")
@@ -65,6 +70,11 @@ def doctor() -> dict:
         "captions": pk["mlx_whisper"],
         "voiceover": bool(ff) and pk["mlx_whisper"],
         "otio": pk["opentimelineio"],
+        "voice_clone": pk["mlx_audio"],
+        "voice_check": pk["speechbrain"],
+        "scripts_claude": bool(shutil.which("claude") or Path("/opt/homebrew/bin/claude").is_file()),
+        "scripts_local": pk["mlx_lm"],
+        "youtube_styles": pk["yt_dlp"],
     }
     return out
 
@@ -99,6 +109,12 @@ def run(argv: list[str]) -> dict:
 
     highlights.add_args(sub.add_parser("clips", help="long video -> N short clips, each edited from several pieces"))
     extract_audio.add_args(sub.add_parser("audio", help="save the sound of videos as audio files"))
+    import narrate
+    import script_writer
+    import voice
+
+    script_writer.add_args(sub, "script-")
+    voice.add_args(sub)
     pl = sub.add_parser("llm", help="list language models / set the default")
     pl.add_argument("--set-default")
     p = sub.add_parser("talk")
@@ -108,13 +124,8 @@ def run(argv: list[str]) -> dict:
     p.add_argument("--captions", action="store_true")
     p.add_argument("--music")
     p = sub.add_parser("voiceover")
-    p.add_argument("voice")
-    p.add_argument("--clips", nargs="+", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument("--script")
-    p.add_argument("--music")
-    p.add_argument("--captions", action="store_true")
-    p.add_argument("--preset", default="travel", choices=sorted(ac.PRESETS))
+    narrate.add_args(p)
+    p.add_argument("--preset", choices=sorted(ac.PRESETS), help="older option: short = vertical")
     for sp in sub.choices.values():
         sp.add_argument("--workers", type=int, default=2)
     a = ap.parse_args(argv)
@@ -125,6 +136,14 @@ def run(argv: list[str]) -> dict:
         return highlights.run_args(a)
     if a.cmd == "audio":
         return extract_audio.run_args(a)
+    if a.cmd.startswith("script-"):
+        return script_writer.run_args(a)
+    if a.cmd.startswith("voice-") or a.cmd == "speak":
+        return voice.run_args(a)
+    if a.cmd == "voiceover":
+        if getattr(a, "preset", None) == "short" and a.aspect == "horizontal":
+            a.aspect = "vertical"
+        return narrate.run_args(a)
     if a.cmd == "llm":
         import llm
 
@@ -153,20 +172,6 @@ def run(argv: list[str]) -> dict:
             args += ["--music", a.music]
         if ac.main(args) != 0:
             raise AutocutError("talking-head edit failed (see the log above)")
-        return {"outputs": [str(out)], "plan": str(plan_path), "out_dir": str(out.parent), **otio_for(plan_path)}
-    if a.cmd == "voiceover":
-        import voiceover_cut as vc
-
-        plan_path = out.with_name(out.stem + ".vo.plan.json")
-        args = ["auto", a.voice, "--clips", *a.clips, "--preset", a.preset, "-o", str(plan_path), "--out", str(out), "--workers", str(a.workers)]
-        if a.captions:
-            args.append("--captions")
-        if a.music:
-            args += ["--music", a.music]
-        if a.script:
-            args += ["--script", a.script]
-        if vc.main(args) != 0:
-            raise AutocutError("voiceover edit failed (see the log above)")
         return {"outputs": [str(out)], "plan": str(plan_path), "out_dir": str(out.parent), **otio_for(plan_path)}
     raise AutocutError(f"unknown command {a.cmd}")
 

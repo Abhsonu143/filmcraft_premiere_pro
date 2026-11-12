@@ -154,3 +154,32 @@ anywhere, no grade, no effects. Rebuilt as four layers, tested on the owner's 14
   - Captions: auto/on/off; auto turns them on only when the clip has clear speech.
   - Title card: off by default, or intro/always. The title is always in the file name; duplicate titles are re-asked.
 - Timing (M3 8 GB, cached analysis): planning 10 clips takes ~100 s; rendering takes 13–22 s per 50 s clip. `quality_check` is clean on all 10.
+
+## Voice clone, script writer and voiceover editor v2 (2026-11-12)
+
+Full description: `docs/voice-and-voiceover.md`.
+
+- **Voice Clone** (`voice.py`, `voice_prompts.py`): record sentence by sentence in the app, or use existing
+  recordings. 24 English + 24 Hindi + 8 Hinglish sentences cover every sound and the main deliveries.
+  - Each reference phrase is analysed: language, delivery, pitch, energy, pace, SNR, and an ECAPA similarity check.
+  - Speech uses Chatterbox Multilingual v3 (MLX, MIT): the reference is matched to each line's language and
+    emotion, 1–4 takes are generated, and the best is kept by Whisper error rate plus voice similarity.
+  - Bad lines are regenerated. Pauses are filled with room tone. Output: `.wav` + `.narration.json`.
+  - Benchmarked on this Mac against OmniVoice: OmniVoice garbled Hindi and used 5.6 GB, so it is not offered.
+- **Write Voiceover Script** (`script_writer.py`):
+  - Learns a talking style from `.txt`/`.srt`/`.vtt` or YouTube links (captions only, via yt-dlp in the venv).
+  - Tested on 3 Hindi travel vlogs: Hinglish, 175 wpm, signature phrases "हम लोग", "यहां पे".
+  - Claude writes through `claude -p` (no API key); Qwen3-4B writes offline.
+  - Each line carries emotion, pace, pause, emphasis and a shot idea. A 60 s Hinglish script took 34 s.
+  - Can speak the script right away with a chosen voice.
+- **Voiceover Edit** (`narrate.py`, replaces `voiceover_cut` in the app; that module and its tests remain):
+  - Each line is matched to footage meaning with CLIP. Queries blend the shot idea, its subject alone, and the
+    words; Hindi works through Claude or Qwen shot ideas, or the Whisper translation.
+  - Scores are relative per line. The whole edit is chosen together by beam search: no reuse, varied clips and
+    shot sizes, shooting order kept.
+  - Cuts are timed 0.12 s before each line and long lines split at breaths.
+  - Sound: natural clip sound under the voice, optional ducked music. Devanagari captions.
+- **App:** AI ▸ Voice Clone… (recorder with microphone choice, playback, level/noise/clipping hints), AI ▸ Write
+  Voiceover Script… (style learning, Claude/local, speak with a voice), and a reworked AI ▸ Voiceover Edit…
+  (shape, pace, shot ideas, caption style, natural sound).
+- **Not changed:** Make Short Clips (highlights, clip_edit, reframe, captions): same code, same tests.

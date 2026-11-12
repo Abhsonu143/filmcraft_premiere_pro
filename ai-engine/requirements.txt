@@ -13,3 +13,9 @@ opentimelineio>=0.17
 mlx-lm>=0.30
 # Apple Vision face detection for reframing (MIT; macOS only).
 pyobjc-framework-Vision>=10; sys_platform == "darwin"
+# YouTube captions for talking-style profiles (Unlicense); only captions are downloaded.
+yt-dlp>=2026.10
+# Voice cloning: Chatterbox Multilingual v3 on MLX (MIT code and weights; Hindi + English).
+mlx-audio>=0.6.5
+# Speaker verification (ECAPA, Apache-2.0) to check a cloned take sounds like you.
+speechbrain>=1.1

@@ -67,6 +67,8 @@ pub enum Kind {
     Voiceover,
     Clips,
     Audio,
+    Script,
+    Voice,
 }
 
 impl Kind {
@@ -79,6 +81,8 @@ impl Kind {
             Kind::Voiceover => "voiceover",
             Kind::Clips => "clips",
             Kind::Audio => "audio",
+            Kind::Script => "script",
+            Kind::Voice => "voice",
         }
     }
     fn from_command(id: &str) -> Option<Kind> {
@@ -90,6 +94,8 @@ impl Kind {
             "ai.voiceover" => Kind::Voiceover,
             "ai.clips" => Kind::Clips,
             "ai.audio" => Kind::Audio,
+            "ai.script" => Kind::Script,
+            "ai.voice" => Kind::Voice,
             _ => return None,
         })
     }
@@ -102,6 +108,8 @@ impl Kind {
             Kind::Voiceover => "Voiceover Edit",
             Kind::Clips => "Make Short Clips from Long Video",
             Kind::Audio => "Extract Audio from Video",
+            Kind::Script => "Write Voiceover Script",
+            Kind::Voice => "Voice Clone",
         }
     }
     fn input_label(self) -> &'static str {
@@ -113,7 +121,7 @@ impl Kind {
         }
     }
     fn needs_input(self) -> bool {
-        !matches!(self, Kind::Music | Kind::Audio)
+        !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice)
     }
     fn needs_clips(self) -> bool {
         matches!(self, Kind::Music | Kind::Reference | Kind::Voiceover | Kind::Audio)
@@ -158,6 +166,60 @@ struct Draft {
     captions: bool,
     import: bool,
     error: String,
+    // voiceover edit
+    describe: &'static str,
+    ambience: bool,
+    // script writing
+    topic: String,
+    niche: String,
+    tone: String,
+    audience: String,
+    notes: String,
+    language: &'static str,
+    seconds: f64,
+    style: String,
+    style_sources: Vec<String>,
+    style_links: String,
+    new_style: String,
+    writer: &'static str,
+    voice: String,
+    takes: f64,
+    // voice clone
+    voice_name: String,
+    lang_en: bool,
+    lang_hi: bool,
+    source: &'static str,
+    rec: Recorder,
+}
+
+/// The sentence-by-sentence recording session of the Voice Clone dialog.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Recorder {
+    prompts: Vec<Prompt>,
+    loading: Option<u64>,
+    mics: Vec<String>,
+    mic: String,
+    mics_job: Option<u64>,
+    cursor: usize,
+    recording: Option<u64>,
+    takes: Vec<Option<Take>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Prompt {
+    id: String,
+    lang: String,
+    text: String,
+    emotion: String,
+    direction: String,
+    /// free talking (no fixed text): the engine transcribes it
+    free: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Take {
+    file: String,
+    issues: String,
 }
 
 impl Draft {
@@ -172,7 +234,11 @@ impl Draft {
             clip_len: 60.0,
             quality: "same",
             length: 30.0,
-            aspect: if kind == Kind::Reference { "same" } else { "vertical" },
+            aspect: match kind {
+                Kind::Reference => "same",
+                Kind::Voiceover => "horizontal",
+                _ => "vertical",
+            },
             pace: "medium",
             preset: if kind == Kind::Voiceover { "travel" } else { "long" },
             look: "cinematic",
@@ -188,7 +254,7 @@ impl Draft {
             caption_mode: "auto",
             hook: true,
             title_mode: "off",
-            caption_style: "pop",
+            caption_style: if kind == Kind::Voiceover { "clean" } else { "pop" },
             llm: "default",
             format: "mp3",
             audio_quality: "high",
@@ -197,8 +263,29 @@ impl Draft {
             mono: false,
             normalize: false,
             captions: false,
-            import: !matches!(kind, Kind::Split | Kind::Audio),
+            import: !matches!(kind, Kind::Split | Kind::Audio | Kind::Script | Kind::Voice),
             error: String::new(),
+            describe: "local",
+            ambience: true,
+            topic: String::new(),
+            niche: String::new(),
+            tone: String::new(),
+            audience: String::new(),
+            notes: String::new(),
+            language: "hinglish",
+            seconds: 60.0,
+            style: String::new(),
+            style_sources: Vec::new(),
+            style_links: String::new(),
+            new_style: String::new(),
+            writer: "claude",
+            voice: String::new(),
+            takes: 2.0,
+            voice_name: String::new(),
+            lang_en: true,
+            lang_hi: true,
+            source: "record",
+            rec: Recorder { mic: "0".into(), ..Recorder::default() },
         }
     }
 
@@ -257,6 +344,39 @@ impl Draft {
         };
         d.captions = p.get("captions").and_then(Value::as_bool).unwrap_or(false);
         d.import = p.get("import").and_then(Value::as_bool).unwrap_or(d.import);
+        d.describe = pick("describe", &DESCRIBERS.map(|a| a.0), d.describe);
+        d.ambience = p.get("ambience").and_then(Value::as_bool).unwrap_or(d.ambience);
+        for (k, f) in [
+            ("topic", &mut d.topic),
+            ("niche", &mut d.niche),
+            ("tone", &mut d.tone),
+            ("audience", &mut d.audience),
+            ("notes", &mut d.notes),
+            ("style", &mut d.style),
+            ("voice", &mut d.voice),
+            ("name", &mut d.voice_name),
+            ("newStyle", &mut d.new_style),
+        ] {
+            if let Some(v) = p.get(k).and_then(Value::as_str) {
+                *f = v.to_string();
+            }
+        }
+        d.language = pick("language", &SCRIPT_LANGUAGES.map(|a| a.0), d.language);
+        d.writer = pick("writer", &WRITERS.map(|a| a.0), d.writer);
+        d.source = pick("source", &VOICE_SOURCES.map(|a| a.0), d.source);
+        d.seconds = num("seconds", d.seconds);
+        d.takes = num("takes", d.takes);
+        if let Some(l) = p.get("languages").and_then(Value::as_array) {
+            let has = |c: &str| l.iter().any(|v| v.as_str() == Some(c));
+            d.lang_en = has("en");
+            d.lang_hi = has("hi");
+        }
+        if let Some(a) = p.get("styleSources").and_then(Value::as_array) {
+            d.style_sources = a.iter().filter_map(Value::as_str).map(str::to_string).collect();
+        }
+        if let Some(a) = p.get("takesFile").and_then(Value::as_str) {
+            d.script = a.to_string();
+        }
         d
     }
 
@@ -401,15 +521,99 @@ impl Draft {
                 a.push("--clips".into());
                 a.extend(self.clips.iter().cloned());
                 push(&mut a, "--out", self.out.trim());
-                push(&mut a, "--preset", self.preset);
+                push(&mut a, "--aspect", if self.aspect == "same" { "horizontal" } else { self.aspect });
+                push(&mut a, "--pace", self.pace);
+                push(&mut a, "--describe", self.describe);
+                push(&mut a, "--llm", self.llm);
                 if self.captions {
                     a.push("--captions".into());
+                    push(&mut a, "--caption-style", self.caption_style);
+                }
+                if !self.ambience {
+                    push(&mut a, "--ambience-db", "-60");
                 }
                 if !self.music.trim().is_empty() {
                     push(&mut a, "--music", self.music.trim());
                 }
-                if !self.script.trim().is_empty() {
-                    push(&mut a, "--script", self.script.trim());
+                let script = self.script.trim();
+                if !script.is_empty() {
+                    push(&mut a, if script.ends_with(".narration.json") { "--narration" } else { "--script" }, script);
+                }
+            }
+            Kind::Script => {
+                if self.topic.trim().is_empty() {
+                    return Err("Write what the video is about (the topic).".into());
+                }
+                if !(5.0..=1800.0).contains(&self.seconds) {
+                    return Err("Length must be 5 seconds to 30 minutes.".into());
+                }
+                if !(1.0..=4.0).contains(&self.takes) {
+                    return Err("Takes per line must be 1 to 4.".into());
+                }
+                a = vec!["script-write".into()];
+                push(&mut a, "--topic", self.topic.trim());
+                push(&mut a, "--out", self.out.trim());
+                push(&mut a, "--seconds", &format!("{}", self.seconds));
+                push(&mut a, "--language", self.language);
+                push(&mut a, "--backend", self.writer);
+                for (k, v) in
+                    [("--niche", &self.niche), ("--tone", &self.tone), ("--audience", &self.audience), ("--notes", &self.notes), ("--style", &self.style)]
+                {
+                    if !v.trim().is_empty() {
+                        push(&mut a, k, v.trim());
+                    }
+                }
+                if !self.voice.trim().is_empty() {
+                    push(&mut a, "--voice", self.voice.trim());
+                    push(&mut a, "--takes", &format!("{}", self.takes.round()));
+                }
+                if !self.clips.is_empty() {
+                    a.push("--footage".into());
+                    a.extend(self.clips.iter().cloned());
+                }
+            }
+            Kind::Voice => {
+                let name = self.voice_name.trim();
+                if name.is_empty() {
+                    return Err("Give the voice a name.".into());
+                }
+                if !self.lang_en && !self.lang_hi {
+                    return Err("Choose at least one language.".into());
+                }
+                a = vec!["voice-enroll".into()];
+                push(&mut a, "--name", name);
+                a.push("--languages".into());
+                if self.lang_en {
+                    a.push("en".into());
+                }
+                if self.lang_hi {
+                    a.push("hi".into());
+                }
+                if self.source == "files" {
+                    if self.clips.is_empty() {
+                        return Err("Add recordings of your voice (audio or video files).".into());
+                    }
+                    a.push("--files".into());
+                    a.extend(self.clips.iter().cloned());
+                } else {
+                    let n = self.rec.takes.iter().flatten().count();
+                    if n < 6 {
+                        return Err(format!("Record at least 6 sentences first ({n} so far); 20+ per language gives a much more faithful voice."));
+                    }
+                    let file = write_takes(&self.voice_name, &self.rec)?;
+                    push(&mut a, "--takes", &file);
+                    let free: Vec<String> = self
+                        .rec
+                        .prompts
+                        .iter()
+                        .zip(self.rec.takes.iter())
+                        .filter(|(p, _)| p.free)
+                        .filter_map(|(_, t)| t.as_ref().map(|t| t.file.clone()))
+                        .collect();
+                    if !free.is_empty() {
+                        a.push("--files".into());
+                        a.extend(free);
+                    }
                 }
             }
         }
@@ -480,6 +684,15 @@ const AUDIO_QUALITIES: [(&str, &str); 5] = [
     ("small", "Small (128 kb/s)"),
 ];
 
+const DESCRIBERS: [(&str, &str); 3] = [
+    ("local", "Local model writes a shot idea per line (offline)"),
+    ("claude", "Claude writes a shot idea per line (best for Hindi)"),
+    ("none", "Match on the words only"),
+];
+const SCRIPT_LANGUAGES: [(&str, &str); 3] = [("hinglish", "Hinglish (Hindi + English words)"), ("hi", "Hindi"), ("en", "English")];
+const WRITERS: [(&str, &str); 2] = [("claude", "Claude (through Claude Code; best quality)"), ("local", "Local model (offline)")];
+const VOICE_SOURCES: [(&str, &str); 2] =
+    [("record", "Record with the microphone (EI gives the sentences)"), ("files", "Recordings I already have (audio or video)")];
 const PRESETS: [(&str, &str); 3] = [("long", "YouTube 16:9"), ("short", "Short / Reel 9:16"), ("travel", "Travel 16:9")];
 
 const VIDEO_EXT: [&str; 9] = ["mp4", "mov", "m4v", "mkv", "avi", "mts", "m2ts", "webm", "mxf"];
@@ -518,7 +731,80 @@ fn default_output(d: &Draft) -> String {
         Kind::Voiceover => free_path(&parent_dir(&d.input), &format!("{} - EI edit", file_stem(&d.input)), ".mp4"),
         Kind::Clips => free_path(&parent_dir(&d.input), &format!("{} - EI clips", file_stem(&d.input)), ""),
         Kind::Audio => d.clips.first().map(|c| parent_dir(c).to_string_lossy().to_string()).unwrap_or_else(|| movies_dir().to_string_lossy().to_string()),
+        Kind::Script => movies_dir().join("Scripts").join(slug(if d.topic.trim().is_empty() { "script" } else { &d.topic })).to_string_lossy().to_string(),
+        Kind::Voice => voices_dir().join(slug(&d.voice_name)).to_string_lossy().to_string(),
     }
+}
+
+/// A file-name-safe version of a name (as the engine's `slug`).
+fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        if c.is_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let s: String = out.trim_matches('-').chars().take(60).collect();
+    if s.is_empty() { "voice".into() } else { s }
+}
+
+fn voices_dir() -> PathBuf {
+    settings_path().parent().map(Path::to_path_buf).unwrap_or_else(support_dir).join("voices")
+}
+
+fn styles_dir() -> PathBuf {
+    settings_path().parent().map(Path::to_path_buf).unwrap_or_else(support_dir).join("styles")
+}
+
+/// Saved voices (folders with a profile) and talking styles, by name.
+fn saved_voices() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(voices_dir())
+        .map(|it| {
+            it.filter_map(Result::ok)
+                .filter(|e| e.path().join("profile.json").is_file())
+                .map(|e| {
+                    std::fs::read_to_string(e.path().join("profile.json"))
+                        .ok()
+                        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                        .and_then(|p| p.get("name").and_then(Value::as_str).map(str::to_string))
+                        .unwrap_or_else(|| e.file_name().to_string_lossy().to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+fn saved_styles() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(styles_dir())
+        .map(|it| {
+            it.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// The recorded takes as the engine's `--takes` JSON (next to the takes).
+fn write_takes(name: &str, rec: &Recorder) -> Result<String, String> {
+    let dir = voices_dir().join(slug(name)).join("takes");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let list: Vec<Value> = rec
+        .prompts
+        .iter()
+        .zip(rec.takes.iter())
+        .filter(|(p, _)| !p.free)
+        .filter_map(|(p, t)| t.as_ref().map(|t| json!({"file": t.file, "text": p.text, "lang": p.lang, "emotion": p.emotion})))
+        .collect();
+    let file = dir.join("takes.json");
+    std::fs::write(&file, serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?).map_err(|e| format!("could not save the takes: {e}"))?;
+    Ok(file.to_string_lossy().to_string())
 }
 
 fn draft_id() -> egui::Id {
@@ -845,6 +1131,8 @@ fn run_draft(d: &mut Draft) -> Result<u64, String> {
         Kind::Music => format!("{}: {}", d.kind.title(), file_stem(&d.music)),
         Kind::Audio => format!("{}: {} file(s)", d.kind.title(), d.clips.len()),
         Kind::Split | Kind::Reference | Kind::Talk | Kind::Voiceover | Kind::Clips => format!("{}: {}", d.kind.title(), file_stem(&d.input)),
+        Kind::Script => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
+        Kind::Voice => format!("{}: {}", d.kind.title(), d.voice_name.trim()),
     };
     Ok(start_job(title, Some(d.kind), vec![step], d.import, Some(engine)))
 }
@@ -938,6 +1226,7 @@ enum Pick {
     Music,
     Script,
     Out,
+    StyleSources,
 }
 
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
@@ -1010,6 +1299,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut close = false;
     let mut run = false;
     let mut pick: Option<Pick> = None;
+    let mut learn_style = false;
     let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
     egui::Window::new(d.kind.title())
         .id(egui::Id::new(("ei-ai-dialog", d.kind.id())))
@@ -1028,8 +1318,14 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     }
                     ui.end_row();
                 }
-                if d.kind.needs_clips() {
-                    ui.label(if d.kind == Kind::Audio { "Videos" } else { "Clips" });
+                if d.kind.needs_clips() || d.kind == Kind::Script || (d.kind == Kind::Voice && d.source == "files") {
+                    ui.label(match d.kind {
+                        Kind::Audio => "Videos",
+                        Kind::Script => "Footage (optional)",
+                        Kind::Voice => "Your recordings",
+                        Kind::Voiceover => "Footage",
+                        _ => "Clips",
+                    });
                     ui.vertical(|ui| {
                         let summary = match d.clips.len() {
                             0 => "No clips yet".to_string(),
@@ -1071,7 +1367,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 }
                 if d.kind == Kind::Voiceover {
                     ui.label("Script (optional)");
-                    if path_row(ui, &mut d.script, &format!("{p}.script"), "a .txt file: helps spelling", &mut elems) {
+                    if path_row(ui, &mut d.script, &format!("{p}.script"), "the .script.json / .txt it was read from", &mut elems) {
                         pick = Some(Pick::Script);
                     }
                     ui.end_row();
@@ -1182,7 +1478,147 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         });
                         ui.end_row();
                     }
-                    Kind::Talk | Kind::Voiceover => {
+                    Kind::Voiceover => {
+                        ui.label("Shape");
+                        radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
+                        ui.end_row();
+                        ui.label("Pace");
+                        radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
+                        ui.end_row();
+                        ui.label("Shot ideas");
+                        combo_row(ui, &mut d.describe, &DESCRIBERS, &format!("{p}.describe"), &mut elems);
+                        ui.end_row();
+                        ui.label("Captions");
+                        ui.horizontal(|ui| {
+                            let r = ui.checkbox(&mut d.captions, "Burn in");
+                            elems.push((format!("{p}.captions"), r.rect, d.captions.to_string()));
+                            combo_row(ui, &mut d.caption_style, &CAPTION_STYLES, &format!("{p}.captionStyle"), &mut elems);
+                        });
+                        ui.end_row();
+                        ui.label("");
+                        let r = ui.checkbox(&mut d.ambience, "Keep a little of each clip's own sound under the voice");
+                        elems.push((format!("{p}.ambience"), r.rect, d.ambience.to_string()));
+                        ui.end_row();
+                    }
+                    Kind::Script => {
+                        ui.label("Topic");
+                        let r = ui.add(egui::TextEdit::singleline(&mut d.topic).hint_text("what the video is about").desired_width(380.0));
+                        elems.push((format!("{p}.topic"), r.rect, d.topic.clone()));
+                        ui.end_row();
+                        for (key, label, hint, v) in [
+                            ("niche", "Niche", "e.g. travel vlog, tech review, finance", &mut d.niche),
+                            ("tone", "Tone", "e.g. excited, calm documentary, funny", &mut d.tone),
+                            ("audience", "Audience", "who is watching", &mut d.audience),
+                        ] {
+                            ui.label(label);
+                            let r = ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(380.0));
+                            elems.push((format!("{p}.{key}"), r.rect, v.clone()));
+                            ui.end_row();
+                        }
+                        ui.label("Notes");
+                        let r = ui.add(
+                            egui::TextEdit::multiline(&mut d.notes)
+                                .hint_text("facts, places, what happened, what to mention")
+                                .desired_rows(3)
+                                .desired_width(380.0),
+                        );
+                        elems.push((format!("{p}.notes"), r.rect, d.notes.clone()));
+                        ui.end_row();
+                        ui.label("Length (seconds)");
+                        let r = ui.add(egui::DragValue::new(&mut d.seconds).range(5.0..=1800.0).speed(1.0).max_decimals(0));
+                        elems.push((format!("{p}.seconds"), r.rect, d.seconds.to_string()));
+                        ui.end_row();
+                        ui.label("Language");
+                        radio_row(ui, &mut d.language, &SCRIPT_LANGUAGES, &format!("{p}.language"), &mut elems);
+                        ui.end_row();
+                        ui.label("Talking style");
+                        let styles = saved_styles();
+                        let shown = if d.style.is_empty() { "None (a natural creator style)".to_string() } else { d.style.clone() };
+                        let r = egui::ComboBox::from_id_salt(format!("{p}.style")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+                            let o = ui.selectable_value(&mut d.style, String::new(), "None (a natural creator style)");
+                            elems.push((format!("{p}.style.none"), o.rect, "None".into()));
+                            for st in &styles {
+                                let o = ui.selectable_value(&mut d.style, st.clone(), st);
+                                elems.push((format!("{p}.style.{st}"), o.rect, st.clone()));
+                            }
+                        });
+                        elems.push((format!("{p}.style"), r.response.rect, shown));
+                        ui.end_row();
+                        ui.label("Learn a style");
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "From transcripts (.txt, .srt, .vtt) and/or YouTube links (one per line): how you or a creator you like talks.",
+                                )
+                                .weak(),
+                            );
+                            ui.horizontal(|ui| {
+                                let b = ui.button("Add Transcripts…");
+                                elems.push((format!("{p}.styleSources.add"), b.rect, "Add Transcripts…".into()));
+                                if b.clicked() {
+                                    pick = Some(Pick::StyleSources);
+                                }
+                                ui.label(format!("{} file(s)", d.style_sources.len()));
+                            });
+                            let r = ui.add(
+                                egui::TextEdit::multiline(&mut d.style_links)
+                                    .hint_text("https://www.youtube.com/watch?v=…")
+                                    .desired_rows(2)
+                                    .desired_width(380.0),
+                            );
+                            elems.push((format!("{p}.styleLinks"), r.rect, d.style_links.clone()));
+                            ui.horizontal(|ui| {
+                                let r = ui.add(egui::TextEdit::singleline(&mut d.new_style).hint_text("style name").desired_width(160.0));
+                                elems.push((format!("{p}.newStyle"), r.rect, d.new_style.clone()));
+                                let b = ui.button("Learn Style");
+                                elems.push((format!("{p}.learnStyle"), b.rect, "Learn Style".into()));
+                                if b.clicked() {
+                                    learn_style = true;
+                                }
+                            });
+                        });
+                        ui.end_row();
+                        ui.label("Written by");
+                        combo_row(ui, &mut d.writer, &WRITERS, &format!("{p}.writer"), &mut elems);
+                        ui.end_row();
+                        ui.label("Speak it with");
+                        let voices = saved_voices();
+                        let shown = if d.voice.is_empty() { "Don't speak (script only)".to_string() } else { d.voice.clone() };
+                        let r = egui::ComboBox::from_id_salt(format!("{p}.voice")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+                            let o = ui.selectable_value(&mut d.voice, String::new(), "Don't speak (script only)");
+                            elems.push((format!("{p}.voice.none"), o.rect, "none".into()));
+                            for v in &voices {
+                                let o = ui.selectable_value(&mut d.voice, v.clone(), v);
+                                elems.push((format!("{p}.voice.{v}"), o.rect, v.clone()));
+                            }
+                        });
+                        elems.push((format!("{p}.voice"), r.response.rect, shown));
+                        ui.end_row();
+                        if !d.voice.is_empty() {
+                            ui.label("Takes per line");
+                            let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
+                            elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
+                            ui.end_row();
+                        }
+                    }
+                    Kind::Voice => {
+                        ui.label("Voice name");
+                        let r = ui.add(egui::TextEdit::singleline(&mut d.voice_name).hint_text("e.g. my voice").desired_width(240.0));
+                        elems.push((format!("{p}.name"), r.rect, d.voice_name.clone()));
+                        ui.end_row();
+                        ui.label("Languages");
+                        ui.horizontal(|ui| {
+                            let r = ui.checkbox(&mut d.lang_hi, "Hindi (and Hinglish)");
+                            elems.push((format!("{p}.lang.hi"), r.rect, d.lang_hi.to_string()));
+                            let r = ui.checkbox(&mut d.lang_en, "English");
+                            elems.push((format!("{p}.lang.en"), r.rect, d.lang_en.to_string()));
+                        });
+                        ui.end_row();
+                        ui.label("Source");
+                        radio_row(ui, &mut d.source, &VOICE_SOURCES, &format!("{p}.source"), &mut elems);
+                        ui.end_row();
+                    }
+                    Kind::Talk => {
                         ui.label("Format");
                         radio_row(ui, &mut d.preset, &PRESETS, &format!("{p}.preset"), &mut elems);
                         ui.end_row();
@@ -1192,22 +1628,31 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         ui.end_row();
                     }
                 }
-                let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio);
-                ui.label(if folder_out { "Output folder" } else { "Save as" });
-                if path_row(ui, &mut d.out, &format!("{p}.out"), "automatic (next to the source)", &mut elems) {
-                    pick = Some(Pick::Out);
+                if d.kind != Kind::Voice {
+                    let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio);
+                    ui.label(if folder_out { "Output folder" } else { "Save as" });
+                    let hint = if d.kind == Kind::Script { "automatic (Movies/EI/Scripts)" } else { "automatic (next to the source)" };
+                    if path_row(ui, &mut d.out, &format!("{p}.out"), hint, &mut elems) {
+                        pick = Some(Pick::Out);
+                    }
+                    ui.end_row();
                 }
-                ui.end_row();
-                ui.label("");
-                let label = match d.kind {
-                    Kind::Split | Kind::Clips => "Import the clips into the project",
-                    Kind::Audio => "Import the audio into the project",
-                    _ => "Open the edit in the timeline when done",
-                };
-                let r = ui.checkbox(&mut d.import, label);
-                elems.push((format!("{p}.import"), r.rect, d.import.to_string()));
-                ui.end_row();
+                if !matches!(d.kind, Kind::Script | Kind::Voice) {
+                    ui.label("");
+                    let label = match d.kind {
+                        Kind::Split | Kind::Clips => "Import the clips into the project",
+                        Kind::Audio => "Import the audio into the project",
+                        _ => "Open the edit in the timeline when done",
+                    };
+                    let r = ui.checkbox(&mut d.import, label);
+                    elems.push((format!("{p}.import"), r.rect, d.import.to_string()));
+                    ui.end_row();
+                }
             });
+            if d.kind == Kind::Voice && d.source == "record" {
+                ui.separator();
+                recorder_ui(ui, &mut d, &p, &mut elems);
+            }
             if !d.error.is_empty() {
                 ui.add_space(4.0);
                 ui.colored_label(egui::Color32::from_rgb(0xE5, 0x6B, 0x6B), &d.error);
@@ -1219,7 +1664,13 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 if c.clicked() {
                     close = true;
                 }
-                let o = ui.add(egui::Button::new(egui::RichText::new("Run").color(egui::Color32::WHITE)).fill(app.tokens.accent));
+                let run_label = match d.kind {
+                    Kind::Voice => "Create Voice",
+                    Kind::Script if !d.voice.is_empty() => "Write and Speak",
+                    Kind::Script => "Write Script",
+                    _ => "Run",
+                };
+                let o = ui.add(egui::Button::new(egui::RichText::new(run_label).color(egui::Color32::WHITE)).fill(app.tokens.accent));
                 elems.push((format!("{p}.run"), o.rect, "Run".into()));
                 if o.clicked() {
                     run = true;
@@ -1239,9 +1690,19 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     d.input = f;
                 }
             }
-            Pick::ClipsAdd => {
+            Pick::StyleSources => {
                 if let Some(f) = app.hooks.pick_files.as_mut() {
-                    for c in f(&video) {
+                    for c in f(&["txt", "srt", "vtt"]) {
+                        if !d.style_sources.contains(&c) {
+                            d.style_sources.push(c);
+                        }
+                    }
+                }
+            }
+            Pick::ClipsAdd => {
+                let media: Vec<&str> = if d.kind == Kind::Voice { AUDIO_EXT.iter().chain(VIDEO_EXT.iter()).copied().collect() } else { video.clone() };
+                if let Some(f) = app.hooks.pick_files.as_mut() {
+                    for c in f(&media) {
                         if !d.clips.contains(&c) {
                             d.clips.push(c);
                         }
@@ -1262,7 +1723,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 }
             }
             Pick::Script => {
-                if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f("Text", &["txt", "md"])) {
+                if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f("Script", &["json", "txt", "md"])) {
                     d.script = f;
                 }
             }
@@ -1283,6 +1744,16 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         close = true;
     }
+    if learn_style {
+        match learn_style_job(&d) {
+            Ok(_) => {
+                d.error.clear();
+                app.ui.status = "Learning the talking style (AI ▸ AI Jobs shows progress)".into();
+            }
+            Err(e) => d.error = e,
+        }
+    }
+    poll_recorder(&mut d);
     if run {
         match run_draft(&mut d) {
             Ok(job) => {
@@ -1297,6 +1768,245 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
     ctx.data_mut(|m| m.insert_temp(draft_id(), if close { None } else { Some(d) }));
 }
 
+/// The engine command line for `args` (python, ei_engine.py, args…) and the engine folder.
+fn engine_step(args: Vec<String>) -> Result<(Vec<String>, PathBuf), String> {
+    let engine = engine_dir().ok_or("The AI engine was not found. Reinstall EI, or set EI_ENGINE_DIR to the ai-engine folder.")?;
+    let mut step = vec![python(Some(&engine)).to_string_lossy().to_string(), engine.join("ei_engine.py").to_string_lossy().to_string()];
+    step.extend(args);
+    Ok((step, engine))
+}
+
+fn job_state(id: u64) -> Option<(Status, Value, String)> {
+    with_job(id, |j| (j.status, j.result.clone(), j.error.clone()))
+}
+
+fn learn_style_job(d: &Draft) -> Result<u64, String> {
+    let name = d.new_style.trim();
+    if name.is_empty() {
+        return Err("Give the style a name.".into());
+    }
+    let mut sources: Vec<String> = d.style_sources.clone();
+    sources.extend(d.style_links.lines().map(str::trim).filter(|l| l.starts_with("http")).map(str::to_string));
+    if sources.is_empty() {
+        return Err("Add transcript files or YouTube links to learn from.".into());
+    }
+    let mut args = vec!["script-style".to_string(), "--name".into(), name.to_string()];
+    args.extend(sources);
+    let (step, engine) = engine_step(args)?;
+    Ok(start_job(format!("Learn talking style: {name}"), None, vec![step], false, Some(engine)))
+}
+
+/// Sentence-by-sentence recording for a voice clone.
+fn recorder_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
+    let mut langs = Vec::new();
+    if d.lang_hi {
+        langs.push("hi".to_string());
+    }
+    if d.lang_en {
+        langs.push("en".to_string());
+    }
+    if d.rec.prompts.is_empty() && d.rec.loading.is_none() && !langs.is_empty() {
+        let mut args = vec!["voice-prompts".to_string(), "--languages".into()];
+        args.extend(langs.iter().cloned());
+        match engine_step(args) {
+            Ok((step, engine)) => d.rec.loading = Some(start_job("Voice clone: sentences".into(), None, vec![step], false, Some(engine))),
+            Err(e) => d.error = e,
+        }
+    }
+    if d.rec.mics.is_empty()
+        && d.rec.mics_job.is_none()
+        && let Ok((step, engine)) = engine_step(vec!["voice-mics".into()])
+    {
+        d.rec.mics_job = Some(start_job("Voice clone: microphones".into(), None, vec![step], false, Some(engine)));
+    }
+    if d.rec.prompts.is_empty() {
+        ui.label(if langs.is_empty() { "Choose a language." } else { "Loading the sentences…" });
+        return;
+    }
+    let n = d.rec.prompts.len();
+    d.rec.cursor = d.rec.cursor.min(n.saturating_sub(1));
+    let done = d.rec.takes.iter().flatten().count();
+    ui.horizontal(|ui| {
+        ui.strong(format!("Sentence {} of {n}", d.rec.cursor + 1));
+        ui.weak(format!("· {done} recorded"));
+        if !d.rec.mics.is_empty() {
+            ui.add_space(12.0);
+            ui.label("Microphone");
+            let shown = d.rec.mics.iter().find(|m| m.split(':').next() == Some(d.rec.mic.as_str())).cloned().unwrap_or_else(|| d.rec.mic.clone());
+            let r = egui::ComboBox::from_id_salt(format!("{p}.mic")).selected_text(shown.clone()).width(200.0).show_ui(ui, |ui| {
+                for m in d.rec.mics.clone() {
+                    let idx = m.split(':').next().unwrap_or("0").trim().to_string();
+                    let o = ui.selectable_value(&mut d.rec.mic, idx.clone(), &m);
+                    elems.push((format!("{p}.mic.{idx}"), o.rect, m.clone()));
+                }
+            });
+            elems.push((format!("{p}.mic"), r.response.rect, shown));
+        }
+    });
+    let Some(pr) = d.rec.prompts.get(d.rec.cursor).cloned() else { return };
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(if pr.lang == "hi" { "हिन्दी" } else { "English" }).strong());
+        ui.label(egui::RichText::new(format!("· {}", pr.emotion)).weak());
+    });
+    if pr.direction != "free" {
+        ui.label(egui::RichText::new(&pr.direction).italics().weak());
+    }
+    let t = ui.add(egui::Label::new(egui::RichText::new(&pr.text).size(20.0)).wrap());
+    elems.push((format!("{p}.prompt"), t.rect, pr.text.clone()));
+    ui.add_space(4.0);
+    let take = d.rec.takes.get(d.rec.cursor).cloned().flatten();
+    let recording = d.rec.recording.is_some();
+    ui.horizontal(|ui| {
+        let b = ui.add_enabled(d.rec.cursor > 0 && !recording, egui::Button::new("‹ Back"));
+        elems.push((format!("{p}.back"), b.rect, "Back".into()));
+        if b.clicked() {
+            d.rec.cursor -= 1;
+        }
+        let label = if recording {
+            "● Recording… (stops when you stop talking)"
+        } else if take.is_some() {
+            "● Record Again"
+        } else {
+            "● Record"
+        };
+        let r = ui.add_enabled(!recording, egui::Button::new(egui::RichText::new(label).color(egui::Color32::from_rgb(0xE5, 0x6B, 0x6B))));
+        elems.push((format!("{p}.record"), r.rect, label.into()));
+        if r.clicked() {
+            if d.voice_name.trim().is_empty() {
+                d.error = "Give the voice a name first.".into();
+            } else {
+                let file = voices_dir().join(slug(&d.voice_name)).join("takes").join(format!("{}.wav", pr.id));
+                let max = if pr.free { "75" } else { "30" };
+                let args = vec![
+                    "voice-record".into(),
+                    "--out".into(),
+                    file.to_string_lossy().to_string(),
+                    "--mic".into(),
+                    d.rec.mic.clone(),
+                    "--max".into(),
+                    max.into(),
+                ];
+                match engine_step(args) {
+                    Ok((step, engine)) => {
+                        d.error.clear();
+                        d.rec.recording = Some(start_job(format!("Recording {}", pr.id), None, vec![step], false, Some(engine)));
+                    }
+                    Err(e) => d.error = e,
+                }
+            }
+        }
+        if recording {
+            let s = ui.button("Stop");
+            elems.push((format!("{p}.stop"), s.rect, "Stop".into()));
+            if s.clicked()
+                && let Some(j) = d.rec.recording.take()
+            {
+                cancel_job(j);
+            }
+        }
+        let pl = ui.add_enabled(take.is_some() && !recording, egui::Button::new("▶ Play"));
+        elems.push((format!("{p}.play"), pl.rect, "Play".into()));
+        if pl.clicked()
+            && let Some(t) = &take
+        {
+            let _ = Command::new("afplay").arg(&t.file).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        }
+        let nx = ui.add_enabled(d.rec.cursor + 1 < n && !recording, egui::Button::new(if take.is_some() { "Next ›" } else { "Skip ›" }));
+        elems.push((format!("{p}.next"), nx.rect, "Next".into()));
+        if nx.clicked() {
+            d.rec.cursor += 1;
+        }
+    });
+    match &take {
+        Some(t) if !t.issues.is_empty() => {
+            ui.colored_label(egui::Color32::from_rgb(0xE0, 0xB0, 0x40), format!("Recorded, but: {}", t.issues));
+        }
+        Some(_) => {
+            ui.colored_label(egui::Color32::from_rgb(0x5C, 0xC0, 0x7A), "✔ Recorded");
+        }
+        None => {
+            ui.label(egui::RichText::new("A quiet room, 15–20 cm from the microphone, and say it the way you talk in your videos.").weak());
+        }
+    }
+}
+
+/// Pick up finished recorder jobs (sentences loaded, microphones listed, a take recorded).
+fn poll_recorder(d: &mut Draft) {
+    if let Some(j) = d.rec.loading
+        && let Some((st, res, err)) = job_state(j)
+        && st != Status::Running
+    {
+        d.rec.loading = None;
+        if st == Status::Done {
+            d.rec.prompts = res
+                .get("prompts")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|v| {
+                            let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+                            Prompt {
+                                id: s("id"),
+                                lang: s("lang"),
+                                text: s("text"),
+                                emotion: s("emotion"),
+                                direction: s("direction"),
+                                free: v.get("free").and_then(Value::as_bool).unwrap_or(false),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            d.rec.takes = vec![None; d.rec.prompts.len()];
+            // takes already on disk from an earlier session count as recorded
+            if !d.voice_name.trim().is_empty() {
+                let dir = voices_dir().join(slug(&d.voice_name)).join("takes");
+                for (k, p) in d.rec.prompts.iter().enumerate() {
+                    let f = dir.join(format!("{}.wav", p.id));
+                    if f.is_file()
+                        && let Some(t) = d.rec.takes.get_mut(k)
+                    {
+                        *t = Some(Take { file: f.to_string_lossy().to_string(), issues: String::new() });
+                    }
+                }
+            }
+        } else {
+            d.error = format!("Could not load the sentences: {err}");
+        }
+    }
+    if let Some(j) = d.rec.mics_job
+        && let Some((st, res, _)) = job_state(j)
+        && st != Status::Running
+    {
+        d.rec.mics = res.get("mics").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+        if d.rec.mics.is_empty() {
+            d.rec.mics = vec!["0: Default microphone".into()];
+        }
+    }
+    if let Some(j) = d.rec.recording
+        && let Some((st, res, err)) = job_state(j)
+        && st != Status::Running
+    {
+        d.rec.recording = None;
+        match st {
+            Status::Done => {
+                let file = res.get("file").and_then(Value::as_str).unwrap_or_default().to_string();
+                let issues =
+                    res.get("issues").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default();
+                if let Some(t) = d.rec.takes.get_mut(d.rec.cursor) {
+                    *t = Some(Take { file, issues: issues.clone() });
+                }
+                if issues.is_empty() && d.rec.cursor + 1 < d.rec.prompts.len() {
+                    d.rec.cursor += 1; // a good take: straight to the next sentence
+                }
+            }
+            Status::Cancelled => {}
+            _ => d.error = err,
+        }
+    }
+}
+
 fn description(kind: Kind) -> &'static str {
     match kind {
         Kind::Split => "Cuts a long video into clips of equal length, saved in a folder. The original is not changed.",
@@ -1307,7 +2017,15 @@ fn description(kind: Kind) -> &'static str {
             "Copies the reference's style, not its content: its cut timing, transitions, flashes, zoom punches and (optionally) colour, filled with your best matching moments. Keeps its soundtrack unless you choose another (any audio or video file)."
         }
         Kind::Talk => "Removes the pauses from a talking video (jump cuts), with optional captions and music that ducks under your voice.",
-        Kind::Voiceover => "Matches your footage to what the voiceover says, shot by shot, so the edit follows the narration.",
+        Kind::Voiceover => {
+            "Cuts your footage to a voiceover like an editor: every line gets the shot that shows what is being said (works for Hindi and English), the best-looking moment of it, camera energy that fits the delivery, no repeats, varied shot sizes, cuts just before the words. Use a cloned-voice narration (its .narration.json is found automatically) or any recording."
+        }
+        Kind::Script => {
+            "Claude (or the local model) writes a voiceover script in your talking style, line by line with emotion, pace and a shot idea for each line, ready for your cloned voice. Optionally speaks it right away."
+        }
+        Kind::Voice => {
+            "Clones your voice on this Mac (Chatterbox Multilingual, Hindi + English). Read the sentences EI shows (they cover every sound and the deliveries a video needs), or use recordings you already have. Use only your own voice, or a voice you have permission to use."
+        }
         Kind::Clips => {
             "Edits each clip from a whole scene of a long video: only its best beats, cut on the action, a teaser first, slow motion on the climax, punch-ins on the big hits. Reframed to truly fill the shape (following the action and faces). Talk clips are built from sentences and topics. Optional captions, title card and music (cuts move onto its beats)."
         }
@@ -1702,6 +2420,41 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--format", "flac"]) && a.windows(2).any(|w| w == ["--end", "20.5"]) && a.contains(&"--normalize".to_string()));
         assert!(Draft::from_params(Kind::Audio, &json!({})).engine_args().is_err());
         assert!(Draft::from_params(Kind::Audio, &json!({"clips": [video.to_string_lossy()], "start": "soon"})).engine_args().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn voiceover_script_and_voice_arguments() {
+        let dir = std::env::temp_dir().join(format!("ei-ai-test3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("narr.wav");
+        std::fs::write(&wav, b"x").unwrap();
+        let nar = dir.join("narr.narration.json");
+        std::fs::write(&nar, b"{}").unwrap();
+        let p = json!({"input": wav.to_string_lossy(), "clips": [dir.to_string_lossy()], "aspect": "vertical", "pace": "fast", "captions": true,
+            "describe": "claude", "ambience": false, "script": nar.to_string_lossy()});
+        let a = Draft::from_params(Kind::Voiceover, &p).engine_args().unwrap();
+        for pair in [["--aspect", "vertical"], ["--pace", "fast"], ["--describe", "claude"], ["--ambience-db", "-60"], ["--caption-style", "clean"]] {
+            assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
+        }
+        assert!(a.windows(2).any(|w| w[0] == "--narration"), "{a:?}");
+        let mut s = Draft::from_params(Kind::Script, &json!({"topic": "Spiti road trip", "language": "hi", "seconds": 90, "voice": "me", "writer": "local"}));
+        let a = s.engine_args().unwrap();
+        assert_eq!(a.first().map(String::as_str), Some("script-write"));
+        for pair in [["--topic", "Spiti road trip"], ["--language", "hi"], ["--seconds", "90"], ["--voice", "me"], ["--backend", "local"], ["--takes", "2"]] {
+            assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
+        }
+        assert!(s.out.contains("Spiti-road-trip"), "{}", s.out);
+        assert!(Draft::from_params(Kind::Script, &json!({"topic": " "})).engine_args().is_err());
+        let a = Draft::from_params(Kind::Voice, &json!({"name": "My Voice", "source": "files", "languages": ["hi"], "clips": [wav.to_string_lossy()]}))
+            .engine_args()
+            .unwrap();
+        assert_eq!(a.first().map(String::as_str), Some("voice-enroll"));
+        assert!(a.windows(2).any(|w| w == ["--name", "My Voice"]) && a.windows(2).any(|w| w == ["--languages", "hi"]) && a.contains(&"--files".to_string()));
+        assert!(!a.contains(&"en".to_string()));
+        // recording mode needs takes first
+        assert!(Draft::from_params(Kind::Voice, &json!({"name": "v", "source": "record"})).engine_args().is_err());
+        assert_eq!(slug("  My Voice / Hindi "), "My-Voice-Hindi");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
