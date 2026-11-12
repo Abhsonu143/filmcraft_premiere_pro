@@ -718,7 +718,7 @@ def tempo(y: np.ndarray, factor: float) -> np.ndarray:
 
 def add_args(sub) -> None:
     p = sub.add_parser("voice-prompts", help="the sentences to read for a voice")
-    p.add_argument("--languages", nargs="+", default=["en", "hi"])
+    p.add_argument("--languages", nargs="+", default=["hi", "mix", "en"], choices=["hi", "mix", "en"], help="sets in reading order (mix = Hinglish)")
     p = sub.add_parser("voice-record", help="record one take from the microphone (stops when you stop talking)")
     p.add_argument("--out", required=True)
     p.add_argument("--max", type=float, default=30.0)

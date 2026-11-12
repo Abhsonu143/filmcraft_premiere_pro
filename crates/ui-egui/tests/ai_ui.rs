@@ -149,7 +149,7 @@ fn ai_menu_and_dialogs() {
                 "run",
             ],
         ),
-        ("voice", &["name", "lang.hi", "lang.en", "source.record", "source.files", "run"]),
+        ("voice", &["name", "lang.hi", "lang.mix", "lang.en", "source.record", "source.files", "run"]),
         (
             "clips",
             &[
@@ -296,4 +296,42 @@ fn ai_jobs_run_the_engine_and_import_results() {
     let square = session.project.items.values().filter_map(|it| session.project.sequence(it.id)).any(|s| s.settings.width == 1080 && s.settings.height == 1080);
     assert!(square, "the 1080x1080 edit was imported as a sequence");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Voice Clone recorder: the sentences follow the chosen languages (Hindi, Hinglish, English),
+/// each language is a section with its own progress, and changing the languages reloads them.
+#[test]
+fn voice_recorder_follows_the_languages() {
+    if !have_tools() {
+        return;
+    }
+    let mut d = Driver::demo();
+    d.run("ai.voice", json!({}));
+    let wait_for = |d: &mut Driver, id: &str, present: bool| {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(60) {
+            d.frames(2);
+            if d.ids(id).iter().any(|x| x == id) == present {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("{id} {}", if present { "never appeared" } else { "never went away" });
+    };
+    for set in ["hi", "mix", "en"] {
+        wait_for(&mut d, &format!("ai.voice.section.{set}"), true);
+    }
+    d.snapshot("voice-recorder");
+    // English only: the Hindi and Hinglish sections go, English stays
+    d.ok("ui.click", json!({"id": "ai.voice.lang.hi"}));
+    d.frames(3);
+    d.ok("ui.click", json!({"id": "ai.voice.lang.mix"}));
+    d.frames(3);
+    wait_for(&mut d, "ai.voice.section.hi", false);
+    wait_for(&mut d, "ai.voice.section.mix", false);
+    wait_for(&mut d, "ai.voice.section.en", true);
+    let prompt = d.ok("ui.elements", json!({"prefix": "ai.voice.prompt"}));
+    let text = prompt.as_array().and_then(|a| a.first()).and_then(|e| e["label"].as_str()).unwrap_or_default().to_string();
+    assert!(text.is_ascii() && !text.is_empty(), "an English sentence: {text}");
+    d.snapshot("voice-recorder-en");
 }

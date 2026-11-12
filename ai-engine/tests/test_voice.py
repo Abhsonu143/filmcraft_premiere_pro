@@ -19,9 +19,11 @@ def W(word, s, e):
 
 
 def test_prompts_cover_both_languages_and_deliveries():
-    ps = vp.prompts(["en", "hi"])
+    ps = vp.prompts(["hi", "mix", "en"])
     langs = {p["lang"] for p in ps}
-    assert langs == {"en", "hi"}
+    assert langs == {"en", "hi"} and {p["set"] for p in ps} == {"hi", "mix", "en"}
+    assert [p["set"] for p in vp.prompts(["en"])] == ["en"] * 25  # 24 sentences + free talk
+    assert vp.prompts(["en", "mix"])[0]["set"] == "en" and vp.prompts(["mix"])[0]["lang"] == "hi"
     emos = {p["emotion"] for p in ps if not p.get("free")}
     assert {"calm", "excited", "curious", "serious", "warm", "suspense", "hook", "cta"} <= emos
     hindi = " ".join(p["text"] for p in ps if p["lang"] == "hi")

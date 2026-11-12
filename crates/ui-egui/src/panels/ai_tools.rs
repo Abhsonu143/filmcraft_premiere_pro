@@ -188,6 +188,7 @@ struct Draft {
     voice_name: String,
     lang_en: bool,
     lang_hi: bool,
+    lang_mix: bool,
     source: &'static str,
     rec: Recorder,
 }
@@ -200,6 +201,8 @@ struct Recorder {
     mics: Vec<String>,
     mic: String,
     mics_job: Option<u64>,
+    /// the language sets the sentences were loaded for (a change reloads them)
+    loaded: Vec<String>,
     cursor: usize,
     recording: Option<u64>,
     takes: Vec<Option<Take>>,
@@ -212,6 +215,8 @@ struct Prompt {
     text: String,
     emotion: String,
     direction: String,
+    /// the section it belongs to: "hi", "mix" (Hinglish) or "en"
+    set: String,
     /// free talking (no fixed text): the engine transcribes it
     free: bool,
 }
@@ -284,6 +289,7 @@ impl Draft {
             voice_name: String::new(),
             lang_en: true,
             lang_hi: true,
+            lang_mix: true,
             source: "record",
             rec: Recorder { mic: "0".into(), ..Recorder::default() },
         }
@@ -370,6 +376,7 @@ impl Draft {
             let has = |c: &str| l.iter().any(|v| v.as_str() == Some(c));
             d.lang_en = has("en");
             d.lang_hi = has("hi");
+            d.lang_mix = has("mix");
         }
         if let Some(a) = p.get("styleSources").and_then(Value::as_array) {
             d.style_sources = a.iter().filter_map(Value::as_str).map(str::to_string).collect();
@@ -577,7 +584,7 @@ impl Draft {
                 if name.is_empty() {
                     return Err("Give the voice a name.".into());
                 }
-                if !self.lang_en && !self.lang_hi {
+                if !self.lang_en && !self.lang_hi && !self.lang_mix {
                     return Err("Choose at least one language.".into());
                 }
                 a = vec!["voice-enroll".into()];
@@ -586,8 +593,8 @@ impl Draft {
                 if self.lang_en {
                     a.push("en".into());
                 }
-                if self.lang_hi {
-                    a.push("hi".into());
+                if self.lang_hi || self.lang_mix {
+                    a.push("hi".into()); // Hinglish is spoken by the Hindi voice
                 }
                 if self.source == "files" {
                     if self.clips.is_empty() {
@@ -1608,8 +1615,10 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         ui.end_row();
                         ui.label("Languages");
                         ui.horizontal(|ui| {
-                            let r = ui.checkbox(&mut d.lang_hi, "Hindi (and Hinglish)");
+                            let r = ui.checkbox(&mut d.lang_hi, "Hindi");
                             elems.push((format!("{p}.lang.hi"), r.rect, d.lang_hi.to_string()));
+                            let r = ui.checkbox(&mut d.lang_mix, "Hinglish");
+                            elems.push((format!("{p}.lang.mix"), r.rect, d.lang_mix.to_string()));
                             let r = ui.checkbox(&mut d.lang_en, "English");
                             elems.push((format!("{p}.lang.en"), r.rect, d.lang_en.to_string()));
                         });
@@ -1798,18 +1807,21 @@ fn learn_style_job(d: &Draft) -> Result<u64, String> {
 
 /// Sentence-by-sentence recording for a voice clone.
 fn recorder_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
-    let mut langs = Vec::new();
-    if d.lang_hi {
-        langs.push("hi".to_string());
-    }
-    if d.lang_en {
-        langs.push("en".to_string());
+    let langs = selected_sets(d);
+    if !d.rec.prompts.is_empty() && d.rec.loaded != langs && d.rec.recording.is_none() {
+        // languages changed: load the matching sentences (takes on disk are found again)
+        d.rec.prompts.clear();
+        d.rec.takes.clear();
+        d.rec.cursor = 0;
     }
     if d.rec.prompts.is_empty() && d.rec.loading.is_none() && !langs.is_empty() {
         let mut args = vec!["voice-prompts".to_string(), "--languages".into()];
         args.extend(langs.iter().cloned());
         match engine_step(args) {
-            Ok((step, engine)) => d.rec.loading = Some(start_job("Voice clone: sentences".into(), None, vec![step], false, Some(engine))),
+            Ok((step, engine)) => {
+                d.rec.loaded = langs.clone();
+                d.rec.loading = Some(start_job("Voice clone: sentences".into(), None, vec![step], false, Some(engine)));
+            }
             Err(e) => d.error = e,
         }
     }
@@ -1843,10 +1855,32 @@ fn recorder_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
             elems.push((format!("{p}.mic"), r.response.rect, shown));
         }
     });
+    ui.horizontal(|ui| {
+        for (set, label) in [("hi", "हिन्दी"), ("mix", "Hinglish"), ("en", "English")] {
+            let idx: Vec<usize> = d.rec.prompts.iter().enumerate().filter(|(_, q)| q.set == set).map(|(i, _)| i).collect();
+            let Some(&first) = idx.first() else { continue };
+            let got = idx.iter().filter(|&&i| d.rec.takes.get(i).is_some_and(Option::is_some)).count();
+            let here = d.rec.prompts.get(d.rec.cursor).is_some_and(|q| q.set == set);
+            let text = format!("{label} {got}/{}", idx.len());
+            let b = ui.add_enabled(d.rec.recording.is_none(), egui::Button::new(text.clone()).selected(here));
+            elems.push((format!("{p}.section.{set}"), b.rect, text));
+            if b.clicked() {
+                // jump to the first sentence of the section not yet recorded
+                d.rec.cursor = idx.iter().copied().find(|&i| d.rec.takes.get(i).is_none_or(Option::is_none)).unwrap_or(first);
+            }
+        }
+    });
     let Some(pr) = d.rec.prompts.get(d.rec.cursor).cloned() else { return };
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(if pr.lang == "hi" { "हिन्दी" } else { "English" }).strong());
+        ui.label(
+            egui::RichText::new(match pr.set.as_str() {
+                "mix" => "Hinglish",
+                "hi" => "हिन्दी",
+                _ => "English",
+            })
+            .strong(),
+        );
         ui.label(egui::RichText::new(format!("· {}", pr.emotion)).weak());
     });
     if pr.direction != "free" {
@@ -1931,6 +1965,11 @@ fn recorder_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
     }
 }
 
+/// The sentence sets to read, in reading order (Hindi, Hinglish, English).
+fn selected_sets(d: &Draft) -> Vec<String> {
+    [("hi", d.lang_hi), ("mix", d.lang_mix), ("en", d.lang_en)].iter().filter(|(_, on)| *on).map(|(k, _)| k.to_string()).collect()
+}
+
 /// Pick up finished recorder jobs (sentences loaded, microphones listed, a take recorded).
 fn poll_recorder(d: &mut Draft) {
     if let Some(j) = d.rec.loading
@@ -1952,6 +1991,7 @@ fn poll_recorder(d: &mut Draft) {
                                 text: s("text"),
                                 emotion: s("emotion"),
                                 direction: s("direction"),
+                                set: s("set"),
                                 free: v.get("free").and_then(Value::as_bool).unwrap_or(false),
                             }
                         })
@@ -2452,6 +2492,15 @@ mod tests {
         assert_eq!(a.first().map(String::as_str), Some("voice-enroll"));
         assert!(a.windows(2).any(|w| w == ["--name", "My Voice"]) && a.windows(2).any(|w| w == ["--languages", "hi"]) && a.contains(&"--files".to_string()));
         assert!(!a.contains(&"en".to_string()));
+        // Hinglish alone is spoken by the Hindi voice; the reading order is Hindi, Hinglish, English
+        let mix = Draft::from_params(Kind::Voice, &json!({"name": "v", "source": "files", "languages": ["mix"], "clips": [wav.to_string_lossy()]}));
+        assert!(mix.clone().engine_args().unwrap().windows(2).any(|w| w == ["--languages", "hi"]));
+        assert_eq!(selected_sets(&mix), vec!["mix".to_string()]);
+        let all = Draft::from_params(Kind::Voice, &json!({"languages": ["en", "mix", "hi"]}));
+        assert_eq!(selected_sets(&all), vec!["hi".to_string(), "mix".into(), "en".into()]);
+        assert!(
+            Draft::from_params(Kind::Voice, &json!({"name": "v", "source": "files", "languages": [], "clips": [wav.to_string_lossy()]})).engine_args().is_err()
+        );
         // recording mode needs takes first
         assert!(Draft::from_params(Kind::Voice, &json!({"name": "v", "source": "record"})).engine_args().is_err());
         assert_eq!(slug("  My Voice / Hindi "), "My-Voice-Hindi");

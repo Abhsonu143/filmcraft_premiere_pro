@@ -91,12 +91,15 @@ FREE_TALK = {
 
 
 def prompts(languages: list[str]) -> list[dict]:
-    """The reading list for the chosen languages (Hindi includes the Hinglish lines)."""
+    """The reading list for the chosen sets, in the order given: "en", "hi", "mix" (Hinglish).
+    `lang` is the language the clone uses ("mix" is Hindi); `set` is the section shown in the app."""
     out = []
-    for lang in languages:
-        for set_key in (["hi", "mix"] if lang == "hi" else [lang]):
-            for pid, text, emotion, direction in SETS.get(set_key, []):
-                out.append({"id": pid, "lang": "hi" if set_key == "mix" else set_key, "text": text, "emotion": emotion, "direction": direction})
-        if lang in FREE_TALK:
-            out.append({"id": f"{lang}-free", "lang": lang, "text": FREE_TALK[lang], "emotion": "natural", "direction": "free", "free": True})
+    for key in languages:
+        if key not in SETS:
+            continue
+        lang = "hi" if key == "mix" else key
+        for pid, text, emotion, direction in SETS[key]:
+            out.append({"id": pid, "lang": lang, "set": key, "text": text, "emotion": emotion, "direction": direction})
+        if key in FREE_TALK:
+            out.append({"id": f"{key}-free", "lang": lang, "set": key, "text": FREE_TALK[key], "emotion": "natural", "direction": "free", "free": True})
     return out
