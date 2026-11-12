@@ -227,6 +227,8 @@ struct Prompt {
 struct Take {
     file: String,
     issues: String,
+    /// length of the take in seconds (0 when found on disk from an earlier session)
+    seconds: f64,
 }
 
 impl Draft {
@@ -1118,6 +1120,14 @@ fn run_steps(id: u64, steps: &[Vec<String>], cwd: Option<&Path>) -> Result<(), S
     Ok(())
 }
 
+/// Stop every running AI job (EI is quitting: no engine process, recording or model keeps running).
+pub fn cancel_all() {
+    let ids: Vec<u64> = jobs().lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|j| j.status == Status::Running).map(|j| j.id).collect();
+    for id in ids {
+        cancel_job(id);
+    }
+}
+
 fn cancel_job(id: u64) -> bool {
     with_job(id, |j| {
         j.cancel = true;
@@ -1974,10 +1984,13 @@ fn recorder_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
     }
     match &take {
         Some(t) if !t.issues.is_empty() => {
-            ui.colored_label(egui::Color32::from_rgb(0xE0, 0xB0, 0x40), format!("Recorded, but: {}", t.issues));
+            let len = if t.seconds > 0.0 { format!(" ({:.1} s)", t.seconds) } else { String::new() };
+            ui.colored_label(egui::Color32::from_rgb(0xE0, 0xB0, 0x40), format!("✔ Saved{len}, but: {}. Play it, then Record Again or Next.", t.issues));
         }
-        Some(_) => {
-            ui.colored_label(egui::Color32::from_rgb(0x5C, 0xC0, 0x7A), "✔ Recorded");
+        Some(t) => {
+            let len = if t.seconds > 0.0 { format!(" ({:.1} s)", t.seconds) } else { String::new() };
+            let l = ui.colored_label(egui::Color32::from_rgb(0x5C, 0xC0, 0x7A), format!("✔ Saved{len}. Play it to check, then Next ›"));
+            elems.push((format!("{p}.saved"), l.rect, "saved".into()));
         }
         None => {
             ui.label(egui::RichText::new("A quiet room, 15–20 cm from the microphone, and say it the way you talk in your videos.").weak());
@@ -2027,7 +2040,7 @@ fn poll_recorder(d: &mut Draft) {
                     if f.is_file()
                         && let Some(t) = d.rec.takes.get_mut(k)
                     {
-                        *t = Some(Take { file: f.to_string_lossy().to_string(), issues: String::new() });
+                        *t = Some(Take { file: f.to_string_lossy().to_string(), issues: String::new(), seconds: 0.0 });
                     }
                 }
             }
@@ -2055,11 +2068,9 @@ fn poll_recorder(d: &mut Draft) {
                 let issues =
                     res.get("issues").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default();
                 if let Some(t) = d.rec.takes.get_mut(d.rec.cursor) {
-                    *t = Some(Take { file, issues: issues.clone() });
+                    *t = Some(Take { file, issues, seconds: res.get("seconds").and_then(Value::as_f64).unwrap_or(0.0) });
                 }
-                if issues.is_empty() && d.rec.cursor + 1 < d.rec.prompts.len() {
-                    d.rec.cursor += 1; // a good take: straight to the next sentence
-                }
+                // stay on the sentence: you see it was saved and can play it; Next moves on
             }
             Status::Cancelled => {}
             _ => d.rec.message = if err.is_empty() { "The recording failed (AI ▸ AI Jobs has the details).".into() } else { err },

@@ -102,8 +102,13 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 printf 'APPL????' >"$APP/Contents/PkgInfo"
 
 echo "==> ad-hoc signing"
-codesign --force --sign - "$APP/Contents/MacOS/EI"
-codesign --force --sign - "$APP"
+# The designated requirement names the bundle id instead of this build's hash, so macOS keeps
+# privacy permissions (microphone for AI ▸ Voice Clone) across rebuilds instead of asking again
+# and sending silence until the question is answered.
+BUNDLE_ID="io.github.abhsonu143.ei"
+REQ="designated => identifier \"$BUNDLE_ID\""
+codesign --force --sign - -r="$REQ" "$APP/Contents/MacOS/EI"
+codesign --force --sign - -r="$REQ" "$APP"
 codesign --verify --strict --verbose=1 "$APP"
 
 if [ "$DMG" = 1 ]; then

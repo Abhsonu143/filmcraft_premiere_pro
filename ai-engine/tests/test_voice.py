@@ -162,3 +162,24 @@ def test_speech_start_detection():
     # talking from the very first moment is still speech (the room level is the quiet end)
     assert vo.detect_speech([-30.0] * 10 + [-60.0] * 30) == 0
     assert vo.detect_speech([-80.0] * 10 + [-70.0] * 5) is None  # very quiet, below the floor
+
+
+def test_end_of_speech_in_a_noisy_room():
+    room = [-62.0 + (i % 3) for i in range(30)]  # fan noise wobbling around -61 dB
+    speech = [-45.0 + (i % 5) for i in range(60)]
+    dbs, quiet = room + speech, 0.0
+    after = [-60.0, -58.5, -61.0, -59.0] * 10  # noise blips after speaking
+    stopped = None
+    for k, d in enumerate(after):
+        dbs.append(d)
+        quiet = vo.quiet_after(dbs, quiet, 0.05)
+        if quiet >= 1.4:
+            stopped = k
+            break
+    assert stopped is not None and stopped < 40
+    # still talking: never quiet
+    dbs, quiet = room + speech, 0.0
+    for d in speech:
+        dbs.append(d)
+        quiet = vo.quiet_after(dbs, quiet, 0.05)
+    assert quiet < 0.3

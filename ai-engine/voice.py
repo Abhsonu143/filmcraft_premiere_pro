@@ -229,6 +229,8 @@ def list_mics() -> list[str]:
     return mics
 
 
+MIC_WAIT = ("No sound from the microphone yet. If macOS asked whether EI may use the microphone, click Allow, then press "
+            "Record again. Otherwise open System Settings ▸ Privacy & Security ▸ Microphone and turn on EI.")
 MIC_DENIED = ("EI is not allowed to use the microphone (macOS gives it silence). Open System Settings ▸ Privacy & Security ▸ "
               "Microphone, turn on EI, then quit and reopen EI.")
 
@@ -244,6 +246,21 @@ def detect_speech(dbs: list[float], start_margin: float = 12.0, floor_db: float 
         if d > max(floor_db, room + start_margin):
             return i
     return None
+
+
+def quiet_after(dbs: list[float], quiet: float, dt: float) -> float:
+    """Seconds of quiet so far after speech. Quiet = the last 0.25 s (smoothed) is near the room
+    level, well below the speech level; a short noise blip does not restart the count (hysteresis),
+    so a fan or street noise does not keep the recording going."""
+    room = float(np.percentile(dbs, 20))
+    loud = float(np.percentile(dbs, 90))
+    thr = max(room + 6, min(loud - 15, room + 12), -60.0)
+    level = float(np.mean(dbs[-5:]))
+    if level < thr:
+        return quiet + dt
+    if level > thr + 4:
+        return 0.0
+    return quiet
 
 
 def record(out: str, max_s: float = 30.0, stop_after: float = 1.4, mic: str = "0", wait_s: float = 12.0, stop_file: str | None = None) -> dict:
@@ -262,11 +279,36 @@ def record(out: str, max_s: float = 30.0, stop_after: float = 1.4, mic: str = "0
     started, quiet, t, peak = False, 0.0, 0.0, 0.0
     next_report = 0.5
     log("recording: speak now")
+    import os
+    import select
+
+    parent = os.getppid()
+    fd = proc.stdout.fileno() if proc.stdout else -1
+    pending = b""
+    waited = 0.0
     try:
         while t < max_s:
-            raw = proc.stdout.read(chunk * 2) if proc.stdout else b""
-            if not raw:
+            # never block on the microphone: macOS sends nothing while its permission question is open
+            ready, _, _ = select.select([fd], [], [], 0.25) if fd >= 0 else ([], [], [])
+            if os.getppid() != parent:
+                raise AutocutError("EI closed: recording stopped")
+            if stop and stop.exists() and not buf:
                 break
+            if not ready:
+                waited += 0.25
+                if waited >= 5.0 and not buf:
+                    raise AutocutError(MIC_WAIT)
+                if waited >= 5.0:
+                    break  # the microphone went away mid-take: keep what was recorded
+                continue
+            waited = 0.0
+            data = os.read(fd, chunk * 2)
+            if not data:
+                break
+            pending += data
+            if len(pending) < chunk * 2:
+                continue
+            raw, pending = pending[: chunk * 2], pending[chunk * 2 :]
             x = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768
             buf.append(x)
             t += len(x) / rate
@@ -283,8 +325,7 @@ def record(out: str, max_s: float = 30.0, stop_after: float = 1.4, mic: str = "0
                 elif t > wait_s:
                     break
             else:
-                room = float(np.percentile(dbs, 20))
-                quiet = quiet + len(x) / rate if db < max(-58.0, room + 6) else 0.0
+                quiet = quiet_after(dbs, quiet, len(x) / rate)
                 if quiet >= stop_after:
                     break
             if t >= next_report:  # a live level for the app

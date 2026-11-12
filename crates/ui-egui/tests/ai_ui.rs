@@ -369,7 +369,7 @@ fn voice_recorder_records_a_take() {
         let e = d.ok("ui.elements", json!({"prefix": "ai.voice.play"}));
         let enabled = e.as_array().and_then(|a| a.first()).is_some_and(|x| x["enabled"].as_bool().unwrap_or(true));
         saw_live |= d.harness.query_by_label_contains("hearing you").is_some();
-        if t0.elapsed() > Duration::from_secs(5) && enabled && d.harness.query_by_label_contains("Recorded").is_some() {
+        if t0.elapsed() > Duration::from_secs(5) && enabled && d.harness.query_by_label_contains("Saved").is_some() {
             break;
         }
         assert!(t0.elapsed() < Duration::from_secs(45), "the take was never accepted");
@@ -378,6 +378,9 @@ fn voice_recorder_records_a_take() {
     let mut player = player;
     let _ = player.wait();
     assert!(saw_live, "live status shown while recording");
+    // the recorder stays on the sentence just recorded: its take can be played right away
+    let sections = d.ok("ui.elements", json!({"prefix": "ai.voice.section.en"}));
+    assert!(sections.to_string().contains("English 1/"), "{sections}");
     d.snapshot("voice-recorded");
     let dir = settings.parent().unwrap().join("voices/My-voice/takes");
     assert!(std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).any(|f| f.path().extension().is_some_and(|x| x == "wav")));
