@@ -1,5 +1,21 @@
 # Progress
 
+## 2026-11-12 (night): Kapwing-style clip maker, audio extraction, model choice
+
+- `highlights.py` (AI ▸ Make Short Clips from Long Video): transcript, then topic sections (lexical cohesion and
+  pauses), then sentence scores (hooks, delivery energy, filler and channel-talk penalties), then a language
+  model rating plus titles, then clips assembled from many pieces near the target length (10–60 s, mostly
+  45–50 s), never sharing material. Gameplay/action mode: per-second loudness, attacks, motion, scene changes
+  and dialogue, then hotspots, then 4–7 pieces each, cut at scene changes or quiet moments and never inside a
+  line. Framing: face-following crop for talk, an enlarged picture over a blurred background for gameplay.
+  Word-by-word captions and a title (ASS).
+- Real test: a 92-min 1080p60 gameplay recording, 10 clips of 46–53 s (4–7 pieces each), spread across the
+  whole video. First run: transcript 141 s plus a one-time action analysis (~20 min decode); after that,
+  2 min 8 s for all 10 clips.
+- `extract_audio.py` (AI ▸ Extract Audio from Video): 8 formats, original-quality copy, range, mono, loudness.
+- `llm.py`: model choice, with Qwen3-4B-Instruct-2507 as the default and a saved default in settings.json.
+- Known: titles of similar fights can sound alike; the first analysis of a very long video is slow.
+
 ## 2026-11-12 (evening): the director (edits that feel hand-made)
 
 Feedback on the first version: reference edits copied the *content* of the reference (green field ->

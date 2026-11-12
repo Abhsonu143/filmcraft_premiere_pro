@@ -9,3 +9,7 @@ torch>=2.2
 open_clip_torch>=2.24
 # Interchange with FilmCraft / Resolve (Apache-2.0); used to validate .otio files.
 opentimelineio>=0.17
+# Local language model for clip titles and ratings (MIT); models: Qwen (Apache-2.0, except Qwen2.5-3B).
+mlx-lm>=0.30
+# Apple Vision face detection for reframing (MIT; macOS only).
+pyobjc-framework-Vision>=10; sys_platform == "darwin"

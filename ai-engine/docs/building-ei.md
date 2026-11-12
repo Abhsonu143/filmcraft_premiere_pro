@@ -51,6 +51,8 @@ the engine (useful when you're editing the engine). Without them, the app uses t
 | Split Long Video into Clips… | a video, clip length (default 60 s), quality (default *same as original*: no re-encode, cuts on the nearest keyframe; or *exact lengths*: re-encoded at the original bitrate; or High/Medium/Small), output folder | `<name>_part001.mp4`, `…002`, … in the folder; optionally imported into the project |
 | Auto Edit Clips to Music… | clips (files or a whole folder), music (**any audio or video file**), length, shape (16:9 / 9:16 / 1:1), pace, music start, look, effects, story order | a director-made edit: cuts on accents, shot lengths following the music, slow motion, punch-ins, a flash on the drop, one grade; plus an `.otio` |
 | Edit Like a Reference Video… | a reference video, your clips, optional other soundtrack (audio or video), shape, look (incl. *match reference*), effects | your footage edited in the reference's style (cut timing, transitions, flashes, punches, motion), plus an `.otio` |
+| Make Short Clips from Long Video… | a long video, number of clips, lengths (shortest / mostly / longest, default 10 / 48 / 60 s), shape, content (auto / talk / gameplay), framing, captions, language model | N clips like Kapwing's clip maker: each edited from several pieces (talk: best sentences of a topic with fillers and pauses removed and an optional hook first; gameplay: the most intense moments of one scene cut at natural points), reframed, titled, with captions; plus `<name>.clips.json` |
+| Extract Audio from Video… | videos or folders, format (MP3, M4A, WAV, AIFF, FLAC, Apple Lossless, Opus, Ogg), quality (or original: no re-encode), range, mono, loudness | audio files next to the videos (or in a folder you choose) |
 | Talking Head Auto-Cut… | a video, format, captions, music | jump-cut `.mp4` (+ `.srt`) and an `.otio` |
 | Voiceover Edit… | voiceover, clips, script, music | narration-matched `.mp4` and an `.otio` |
 
@@ -61,6 +63,11 @@ you cancel, nothing else is affected, and your original files are never changed.
 Everything is also scriptable through EI's control channel and MCP (`ai.split`, `ai.music`,
 `ai.reference`, `ai.talk`, `ai.voiceover` with parameters, `ai.jobs`, `ai.cancel`; see the comment
 at the top of `crates/ui-egui/src/panels/ai_tools.rs`).
+
+Language models: AI ▸ AI Engine Setup ▸ Language model sets the default (saved in
+`~/Library/Application Support/EI/settings.json`); each clip job can pick another. Default **Qwen3 4B**
+(2.3 GB, Apache-2.0, the best that fits 8 GB). Also Qwen2.5 7B (4.3 GB, for 16 GB Macs), Qwen2.5 3B
+(research licence, non-commercial), Qwen2.5 1.5B (fastest), or none (rules only).
 
 ## 5. Tests
 

@@ -12,6 +12,9 @@ Subcommands (all paths absolute or relative to the current folder):
     reference REF --clips C... --out O.mp4 [--aspect same]
     talk      VIDEO --out O.mp4 [--preset long] [--captions] [--music M]
     voiceover VOICE --clips C... --out O.mp4 [--script S] [--music M] [--captions] [--preset travel]
+    clips     VIDEO --out-dir D [--count 5] [--min 10] [--max 60] [--target 48] [--aspect vertical] [--llm KEY]
+    audio     FILE... [--format mp3|m4a|wav|aiff|flac|alac|opus|ogg] [--quality original|best|high|medium|small]
+    llm       [--set-default KEY]   the local language models and the saved default
 
 The engine runs as its own process: if it fails or is cancelled, the editor is unaffected.
 """
@@ -91,6 +94,13 @@ def run(argv: list[str]) -> dict:
 
     director.add_music_args(sub.add_parser("music"), workers=False)  # same options as director.py
     director.add_reference_args(sub.add_parser("reference"), workers=False)
+    import extract_audio
+    import highlights
+
+    highlights.add_args(sub.add_parser("clips", help="long video -> N short clips, each edited from several pieces"))
+    extract_audio.add_args(sub.add_parser("audio", help="save the sound of videos as audio files"))
+    pl = sub.add_parser("llm", help="list language models / set the default")
+    pl.add_argument("--set-default")
     p = sub.add_parser("talk")
     p.add_argument("input")
     p.add_argument("--out", required=True)
@@ -111,6 +121,17 @@ def run(argv: list[str]) -> dict:
 
     if a.cmd == "doctor":
         return doctor()
+    if a.cmd == "clips":
+        return highlights.run_args(a)
+    if a.cmd == "audio":
+        return extract_audio.run_args(a)
+    if a.cmd == "llm":
+        import llm
+
+        if a.set_default:
+            llm.save_default(a.set_default)
+        cur = llm.load_settings().get("llm_model", llm.DEFAULT)
+        return {"default": cur, "models": {k: {"repo": v[0], "size": v[1], "license": v[2], "note": v[3]} for k, v in llm.MODELS.items()}}
     if a.cmd == "split":
         import split_video
 

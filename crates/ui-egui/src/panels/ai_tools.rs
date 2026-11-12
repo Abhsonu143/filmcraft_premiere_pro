@@ -22,6 +22,10 @@
 //!   effects?, order?, import?}`
 //! - `ai.talk {input, out?, preset?=long|short|travel, captions?, music?, import?}`
 //! - `ai.voiceover {input, clips: [..], out?, script?, music?, captions?, preset?, import?}`
+//! - `ai.clips {input, outDir?, count?=5, min?=10, target?=48, max?=60, aspect?=vertical|square|horizontal|same,
+//!   content?=auto|talk|gameplay, framing?=auto|crop|fit, captionMode?=auto|on|off, llm?=default|<model>|none, title?, hook?, import?}`
+//! - `ai.audio {clips: [files or folders], outDir?, format?=mp3|m4a|wav|aiff|flac|alac|opus|ogg,
+//!   audioQuality?=original|best|high|medium|small, start?, end?, mono?, normalize?, import?}`
 //! - each returns `{job}`; `ai.jobs` returns every job (and shows the window); `ai.cancel {job}`;
 //!   `ai.setup` shows the set-up window (`{install: true}` installs the Python packages).
 //!
@@ -60,6 +64,8 @@ pub enum Kind {
     Reference,
     Talk,
     Voiceover,
+    Clips,
+    Audio,
 }
 
 impl Kind {
@@ -70,6 +76,8 @@ impl Kind {
             Kind::Reference => "reference",
             Kind::Talk => "talk",
             Kind::Voiceover => "voiceover",
+            Kind::Clips => "clips",
+            Kind::Audio => "audio",
         }
     }
     fn from_command(id: &str) -> Option<Kind> {
@@ -79,6 +87,8 @@ impl Kind {
             "ai.reference" => Kind::Reference,
             "ai.talk" => Kind::Talk,
             "ai.voiceover" => Kind::Voiceover,
+            "ai.clips" => Kind::Clips,
+            "ai.audio" => Kind::Audio,
             _ => return None,
         })
     }
@@ -89,20 +99,23 @@ impl Kind {
             Kind::Reference => "Edit Like a Reference Video",
             Kind::Talk => "Talking Head Auto-Cut",
             Kind::Voiceover => "Voiceover Edit",
+            Kind::Clips => "Make Short Clips from Long Video",
+            Kind::Audio => "Extract Audio from Video",
         }
     }
     fn input_label(self) -> &'static str {
         match self {
             Kind::Reference => "Reference video",
             Kind::Voiceover => "Voiceover audio",
+            Kind::Clips => "Long video",
             _ => "Video",
         }
     }
     fn needs_input(self) -> bool {
-        self != Kind::Music
+        !matches!(self, Kind::Music | Kind::Audio)
     }
     fn needs_clips(self) -> bool {
-        matches!(self, Kind::Music | Kind::Reference | Kind::Voiceover)
+        matches!(self, Kind::Music | Kind::Reference | Kind::Voiceover | Kind::Audio)
     }
 }
 
@@ -124,6 +137,22 @@ struct Draft {
     effects: &'static str,
     order: &'static str,
     music_start: String,
+    count: f64,
+    min_len: f64,
+    target_len: f64,
+    max_len: f64,
+    content: &'static str,
+    framing: &'static str,
+    caption_mode: &'static str,
+    hook: bool,
+    title_on: bool,
+    llm: &'static str,
+    format: &'static str,
+    audio_quality: &'static str,
+    start: String,
+    end: String,
+    mono: bool,
+    normalize: bool,
     captions: bool,
     import: bool,
     error: String,
@@ -148,8 +177,24 @@ impl Draft {
             effects: "full",
             order: "time",
             music_start: String::new(),
+            count: 5.0,
+            min_len: 10.0,
+            target_len: 48.0,
+            max_len: 60.0,
+            content: "auto",
+            framing: "auto",
+            caption_mode: "auto",
+            hook: true,
+            title_on: true,
+            llm: "default",
+            format: "mp3",
+            audio_quality: "high",
+            start: String::new(),
+            end: String::new(),
+            mono: false,
+            normalize: false,
             captions: false,
-            import: kind != Kind::Split,
+            import: !matches!(kind, Kind::Split | Kind::Audio),
             error: String::new(),
         }
     }
@@ -173,6 +218,28 @@ impl Draft {
             p.get(k).and_then(Value::as_str).and_then(|v| options.iter().copied().find(|o| *o == v)).unwrap_or(default)
         };
         d.quality = pick("quality", &QUALITIES.map(|q| q.0), d.quality);
+        let num = |k: &str, cur: f64| p.get(k).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(cur);
+        d.count = num("count", d.count);
+        d.min_len = num("min", d.min_len);
+        d.target_len = num("target", d.target_len);
+        d.max_len = num("max", d.max_len);
+        d.content = pick("content", &CONTENTS.map(|a| a.0), d.content);
+        d.framing = pick("framing", &FRAMINGS.map(|a| a.0), d.framing);
+        d.caption_mode = pick("captionMode", &CAPTION_MODES.map(|a| a.0), d.caption_mode);
+        d.hook = p.get("hook").and_then(Value::as_bool).unwrap_or(d.hook);
+        d.title_on = p.get("title").and_then(Value::as_bool).unwrap_or(d.title_on);
+        d.llm = pick("llm", &LLMS.map(|a| a.0), d.llm);
+        d.format = pick("format", &AUDIO_FORMATS.map(|a| a.0), d.format);
+        d.audio_quality = pick("audioQuality", &AUDIO_QUALITIES.map(|a| a.0), d.audio_quality);
+        let txt = |k: &str| match p.get(k) {
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(v)) => v.clone(),
+            _ => String::new(),
+        };
+        d.start = txt("start");
+        d.end = txt("end");
+        d.mono = p.get("mono").and_then(Value::as_bool).unwrap_or(false);
+        d.normalize = p.get("normalize").and_then(Value::as_bool).unwrap_or(false);
         d.aspect = pick("aspect", &ASPECTS.map(|a| a.0), d.aspect);
         d.pace = pick("pace", &PACES.map(|a| a.0), d.pace);
         d.preset = pick("preset", &PRESETS.map(|a| a.0), d.preset);
@@ -265,6 +332,52 @@ impl Draft {
                 }
                 self.style_args(&mut a);
             }
+            Kind::Clips => {
+                let (n, lo, t, hi) = (self.count, self.min_len, self.target_len, self.max_len);
+                if !(1.0..=50.0).contains(&n) || n.fract() != 0.0 {
+                    return Err("Number of clips must be a whole number from 1 to 50.".into());
+                }
+                if !(3.0 <= lo && lo <= t && t <= hi && hi <= 600.0) {
+                    return Err("Lengths must satisfy 3 ≤ shortest ≤ typical ≤ longest ≤ 600 seconds.".into());
+                }
+                a.push(self.input.trim().into());
+                push(&mut a, "--out-dir", self.out.trim());
+                push(&mut a, "--count", &format!("{n}"));
+                push(&mut a, "--min", &format!("{lo}"));
+                push(&mut a, "--target", &format!("{t}"));
+                push(&mut a, "--max", &format!("{hi}"));
+                push(&mut a, "--aspect", self.aspect);
+                push(&mut a, "--content", self.content);
+                push(&mut a, "--framing", self.framing);
+                push(&mut a, "--captions", self.caption_mode);
+                push(&mut a, "--llm", self.llm);
+                if !self.hook {
+                    a.push("--no-hook".into());
+                }
+                if !self.title_on {
+                    a.push("--no-title".into());
+                }
+            }
+            Kind::Audio => {
+                a.extend(self.clips.iter().cloned());
+                push(&mut a, "--out-dir", self.out.trim());
+                push(&mut a, "--format", self.format);
+                push(&mut a, "--quality", self.audio_quality);
+                for (flag, v) in [("--start", self.start.trim()), ("--end", self.end.trim())] {
+                    if !v.is_empty() {
+                        match v.parse::<f64>() {
+                            Ok(x) if x.is_finite() && x >= 0.0 => push(&mut a, flag, &format!("{x}")),
+                            _ => return Err("Start and end must be numbers of seconds (or empty).".into()),
+                        }
+                    }
+                }
+                if self.mono {
+                    a.push("--mono".into());
+                }
+                if self.normalize {
+                    a.push("--normalize".into());
+                }
+            }
             Kind::Talk => {
                 a.push(self.input.trim().into());
                 push(&mut a, "--out", self.out.trim());
@@ -318,6 +431,42 @@ const EFFECTS: [(&str, &str); 3] =
     [("full", "Full: speed ramps, punch-ins, flashes, transitions"), ("subtle", "Subtle: slow motion, push-ins, dissolves"), ("none", "Clean cuts only")];
 const ORDERS: [(&str, &str); 2] = [("time", "Follow the trip (shooting order)"), ("free", "Best shots first")];
 
+const CLIP_ASPECTS: [(&str, &str); 4] =
+    [("vertical", "Vertical 9:16"), ("square", "Square 1:1"), ("horizontal", "Horizontal 16:9"), ("same", "Same as the video")];
+const CONTENTS: [(&str, &str); 3] = [
+    ("auto", "Automatic (talk or gameplay, from how much is spoken)"),
+    ("talk", "Talk: podcast, vlog, interview (built from sentences)"),
+    ("gameplay", "Gameplay / action (built from the most intense moments)"),
+];
+const FRAMINGS: [(&str, &str); 3] =
+    [("auto", "Automatic (follow faces, else fit over blur)"), ("crop", "Crop to fill (follow the face)"), ("fit", "Whole frame over a blurred background")];
+const CAPTION_MODES: [(&str, &str); 3] = [("auto", "Automatic (on for talk)"), ("on", "On"), ("off", "Off")];
+const LLMS: [(&str, &str); 6] = [
+    ("default", "Default (set in AI Engine Setup)"),
+    ("qwen3-4b", "Qwen3 4B: best for 8 GB (2.3 GB)"),
+    ("qwen2.5-7b", "Qwen2.5 7B: largest (4.3 GB, 16 GB Macs)"),
+    ("qwen2.5-3b", "Qwen2.5 3B (1.8 GB, research licence)"),
+    ("qwen2.5-1.5b", "Qwen2.5 1.5B: fastest (0.9 GB)"),
+    ("none", "None: rules only"),
+];
+const AUDIO_FORMATS: [(&str, &str); 8] = [
+    ("mp3", "MP3"),
+    ("m4a", "M4A (AAC)"),
+    ("wav", "WAV (uncompressed)"),
+    ("aiff", "AIFF (uncompressed)"),
+    ("flac", "FLAC (lossless)"),
+    ("alac", "Apple Lossless (.m4a)"),
+    ("opus", "Opus"),
+    ("ogg", "Ogg Vorbis"),
+];
+const AUDIO_QUALITIES: [(&str, &str); 5] = [
+    ("original", "Original (no re-encode when the format allows)"),
+    ("best", "Best (320 kb/s)"),
+    ("high", "High (256 kb/s)"),
+    ("medium", "Medium (192 kb/s)"),
+    ("small", "Small (128 kb/s)"),
+];
+
 const PRESETS: [(&str, &str); 3] = [("long", "YouTube 16:9"), ("short", "Short / Reel 9:16"), ("travel", "Travel 16:9")];
 
 const VIDEO_EXT: [&str; 9] = ["mp4", "mov", "m4v", "mkv", "avi", "mts", "m2ts", "webm", "mxf"];
@@ -354,6 +503,8 @@ fn default_output(d: &Draft) -> String {
         Kind::Reference => free_path(&parent_dir(&d.input), &format!("{} - EI edit", file_stem(&d.input)), ".mp4"),
         Kind::Talk => free_path(&parent_dir(&d.input), &format!("{} - EI cut", file_stem(&d.input)), ".mp4"),
         Kind::Voiceover => free_path(&parent_dir(&d.input), &format!("{} - EI edit", file_stem(&d.input)), ".mp4"),
+        Kind::Clips => free_path(&parent_dir(&d.input), &format!("{} - EI clips", file_stem(&d.input)), ""),
+        Kind::Audio => d.clips.first().map(|c| parent_dir(c).to_string_lossy().to_string()).unwrap_or_else(|| movies_dir().to_string_lossy().to_string()),
     }
 }
 
@@ -403,6 +554,42 @@ pub fn support_dir() -> PathBuf {
 
 fn venv_python(venv: &Path) -> PathBuf {
     if cfg!(windows) { venv.join("Scripts").join("python.exe") } else { venv.join("bin").join("python") }
+}
+
+/// EI's settings file (shared with the engine: `ai-engine/llm.py`).
+fn settings_path() -> PathBuf {
+    std::env::var_os("EI_SETTINGS").map(PathBuf::from).unwrap_or_else(|| support_dir().join("settings.json"))
+}
+
+/// The saved default language model (`llm_model`), or Qwen3 4B.
+pub fn default_llm() -> &'static str {
+    default_llm_at(&settings_path())
+}
+
+fn default_llm_at(path: &Path) -> &'static str {
+    let saved = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    let key = saved.as_ref().and_then(|v| v.get("llm_model")).and_then(Value::as_str).unwrap_or("qwen3-4b");
+    LLMS.iter().skip(1).map(|m| m.0).find(|k| *k == key).unwrap_or("qwen3-4b")
+}
+
+/// Save the default language model, keeping the other settings.
+pub fn save_default_llm(key: &str) -> Result<(), String> {
+    save_default_llm_at(&settings_path(), key)
+}
+
+fn save_default_llm_at(path: &Path, key: &str) -> Result<(), String> {
+    if !LLMS.iter().skip(1).any(|m| m.0 == key) {
+        return Err(format!("unknown language model `{key}`"));
+    }
+    let mut v = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("llm_model".into(), json!(key));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("could not save settings: {e}"))?;
+    }
+    let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("could not save settings: {e}"))
 }
 
 /// The Python that runs the engine.
@@ -643,7 +830,8 @@ fn run_draft(d: &mut Draft) -> Result<u64, String> {
     step.extend(args);
     let title = match d.kind {
         Kind::Music => format!("{}: {}", d.kind.title(), file_stem(&d.music)),
-        Kind::Split | Kind::Reference | Kind::Talk | Kind::Voiceover => format!("{}: {}", d.kind.title(), file_stem(&d.input)),
+        Kind::Audio => format!("{}: {} file(s)", d.kind.title(), d.clips.len()),
+        Kind::Split | Kind::Reference | Kind::Talk | Kind::Voiceover | Kind::Clips => format!("{}: {}", d.kind.title(), file_stem(&d.input)),
     };
     Ok(start_job(title, Some(d.kind), vec![step], d.import, Some(engine)))
 }
@@ -692,7 +880,9 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
         },
         "ai.setup" => {
             ctx.data_mut(|m| m.insert_temp(setup_open_id(), true));
-            if params.get("install").and_then(Value::as_bool).unwrap_or(false) {
+            if let Some(k) = params.get("llm").and_then(Value::as_str) {
+                save_default_llm(k).map(|()| json!({"llm": default_llm()}))
+            } else if params.get("install").and_then(Value::as_bool).unwrap_or(false) {
                 install_steps().map(|steps| json!({"job": start_job("Install AI engine".into(), None, steps, false, None)}))
             } else {
                 let engine = engine_dir();
@@ -700,6 +890,7 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
                     "engine": engine.as_ref().map(|e| e.to_string_lossy().to_string()),
                     "python": python(engine.as_deref()).to_string_lossy().to_string(),
                     "venv": support_dir().join("venv").to_string_lossy().to_string(),
+                    "llm": default_llm(),
                 }))
             }
         }
@@ -825,7 +1016,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     ui.end_row();
                 }
                 if d.kind.needs_clips() {
-                    ui.label("Clips");
+                    ui.label(if d.kind == Kind::Audio { "Videos" } else { "Clips" });
                     ui.vertical(|ui| {
                         let summary = match d.clips.len() {
                             0 => "No clips yet".to_string(),
@@ -905,6 +1096,72 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         ui.end_row();
                         style_rows(ui, &mut d, &p, true, &mut elems);
                     }
+                    Kind::Clips => {
+                        ui.label("Number of clips");
+                        let r = ui.add(egui::DragValue::new(&mut d.count).range(1.0..=50.0).speed(0.1).max_decimals(0));
+                        elems.push((format!("{p}.count"), r.rect, d.count.to_string()));
+                        ui.end_row();
+                        ui.label("Clip length (s)");
+                        ui.horizontal(|ui| {
+                            for (key, label, v) in
+                                [("min", "shortest", &mut d.min_len), ("target", "mostly", &mut d.target_len), ("max", "longest", &mut d.max_len)]
+                            {
+                                ui.label(label);
+                                let r = ui.add(egui::DragValue::new(v).range(3.0..=600.0).speed(1.0).max_decimals(0));
+                                elems.push((format!("{p}.{key}"), r.rect, v.to_string()));
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Shape");
+                        radio_row(ui, &mut d.aspect, &CLIP_ASPECTS, &format!("{p}.aspect"), &mut elems);
+                        ui.end_row();
+                        ui.label("Content");
+                        combo_row(ui, &mut d.content, &CONTENTS, &format!("{p}.content"), &mut elems);
+                        ui.end_row();
+                        ui.label("Framing");
+                        combo_row(ui, &mut d.framing, &FRAMINGS, &format!("{p}.framing"), &mut elems);
+                        ui.end_row();
+                        ui.label("Captions");
+                        combo_row(ui, &mut d.caption_mode, &CAPTION_MODES, &format!("{p}.captions"), &mut elems);
+                        ui.end_row();
+                        ui.label("Language model");
+                        combo_row(ui, &mut d.llm, &LLMS, &format!("{p}.llm"), &mut elems);
+                        ui.end_row();
+                        ui.label("");
+                        ui.vertical(|ui| {
+                            let r = ui.checkbox(&mut d.title_on, "Title at the top (written by the language model)");
+                            elems.push((format!("{p}.title"), r.rect, d.title_on.to_string()));
+                            let r = ui.checkbox(&mut d.hook, "Open talk clips with their strongest line");
+                            elems.push((format!("{p}.hook"), r.rect, d.hook.to_string()));
+                        });
+                        ui.end_row();
+                    }
+                    Kind::Audio => {
+                        ui.label("Format");
+                        combo_row(ui, &mut d.format, &AUDIO_FORMATS, &format!("{p}.format"), &mut elems);
+                        ui.end_row();
+                        ui.label("Quality");
+                        combo_row(ui, &mut d.audio_quality, &AUDIO_QUALITIES, &format!("{p}.quality"), &mut elems);
+                        ui.end_row();
+                        ui.label("Range (s)");
+                        ui.horizontal(|ui| {
+                            ui.label("from");
+                            let r = ui.add(egui::TextEdit::singleline(&mut d.start).hint_text("start").desired_width(70.0));
+                            elems.push((format!("{p}.start"), r.rect, d.start.clone()));
+                            ui.label("to");
+                            let r = ui.add(egui::TextEdit::singleline(&mut d.end).hint_text("end").desired_width(70.0));
+                            elems.push((format!("{p}.end"), r.rect, d.end.clone()));
+                        });
+                        ui.end_row();
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            let r = ui.checkbox(&mut d.mono, "Mono");
+                            elems.push((format!("{p}.mono"), r.rect, d.mono.to_string()));
+                            let r = ui.checkbox(&mut d.normalize, "Normalise loudness (-14 LUFS)");
+                            elems.push((format!("{p}.normalize"), r.rect, d.normalize.to_string()));
+                        });
+                        ui.end_row();
+                    }
                     Kind::Talk | Kind::Voiceover => {
                         ui.label("Format");
                         radio_row(ui, &mut d.preset, &PRESETS, &format!("{p}.preset"), &mut elems);
@@ -915,13 +1172,18 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         ui.end_row();
                     }
                 }
-                ui.label(if d.kind == Kind::Split { "Output folder" } else { "Save as" });
+                let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio);
+                ui.label(if folder_out { "Output folder" } else { "Save as" });
                 if path_row(ui, &mut d.out, &format!("{p}.out"), "automatic (next to the source)", &mut elems) {
                     pick = Some(Pick::Out);
                 }
                 ui.end_row();
                 ui.label("");
-                let label = if d.kind == Kind::Split { "Import the clips into the project" } else { "Open the edit in the timeline when done" };
+                let label = match d.kind {
+                    Kind::Split | Kind::Clips => "Import the clips into the project",
+                    Kind::Audio => "Import the audio into the project",
+                    _ => "Open the edit in the timeline when done",
+                };
                 let r = ui.checkbox(&mut d.import, label);
                 elems.push((format!("{p}.import"), r.rect, d.import.to_string()));
                 ui.end_row();
@@ -985,7 +1247,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 }
             }
             Pick::Out => {
-                if d.kind == Kind::Split {
+                if matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio) {
                     if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
                         d.out = dir;
                     }
@@ -1026,6 +1288,10 @@ fn description(kind: Kind) -> &'static str {
         }
         Kind::Talk => "Removes the pauses from a talking video (jump cuts), with optional captions and music that ducks under your voice.",
         Kind::Voiceover => "Matches your footage to what the voiceover says, shot by shot, so the edit follows the narration.",
+        Kind::Clips => {
+            "Finds the best moments of a long video and edits each clip from several pieces (no filler, no dead air), reframed, with a title and captions. Talk is built from sentences and topics; gameplay from the most intense moments."
+        }
+        Kind::Audio => "Saves the sound of videos as audio files in the format you choose. The videos are not changed.",
     }
 }
 
@@ -1199,7 +1465,7 @@ fn import_finished(app: &mut FilmcraftApp) {
         };
         let one = |k: &str| result.get(k).and_then(Value::as_str).map(str::to_string);
         let paths: Vec<String> = match kind {
-            Kind::Split => strs("outputs"),
+            Kind::Split | Kind::Clips | Kind::Audio => strs("outputs"),
             _ => match one("otio") {
                 Some(o) => std::iter::once(o).chain(one("srt")).collect(),
                 None => strs("outputs"),
@@ -1239,6 +1505,7 @@ fn show_setup(app: &mut FilmcraftApp, ctx: &egui::Context) {
         (last.filter(|j| j.status == Status::Done).map(|j| j.result.clone()), last.is_some_and(|j| j.status == Status::Running), last.is_some())
     };
     let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
+    let mut llm_error: Option<String> = None;
     let mut do_install = false;
     let mut do_check = false;
     let mut close = false;
@@ -1251,6 +1518,16 @@ fn show_setup(app: &mut FilmcraftApp, ctx: &egui::Context) {
             ui.end_row();
             ui.label("Python");
             ui.monospace(py.to_string_lossy());
+            ui.end_row();
+            ui.label("Language model");
+            let mut cur = default_llm();
+            let before = cur;
+            combo_row(ui, &mut cur, &LLMS[1..], "ai.setup.llm", &mut elems);
+            if cur != before
+                && let Err(e) = save_default_llm(cur)
+            {
+                llm_error = Some(e);
+            }
             ui.end_row();
             ui.label("Environment");
             ui.monospace(format!("{}{}", venv.to_string_lossy(), if venv.exists() { "" } else { " (not created yet)" }));
@@ -1296,6 +1573,9 @@ fn show_setup(app: &mut FilmcraftApp, ctx: &egui::Context) {
     });
     for (id, r, l) in elems {
         app.auto.add(&id, r, &l);
+    }
+    if let Some(e) = llm_error {
+        app.ui.status = e;
     }
     if do_install {
         match install_steps() {
@@ -1362,6 +1642,47 @@ mod tests {
         let a = other.engine_args().unwrap();
         assert!(a.windows(2).any(|w| w[0] == "--audio") && a.windows(2).any(|w| w == ["--look", "match"]));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clips_and_audio_arguments() {
+        let dir = std::env::temp_dir().join(format!("ei-ai-test2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("long.mov");
+        std::fs::write(&video, b"x").unwrap();
+        let mut c = Draft::from_params(Kind::Clips, &json!({"input": video.to_string_lossy(), "count": 10, "llm": "qwen2.5-7b", "framing": "fit"}));
+        let a = c.engine_args().unwrap();
+        assert_eq!(a.first().map(String::as_str), Some("clips"));
+        for pair in [["--count", "10"], ["--min", "10"], ["--target", "48"], ["--max", "60"], ["--llm", "qwen2.5-7b"], ["--framing", "fit"]] {
+            assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
+        }
+        assert!(c.out.ends_with("long - EI clips"), "{}", c.out);
+        for bad in [json!({"count": 0}), json!({"count": 2.5}), json!({"min": 50, "target": 40}), json!({"max": 9000})] {
+            let mut p = bad.clone();
+            p["input"] = json!(video.to_string_lossy());
+            assert!(Draft::from_params(Kind::Clips, &p).engine_args().is_err(), "{bad}");
+        }
+        let mut au =
+            Draft::from_params(Kind::Audio, &json!({"clips": [video.to_string_lossy()], "format": "flac", "start": 5, "end": "20.5", "normalize": true}));
+        let a = au.engine_args().unwrap();
+        assert!(a.windows(2).any(|w| w == ["--format", "flac"]) && a.windows(2).any(|w| w == ["--end", "20.5"]) && a.contains(&"--normalize".to_string()));
+        assert!(Draft::from_params(Kind::Audio, &json!({})).engine_args().is_err());
+        assert!(Draft::from_params(Kind::Audio, &json!({"clips": [video.to_string_lossy()], "start": "soon"})).engine_args().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_model_is_saved_and_validated() {
+        let f = std::env::temp_dir().join(format!("ei-settings-{}.json", std::process::id()));
+        assert_eq!(default_llm_at(&f), "qwen3-4b");
+        std::fs::write(&f, r#"{"other": 1}"#).unwrap();
+        save_default_llm_at(&f, "qwen2.5-1.5b").unwrap();
+        assert_eq!(default_llm_at(&f), "qwen2.5-1.5b");
+        assert!(std::fs::read_to_string(&f).unwrap().contains("other"), "other settings kept");
+        assert!(save_default_llm_at(&f, "gpt-9").is_err());
+        std::fs::write(&f, "not json").unwrap();
+        assert_eq!(default_llm_at(&f), "qwen3-4b");
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]
