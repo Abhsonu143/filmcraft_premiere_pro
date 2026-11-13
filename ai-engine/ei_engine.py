@@ -135,6 +135,7 @@ def run(argv: list[str]) -> dict:
     p.add_argument("--preset", default="long", choices=sorted(ac.PRESETS))
     p.add_argument("--captions", action="store_true")
     p.add_argument("--music")
+    p.add_argument("--resolution", default="1080p", choices=list(ac.RESOLUTIONS))
     p = sub.add_parser("voiceover")
     narrate.add_args(p)
     p.add_argument("--preset", choices=sorted(ac.PRESETS), help="older option: short = vertical")
@@ -183,7 +184,7 @@ def run(argv: list[str]) -> dict:
         return director.run(a)
     if a.cmd == "talk":
         plan_path = out.with_name(out.stem + ".plan.json")
-        args = ["auto", a.input, "--preset", a.preset, "-o", str(plan_path), "--out", str(out), "--codec", "h264"]
+        args = ["auto", a.input, "--preset", a.preset, "-o", str(plan_path), "--out", str(out), "--codec", "h264", "--resolution", a.resolution]
         if a.captions:
             args.append("--captions")
         if a.music:

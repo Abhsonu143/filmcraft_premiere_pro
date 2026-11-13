@@ -627,7 +627,7 @@ def render_edit(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, ass
                 t_ += s_["frames"] / fps
                 cuts.append(round(t_, 3))
             sp = score.render(str(audio_wav), clip["score_lines"], total / fps, scored, duck_db=6.0, cuts=cuts,
-                              plan_path=dst.with_suffix(".score.json"), **{**sound, "music_db": sound.get("music_db", -2.0) - 3.0})
+                              plan_path=dst.with_suffix(".score.json"), **{**sound, "music_db": sound.get("music_db", score.MUSIC_DB) - 3.0})
             credits = score.credits(sp)
             if credits:
                 dst.with_suffix(".credits.txt").write_text("\n".join(credits) + "\n", encoding="utf-8")
@@ -637,7 +637,7 @@ def render_edit(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, ass
             ass = Path(tmp) / "caps.ass"
             ass.write_text(ass_text, encoding="utf-8")
             e = str(ass).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-            cmd += ["-vf", f"subtitles=filename='{e}'", "-c:v", "h264_videotoolbox", "-b:v", "14M", "-profile:v", "high"]
+            cmd += ["-vf", f"subtitles=filename='{e}'", "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(W, H), "-profile:v", "high"]
         else:
             cmd += ["-c:v", "copy"]
         tmp_out = dst.with_name(dst.stem + ".part.mp4")
@@ -680,14 +680,17 @@ def action_clips(src: str, duration: float, words: list[dict], count: int, targe
 # ---------------------------------------------------------------------------------------------
 
 
-def output_size(aspect: str, dw: int, dh: int) -> tuple[int, int]:
-    """Output frame size: a social shape, or the video's own shape ("same", at most 1920 wide/high)."""
+def output_size(aspect: str, dw: int, dh: int, resolution: str = "1080p") -> tuple[int, int]:
+    """Output frame size: a social shape, or the video's own shape ("same", at most 1920 wide/high;
+    3840 in 4K), at 1080p or 4K."""
     if aspect == "same":
-        sc = min(1.0, 1920 / max(dw, dh, 1))
+        sc = min(1.0, ac.long_side(resolution) / max(dw, dh, 1))
+        if resolution == "4k":
+            sc = ac.long_side(resolution) / max(dw, dh, 1)  # 4K asked for: fill it, even from a smaller source
         return max(2, int(dw * sc) // 2 * 2), max(2, int(dh * sc) // 2 * 2)
     if aspect not in ASPECTS:
         raise AutocutError(f"unknown shape {aspect!r} ({', '.join([*ASPECTS, 'same'])})")
-    return ASPECTS[aspect]
+    return ac.sized(*ASPECTS[aspect], resolution)
 
 
 def name_clips(src: str, clips: list[dict], mode: str, model: str | None) -> None:
@@ -741,7 +744,7 @@ def make_clips(src: str, out_dir: str, count: int = 5, mn: float = 10, mx: float
                captions: str = "auto", title: str = "off", hook: bool = True, model: str | None = None, language: str | None = None,
                content: str = "auto", framing: str = "auto", whisper_model: str = ac.DEFAULT_WHISPER, plan_only: bool = False,
                caption_style: str = "pop", music: str | None = None, music_volume: float = 0.35, pace: str = "medium", workers: int = 2,
-               sound: dict | None = None) -> dict:
+               sound: dict | None = None, resolution: str = "1080p") -> dict:
     import captions as cap
     import clip_edit as ce
 
@@ -766,7 +769,7 @@ def make_clips(src: str, out_dir: str, count: int = 5, mn: float = 10, mx: float
     if info.duration < mn:
         raise AutocutError(f"the video ({info.duration:.0f}s) is shorter than the minimum clip length")
     dw, dh = info.display_size
-    W, H = output_size(aspect, dw, dh)
+    W, H = output_size(aspect, dw, dh, resolution)
     fps = 30.0
     t0 = time.time()
     words: list[dict] = []
@@ -860,6 +863,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max", type=float, default=60.0, help="longest clip (s)")
     p.add_argument("--target", type=float, default=48.0, help="typical clip length (s)")
     p.add_argument("--aspect", default="vertical", choices=["vertical", "square", "horizontal", "same"])
+    p.add_argument("--resolution", default="1080p", choices=list(ac.RESOLUTIONS), help="1080p, or 4k (3840 on the long side) in any shape")
     p.add_argument("--content", default="auto", choices=["auto", "talk", "gameplay"], help="talk: built from sentences; gameplay: from action moments")
     p.add_argument("--framing", default="auto", choices=[*FRAMINGS, "crop", "fit"],
                    help="smart: fill the shape following the action/faces; center: fill, centred crop; blur: whole picture over a blurred copy; bars: whole picture with black bars")
@@ -890,11 +894,11 @@ def run_args(a) -> dict:
         return sections.make_sections(a.input, a.out_dir, a.count, a.min, a.max, a.target, a.aspect, captions=a.captions,
                                       title="off" if a.no_title else a.title, model=a.llm, language=a.language, content=a.content,
                                       framing=a.framing, plan_only=a.plan_only, caption_style=a.caption_style, workers=getattr(a, "workers", 2),
-                                      sound=score.options(a))
+                                      sound=score.options(a), resolution=a.resolution)
     return make_clips(a.input, a.out_dir, a.count, a.min, a.max, a.target, a.aspect, captions=a.captions,
                       title="off" if a.no_title else a.title, hook=not a.no_hook, model=a.llm, language=a.language, content=a.content,
                       framing=a.framing, plan_only=a.plan_only, caption_style=a.caption_style, music=a.music, music_volume=a.music_volume,
-                      pace=a.pace, workers=getattr(a, "workers", 2), sound=score.options(a))
+                      pace=a.pace, workers=getattr(a, "workers", 2), sound=score.options(a), resolution=a.resolution)
 
 
 def main(argv: list[str] | None = None) -> int:

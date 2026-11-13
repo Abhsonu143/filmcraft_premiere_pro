@@ -674,7 +674,7 @@ def plan_music(args) -> dict:
     start = mu.choose_window(m, length, args.music_start)
     w = mu.window(m, start, length)
     fps = float(args.fps)
-    width, height = ASPECTS[args.aspect]
+    width, height = ac.sized(*ASPECTS[args.aspect], getattr(args, "resolution", "1080p"))
     clips = load_footage(vc.collect_clips(args.clips), use_clip=not args.no_clip)
     slots = cut_points(w, fps, PACE.get(args.pace, 1.0))
     med = float(np.median([c["dur"] for c in clips]))
@@ -703,10 +703,11 @@ def plan_reference(args) -> dict:
     fps = float(args.fps) if args.fps else (30.0 if rinfo.fps > 31 or not rinfo.fps else round(rinfo.fps, 3))
     if args.aspect == "same":
         dw, dh = rinfo.display_size
-        scale = min(1.0, 1920 / max(dw, dh, 1))
+        res = getattr(args, "resolution", "1080p")
+        scale = ac.long_side(res) / max(dw, dh, 1) if res == "4k" else min(1.0, 1920 / max(dw, dh, 1))
         width, height = max(2, int(dw * scale) // 2 * 2), max(2, int(dh * scale) // 2 * 2)
     else:
-        width, height = ASPECTS[args.aspect]
+        width, height = ac.sized(*ASPECTS[args.aspect], getattr(args, "resolution", "1080p"))
     style = reference_style(ref, fps)
     audio = str(Path(args.audio).resolve()) if args.audio else ref
     clips = load_footage(vc.collect_clips(args.clips), use_clip=not args.no_clip)
@@ -784,6 +785,7 @@ def add_common(p: argparse.ArgumentParser, workers: bool = True) -> None:
     if workers:
         p.add_argument("--workers", type=int, default=2)
     p.add_argument("--plan-only", action="store_true")
+    p.add_argument("--resolution", default="1080p", choices=list(ac.RESOLUTIONS), help="1080p, or 4k in any shape")
 
 
 def add_music_args(pm: argparse.ArgumentParser, workers: bool = True) -> None:

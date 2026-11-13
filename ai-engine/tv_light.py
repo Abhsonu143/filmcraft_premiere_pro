@@ -536,12 +536,14 @@ def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], 
                 yield f, t_rec + got / fps, a0 + got / fps * HZ
                 got += 1
 
+    k = max(1.0, max(W, H) / 1920)  # the clip is sharper on a 4K frame
+    cw, ch = int(1280 * k) // 2 * 2, int(720 * k) // 2 * 2
     clip_proc = subprocess.Popen(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", clip, "-an", "-vf",
-                                  f"fps={fps:g},scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+                                  f"fps={fps:g},scale={cw}:{ch}:force_original_aspect_ratio=decrease,pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2",
                                   "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], stdout=subprocess.PIPE)
     enc = subprocess.Popen(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
                             "-s", f"{W}x{H}", "-r", f"{fps:g}", "-i", "-", "-i", clip, "-map", "0:v", "-map", "1:a?", "-shortest",
-                            "-c:v", "h264_videotoolbox", "-b:v", "16M", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out],
+                            "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(W, H, 16.0), "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out],
                            stdin=subprocess.PIPE)
     rng = np.random.default_rng(1)
     grain = [rng.normal(0, 1.6, (H, W, 3)).astype(np.int16) for _ in range(6)]  # camera grain, reused
@@ -807,7 +809,7 @@ def preview(path: str, out_png: str, n: int = 6) -> dict:
 
 
 def make_batch(clips: list[str], folder: str, out_dir: str, orientation: str = "horizontal", relight: float = 1.0,
-               recording: str | None = None, bezel: float = 0.0) -> dict:
+               recording: str | None = None, bezel: float = 0.0, resolution: str = "1080p") -> dict:
     """Several clips one after another (the room analysis is shared, so later clips go faster).
     A clip that fails is reported and the rest carry on."""
     outd = Path(out_dir).expanduser().resolve()
@@ -821,7 +823,7 @@ def make_batch(clips: list[str], folder: str, out_dir: str, orientation: str = "
             n += 1
         log(f"clip {k}/{len(clips)}: {Path(c).name}")
         try:
-            make(c, folder, str(out), orientation, relight, recording=recording, bezel=bezel)
+            make(c, folder, str(out), orientation, relight, recording=recording, bezel=bezel, resolution=resolution)
             done.append(str(out))
         except AutocutError as e:
             log(f"{Path(c).name} failed: {e}")
@@ -833,7 +835,7 @@ def make_batch(clips: list[str], folder: str, out_dir: str, orientation: str = "
 
 
 def make(clip: str, folder: str, out: str, orientation: str = "horizontal", relight: float = 1.0, fps: float = 30.0,
-         recording: str | None = None, bezel: float = 0.0) -> dict:
+         recording: str | None = None, bezel: float = 0.0, resolution: str = "1080p") -> dict:
     """Clip on the TV of the best-matching recording of that orientation, backlight matched."""
     ac.require_tools()
     if orientation not in SIZES:
@@ -863,7 +865,7 @@ def make(clip: str, folder: str, out: str, orientation: str = "horizontal", reli
         if best is None or cost < best[0]:
             best = (cost, r, a, path, tgt)
     cost, r, a, path, tgt = best
-    W, H = SIZES[orientation]
+    W, H = ac.sized(*SIZES[orientation], resolution)
     outp = Path(out).resolve()
     outp.parent.mkdir(parents=True, exist_ok=True)
     part = outp.with_name(outp.stem + ".part.mp4")
@@ -898,6 +900,7 @@ def add_args(sub) -> None:
     p.add_argument("--out", help="output file (one clip)")
     p.add_argument("--out-dir", help="output folder (several clips: '<clip> - on TV <shape>.mp4')")
     p.add_argument("--orientation", default="horizontal", choices=list(SIZES))
+    p.add_argument("--resolution", default="1080p", choices=list(ac.RESOLUTIONS), help="1080p, or 4k")
     p.add_argument("--relight", type=float, default=1.0, help="0 = only choose matching moments, 1 = also recolour the glow fully")
     p.add_argument("--recording", help="use this recording only")
     p.add_argument("--bezel", type=float, default=0.0,
@@ -933,9 +936,9 @@ def run_args(a) -> dict:
         if not clips:
             raise AutocutError("none of the clips were found")
         if len(clips) == 1 and a.out and not a.out_dir:
-            return make(clips[0], a.recordings, a.out, a.orientation, a.relight, recording=a.recording, bezel=a.bezel)
+            return make(clips[0], a.recordings, a.out, a.orientation, a.relight, recording=a.recording, bezel=a.bezel, resolution=a.resolution)
         out_dir = a.out_dir or (str(Path(a.out).parent) if a.out else str(Path(clips[0]).parent / "EI on TV"))
-        res = make_batch(clips, a.recordings, out_dir, a.orientation, a.relight, recording=a.recording, bezel=a.bezel)
+        res = make_batch(clips, a.recordings, out_dir, a.orientation, a.relight, recording=a.recording, bezel=a.bezel, resolution=a.resolution)
         res["failed"] = missing + res.get("failed", [])
         return res
     raise AutocutError(f"unknown command {a.cmd}")

@@ -33,8 +33,11 @@ import sfx as fx
 from autocut import AutocutError, log
 
 SR = fx.SR
-SFX_DB = {"impact": -5.0, "riser": -11.0, "whoosh": -15.0, "sub": -9.0, "braam": -8.0, "shimmer": -15.0, "chime": -14.0, "heartbeat": -13.0,
-          "swell": -14.0}
+# effects sit under the voice too: felt more than heard (the hook's impact is lifted, see effects_track)
+SFX_DB = {"impact": -9.0, "riser": -15.0, "whoosh": -20.0, "sub": -12.0, "braam": -11.0, "shimmer": -20.0, "chime": -19.0, "heartbeat": -17.0,
+          "swell": -18.0}
+MUSIC_DB = -12.0  # the bed: about 13 dB under the voice even in pauses ("there, but not noticed")
+LIFT_DB = 7.0  # how much the music comes up where it is needed (before the first word, after reveals, the ending)
 HARD_IN = {"Surprise", "Amazement", "Triumph", "Rage", "Anger", "Fear", "Euphoria", "Thrill"}
 BRAAM_HOOK = {"mystery", "fear", "tension", "wonder"}
 
@@ -292,11 +295,59 @@ def music_bed(acts: list[dict], trans: list[dict], total: float, music_db: float
             env[:fi] = np.linspace(0, 1, fi) ** 1.5
         if fo:
             env[m - fo :] *= np.linspace(1, 0, fo) ** 1.5
-        gain = 10 ** ((music_db + 4.0 * (a.get("intensity", 0.6) - 0.6)) / 20)
+        gain = 10 ** ((music_db + 3.0 * (a.get("intensity", 0.6) - 0.6)) / 20)
         i0 = int(s * SR)
         seg = (y * env[:, None] * gain)[: n - i0]
         bed[i0 : i0 + len(seg)] += seg.astype(np.float32)
     return bed
+
+
+def lift_windows(plan_: dict) -> list[tuple[float, float]]:
+    """Where the music may come up: before the first word, after the last, a moment after a reveal
+    or a hard transition lands, and in long pauses. Everywhere else it stays under."""
+    lines = plan_.get("lines") or []
+    total = float(plan_["total"])
+    if not lines:
+        return [(0.0, total)]
+    w = [(0.0, float(lines[0]["start"])), (float(lines[-1]["end"]), total)]
+    for e in plan_.get("events", []):
+        if e["kind"] in ("impact", "braam") and ("lands" in str(e.get("why", "")) or str(e.get("why", "")).startswith("peak")):
+            w.append((float(e["t"]), float(e["t"]) + 1.5))
+    for a, b in zip(lines, lines[1:]):
+        if float(b["start"]) - float(a["end"]) >= 1.2:
+            w.append((float(a["end"]), float(b["start"])))
+    return w
+
+
+def window_env(windows: list[tuple[float, float]], n: int, ramp: float = 0.35) -> np.ndarray:
+    """0…1 over the windows, with smooth ramps."""
+    g = np.zeros(n)
+    r = int(ramp * SR)
+    for a, b in windows:
+        i0, i1 = max(0, int(a * SR) - r), min(n, int(b * SR) + r)
+        if i1 <= i0:
+            continue
+        t = np.arange(i0, i1)
+        up = np.clip((t - (int(a * SR) - r)) / max(1, r), 0, 1)
+        down = np.clip(((int(b * SR) + r) - t) / max(1, r), 0, 1)
+        g[i0:i1] = np.maximum(g[i0:i1], np.minimum(up, down))
+    return g
+
+
+def carve(bed: np.ndarray, pres: np.ndarray, duck_db: float, mid_extra_db: float = 6.0) -> np.ndarray:
+    """Duck the music under the voice, more where speech lives (250 Hz – 4 kHz) than in the lows
+    and highs, so the music keeps its body and air without masking a word."""
+    try:
+        from scipy.signal import butter, sosfilt
+
+        lo = sosfilt(butter(2, 250, "lowpass", fs=SR, output="sos"), bed, axis=0)
+        hi = sosfilt(butter(2, 4000, "highpass", fs=SR, output="sos"), bed, axis=0)
+        mid = bed - lo - hi
+    except ImportError:
+        lo, hi, mid = np.zeros_like(bed), np.zeros_like(bed), bed
+    g = (10 ** (-duck_db * pres / 20))[:, None]
+    gm = (10 ** (-(duck_db + mid_extra_db) * pres / 20))[:, None]
+    return (lo * g + hi * g + mid * gm).astype(np.float32)
 
 
 def dips(events: list[dict], n: int) -> np.ndarray:
@@ -324,7 +375,8 @@ def effects_track(events: list[dict], total: float, effects_db: float = 0.0) -> 
         if e["kind"] not in fx.KINDS:  # (dips shape the music, they make no sound)
             continue
         y = fx.make(e["kind"], e.get("seconds"), seed=k)
-        gain = 10 ** ((SFX_DB.get(e["kind"], -12) + effects_db) / 20)
+        lift = 3.0 if str(e.get("why", "")).startswith(("hook", "peak")) or "lands" in str(e.get("why", "")) else 0.0
+        gain = 10 ** ((SFX_DB.get(e["kind"], -12) + effects_db + lift) / 20)
         # a riser or swell ends on its moment; everything else starts on it
         i0 = int(e["t"] * SR) - (len(y) if e["kind"] in ("riser", "swell") else 0)
         if i0 < 0:
@@ -334,7 +386,7 @@ def effects_track(events: list[dict], total: float, effects_db: float = 0.0) -> 
     return out
 
 
-def mix(primary: str, plan: dict, dst: Path, *, duck_db: float = 10.0, primary_db: float = 0.0, loudness: float = -14.0,
+def mix(primary: str, plan: dict, dst: Path, *, duck_db: float = 6.0, primary_db: float = 0.0, loudness: float = -14.0,
         duck_source: str | None = None) -> None:
     """primary (voice, or a clip's own sound) + music bed (ducked) + effects -> dst (48 kHz wav).
     The music ducks under `duck_source` (the voice alone) when the primary also carries other sound."""
@@ -342,13 +394,15 @@ def mix(primary: str, plan: dict, dst: Path, *, duck_db: float = 10.0, primary_d
     n = int(total * SR)
     v = decode(primary)
     v = np.pad(v, ((0, max(0, n - len(v))), (0, 0)))[:n] * (10 ** (primary_db / 20))
+    key = v
     if duck_source:
         d = decode(duck_source)
-        pres = presence(np.pad(d, ((0, max(0, n - len(d))), (0, 0)))[:n])
-    else:
-        pres = presence(v)
-    bed = music_bed(plan["acts"], plan["transitions"], total, plan.get("music_db", -2.0)) if plan.get("music", True) else np.zeros((n, 2), np.float32)
-    bed *= (10 ** (-duck_db * pres / 20))[:, None]
+        key = np.pad(d, ((0, max(0, n - len(d))), (0, 0)))[:n]
+    pres = presence(key, attack=0.12, release=1.0)  # slow release: no pumping in the short breaths
+    bed = music_bed(plan["acts"], plan["transitions"], total, plan.get("music_db", MUSIC_DB)) if plan.get("music", True) else np.zeros((n, 2), np.float32)
+    bed = carve(bed, pres, duck_db)
+    lift = window_env(lift_windows(plan), n) * (1.0 - presence(key, attack=0.03, release=0.25))
+    bed *= (10 ** (LIFT_DB * lift / 20))[:, None]
     bed *= dips(plan["events"], n)[:, None]
     fxt = effects_track(plan["events"], total, plan.get("effects_db", 0.0)) if plan.get("effects", True) else np.zeros((n, 2), np.float32)
     fxt *= (10 ** (-3.0 * pres / 20))[:, None]
@@ -369,7 +423,7 @@ def mix(primary: str, plan: dict, dst: Path, *, duck_db: float = 10.0, primary_d
 
 
 def plan(lines: list[dict], total: float, *, cuts: list[float] | None = None, source: str = "internet", folder: str | None = None,
-         licence: str = "monetized", music: bool = True, effects: bool = True, music_db: float = -2.0, lib=None) -> dict:
+         licence: str = "monetized", music: bool = True, effects: bool = True, music_db: float = MUSIC_DB, lib=None) -> dict:
     ls = normalise_lines(lines)
     # a short video holds 2–4 cues, a long one changes music at most every ~25 s
     acts = make_acts(ls, total, min_len=float(np.clip(total / 5, 6.0, 25.0)))
@@ -396,7 +450,7 @@ def credits(plan_: dict) -> list[str]:
     return out
 
 
-def render(primary: str, lines: list[dict], total: float, dst: str | Path, *, duck_db: float = 10.0, duck_source: str | None = None,
+def render(primary: str, lines: list[dict], total: float, dst: str | Path, *, duck_db: float = 6.0, duck_source: str | None = None,
            plan_path: str | Path | None = None, **kw) -> dict:
     """Plan + mix; writes `dst` and the plan (`<dst>.score.json` unless `plan_path`); returns the plan."""
     dst = Path(dst)
@@ -409,7 +463,7 @@ def render(primary: str, lines: list[dict], total: float, dst: str | Path, *, du
     return p
 
 
-def remix(primary: str, plan_path: str, dst: str, duck_db: float = 11.0) -> None:
+def remix(primary: str, plan_path: str, dst: str, duck_db: float = 6.0) -> None:
     """Mix again from an edited `.score.json` (change emotions' tracks, levels, effects, times)."""
     mix(primary, json.loads(Path(plan_path).read_text(encoding="utf-8")), Path(dst), duck_db=duck_db)
 
@@ -430,7 +484,7 @@ def add_sound_args(p) -> None:
     g.add_argument("--licence", default="monetized", choices=["monetized", "personal"],
                    help="internet music: monetized = CC0/BY/BY-SA only; personal = also non-commercial licences")
     g.add_argument("--no-effects", action="store_true", help="music only, no sound effects")
-    g.add_argument("--music-level", type=float, default=-2.0, help="music level in dB (0 louder, -6 quieter)")
+    g.add_argument("--music-level", type=float, default=MUSIC_DB, help="music bed level in dB (-12: felt, not noticed; -6 louder; -18 quieter)")
 
 
 def options(a) -> dict | None:

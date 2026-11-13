@@ -202,7 +202,8 @@ def render_shot(plan: dict, shot: dict, pre: int, post: int, dst: Path, codec: s
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-hwaccel", "videotoolbox",
            "-ss", _f(seek), "-t", _f(s_len + 0.5), "-i", shot["clip"], "-an", "-vf", vf,
            "-frames:v", str(total), "-fps_mode", "cfr", "-r", ac.rate_arg(fps)]
-    cmd += ["-c:v", "h264_videotoolbox", "-b:v", SHOT_BITRATE] if codec == "h264" else ac.video_encoder_args(codec, SHOT_BITRATE)
+    rate = ac.bitrate_for(int(plan["width"]), int(plan["height"]), 24.0)  # SHOT_BITRATE at 1080p, more at 4K
+    cmd += ["-c:v", "h264_videotoolbox", "-b:v", rate] if codec == "h264" else ac.video_encoder_args(codec, rate)
     tmp = dst.with_suffix(".part.mp4")
     ac.run(cmd + [str(tmp)])
     tmp.replace(dst)
@@ -234,7 +235,7 @@ def assemble_chunk(plan: dict, files: list[Path], shots: list[dict], hand: list[
         cur_len = cur_len + shots[i]["frames"] + hand[i][0] + hand[i][1] - d
     total = sum(s["frames"] for s in shots) + hand[0][0] + hand[-1][1]
     cmd += ["-filter_complex", ";".join(parts), "-map", f"[{cur}]", "-frames:v", str(total),
-            "-fps_mode", "cfr", "-r", ac.rate_arg(fps), "-c:v", "h264_videotoolbox", "-b:v", "20M", str(dst)]
+            "-fps_mode", "cfr", "-r", ac.rate_arg(fps), "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(int(plan["width"]), int(plan["height"]), 20.0), str(dst)]
     ac.run(cmd)
 
 

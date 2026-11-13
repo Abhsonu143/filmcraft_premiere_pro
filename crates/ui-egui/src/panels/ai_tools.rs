@@ -139,6 +139,10 @@ impl Kind {
     fn needs_input(self) -> bool {
         !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Tv | Kind::Speak)
     }
+    /// Tools that render a video in a chosen shape (and so offer 1080p or 4K).
+    fn has_resolution(self) -> bool {
+        matches!(self, Kind::Music | Kind::Reference | Kind::Talk | Kind::Voiceover | Kind::Clips | Kind::Topic | Kind::Tv)
+    }
     /// Tools that can add the optional emotional sound design.
     fn has_sound_design(self) -> bool {
         matches!(self, Kind::Speak | Kind::Voiceover | Kind::Topic | Kind::Clips | Kind::Music)
@@ -223,6 +227,8 @@ struct Draft {
     tv_bezel: bool,
     // short clips: "edited" (best moments cut together) or "sections" (one continuous part each)
     clip_type: &'static str,
+    /// "1080p" or "4k" (in every shape)
+    resolution: &'static str,
     // optional emotional sound design (music per mood, hits, risers, pauses)
     sound: bool,
     music_source: &'static str,
@@ -382,12 +388,13 @@ impl Draft {
             relight: 1.0,
             tv_bezel: false,
             clip_type: "edited",
+            resolution: "1080p",
             sound: false,
             music_source: "internet",
             music_folder: setting_str("music_folder").unwrap_or_default(),
             licence: "monetized",
             sound_effects: true,
-            music_level: -2.0,
+            music_level: -12.0,
             emo: EmotionEditor::default(),
             tv: TvState::default(),
         }
@@ -495,6 +502,7 @@ impl Draft {
         d.tv_bezel = flag("bezel", d.tv_bezel);
         d.clip_type = pick("clipType", &CLIP_TYPES.map(|a| a.0), d.clip_type);
         d.sound = flag("soundDesign", d.sound);
+        d.resolution = pick("resolution", &RESOLUTIONS.map(|a| a.0), d.resolution);
         d.music_source = pick("musicSource", &MUSIC_SOURCES.map(|a| a.0), d.music_source);
         d.licence = pick("licence", &LICENCES.map(|a| a.0), d.licence);
         d.sound_effects = flag("soundEffects", d.sound_effects);
@@ -541,8 +549,8 @@ impl Draft {
             }
             a.push("--no-effects".into());
         }
-        if !(-20.0..=6.0).contains(&self.music_level) {
-            return Err("Music level must be between -20 and +6 dB.".into());
+        if !(-30.0..=0.0).contains(&self.music_level) {
+            return Err("Music level must be between -30 and 0 dB.".into());
         }
         a.extend(["--music-level".into(), format!("{}", self.music_level)]);
         Ok(())
@@ -870,6 +878,9 @@ impl Draft {
                 }
             }
         }
+        if self.kind.has_resolution() && self.resolution != "1080p" && !(self.kind == Kind::Topic && !self.make_video) {
+            a.extend(["--resolution".into(), self.resolution.into()]);
+        }
         if self.kind.has_sound_design() && self.sound && !(self.kind == Kind::Topic && !self.make_video) {
             self.sound_args(&mut a)?;
         }
@@ -898,6 +909,7 @@ const EFFECTS: [(&str, &str); 3] =
     [("full", "Full: speed ramps, punch-ins, flashes, transitions"), ("subtle", "Subtle: slow motion, push-ins, dissolves"), ("none", "Clean cuts only")];
 const ORDERS: [(&str, &str); 2] = [("time", "Follow the trip (shooting order)"), ("free", "Best shots first")];
 
+const RESOLUTIONS: [(&str, &str); 2] = [("1080p", "1080p (Full HD)"), ("4k", "4K (Ultra HD: 3840 on the long side; slower, bigger files)")];
 const MUSIC_SOURCES: [(&str, &str); 4] = [
     ("internet", "Free music from the internet, chosen by mood (credited in the description)"),
     ("folder", "My music folder (EI sorts it by mood)"),
@@ -1769,7 +1781,7 @@ fn sound_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String
         ui.end_row();
     }
     ui.label("Music level");
-    let r = ui.add(egui::Slider::new(&mut d.music_level, -12.0..=4.0).suffix(" dB").step_by(1.0));
+    let r = ui.add(egui::Slider::new(&mut d.music_level, -24.0..=0.0).suffix(" dB").step_by(1.0));
     elems.push((format!("{p}.musicLevel"), r.rect, d.music_level.to_string()));
     ui.end_row();
     ui.label("");
@@ -2410,6 +2422,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     }
                     if matches!(d.kind, Kind::Speak | Kind::Voiceover) {
                         emotion_rows(ui, &mut d, &p, &mut elems);
+                    }
+                    if d.kind.has_resolution() && !(d.kind == Kind::Topic && !d.make_video) {
+                        ui.label("Resolution");
+                        radio_row(ui, &mut d.resolution, &RESOLUTIONS, &format!("{p}.resolution"), &mut elems);
+                        ui.end_row();
                     }
                     if d.kind.has_sound_design() && !(d.kind == Kind::Topic && !d.make_video) && sound_rows(ui, &mut d, &p, &mut elems) {
                         pick = Some(Pick::MusicFolder);
@@ -3646,7 +3663,7 @@ mod tests {
         let mut d = Draft::from_params(Kind::Speak, &json!({"script": sp, "voice": "test1", "soundDesign": true, "licence": "personal"}));
         let a = d.engine_args().unwrap();
         assert_eq!(a.first().map(String::as_str), Some("speak"));
-        for pair in [["--voice", "test1"], ["--music-source", "internet"], ["--licence", "personal"], ["--music-level", "-2"], ["--takes", "2"]] {
+        for pair in [["--voice", "test1"], ["--music-source", "internet"], ["--licence", "personal"], ["--music-level", "-12"], ["--takes", "2"]] {
             assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
         }
         assert!(a.contains(&"--sound-design".to_string()) && d.out.ends_with(".wav"), "{a:?} {}", d.out);
@@ -3686,6 +3703,30 @@ mod tests {
         assert!(a.contains(&"--sound-design".to_string()) && !a.contains(&"--music".to_string()), "{a:?}");
         let mut off = Draft::from_params(Kind::Clips, &json!({"input": clip.to_string_lossy()}));
         assert!(!off.engine_args().unwrap().contains(&"--sound-design".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolution_4k_in_every_video_tool() {
+        let dir = std::env::temp_dir().join(format!("ei-ai-4k-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("long.mov");
+        std::fs::write(&v, b"x").unwrap();
+        let vs = v.to_string_lossy().to_string();
+        for (kind, extra) in [
+            (Kind::Clips, json!({"input": vs})),
+            (Kind::Talk, json!({"input": vs})),
+            (Kind::Voiceover, json!({"input": vs, "clips": [vs]})),
+            (Kind::Music, json!({"music": vs, "clips": [vs]})),
+            (Kind::Reference, json!({"input": vs, "clips": [vs]})),
+        ] {
+            let mut p = extra.clone();
+            p["resolution"] = json!("4k");
+            let a = Draft::from_params(kind, &p).engine_args().unwrap();
+            assert!(a.windows(2).any(|w| w == ["--resolution", "4k"]), "{kind:?}: {a:?}");
+            let a = Draft::from_params(kind, &extra).engine_args().unwrap();
+            assert!(!a.contains(&"--resolution".to_string()), "{kind:?} 1080p is the default: {a:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

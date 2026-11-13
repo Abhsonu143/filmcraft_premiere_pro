@@ -248,10 +248,12 @@ def image_to_clip(img: Path, dst: Path, W: int, H: int, seconds: float = 6.0, pu
     fps = 30
     n = int(seconds * fps)
     z = f"min(1+0.10*on/{n},1.10)" if push_in else f"max(1.10-0.10*on/{n},1.0)"
-    vf = (f"scale={W * 2}:{H * 2}:force_original_aspect_ratio=increase,crop={W * 2}:{H * 2},"
+    k = 2 if W * H <= 1920 * 1080 else 1.5  # push-in headroom (less at 4K: the frame is already big)
+    sw, sh = int(W * k) // 2 * 2, int(H * k) // 2 * 2
+    vf = (f"scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh},"
           f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={n}:s={W}x{H}:fps={fps},format=yuv420p")
     proc = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(img), "-vf", vf, "-frames:v", str(n),
-                           "-c:v", "h264_videotoolbox", "-b:v", "12M", str(dst)], capture_output=True)
+                           "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(W, H, 12.0), str(dst)], capture_output=True)
     return proc.returncode == 0 and dst.is_file()
 
 
@@ -453,7 +455,8 @@ def description_txt(data: dict, items: list[dict], script: dict) -> str:
 def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, language: str = "en", aspect: str = "horizontal", voice: str | None = None,
          script_only: bool = False, style: str | None = None, writer: str = "claude", model: str | None = None, tone: str = "", niche: str = "",
          sources: list[str] | None = None, footage: list[str] | None = None, music: str | None = None, captions: bool = True,
-         caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False, sound: dict | None = None) -> dict:
+         caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False, sound: dict | None = None,
+         resolution: str = "1080p") -> dict:
     import script_writer as sw
 
     ac.require_tools()
@@ -464,7 +467,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
     if not script_only and not voice:
         raise AutocutError("choose a voice for the video (a cloned voice or a macOS voice like mac:Rishi), or make the script only")
     sources = [s for s in (sources if sources is not None else ["free", "cards"]) if s in SOURCES]
-    W, H = ASPECTS[aspect]
+    W, H = ac.sized(*ASPECTS[aspect], resolution)
     t0 = time.time()
     name = sw.safe(re.sub(r"https?://(www\.)?", "", topic))[:50] or "topic"
     folder = Path(out_dir).expanduser().resolve() if out_dir else Path.home() / "Movies" / "EI" / "Topics" / name
@@ -511,7 +514,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         cards = {str(Path(i["file"]).resolve()) for i in items if i["kind"] == "card"}
         nr.make(sp["outputs"][0], clips, str(video_out), narration=sp["narration"], aspect=aspect, pace=pace, captions=captions,
                 caption_style=caption_style or ("pop" if aspect == "vertical" else "clean"), music=music, describe="none", hints=hints, stills=stills, cards=cards,
-                ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound)
+                ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound, resolution=resolution)
         outputs.insert(0, str(video_out))
     (folder / "sources.md").write_text(sources_md(data, items, script), encoding="utf-8")
     desc = description_txt(data, items, script)
@@ -531,6 +534,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--seconds", type=float, default=60)
     p.add_argument("--language", default="en", choices=["en", "hi", "hinglish"])
     p.add_argument("--aspect", default="horizontal", choices=list(ASPECTS))
+    p.add_argument("--resolution", default="1080p", choices=list(ac.RESOLUTIONS), help="1080p, or 4k in any shape")
     p.add_argument("--voice", help="cloned voice name, or mac / mac:<voice> (e.g. mac:Rishi, mac:Lekha)")
     p.add_argument("--script-only", action="store_true", help="research + script + sources only (no voice, no video)")
     p.add_argument("--style")
@@ -560,7 +564,7 @@ def run_args(a) -> dict:
     return make(a.topic, a.out_dir, seconds=a.seconds, language=a.language, aspect=a.aspect, voice=a.voice, script_only=a.script_only, style=a.style,
                 writer=a.writer, model=a.model, tone=a.tone, niche=a.niche, sources=a.sources, footage=footage, music=a.music,
                 captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, fresh=a.fresh,
-                sound=__import__("score").options(a))
+                sound=__import__("score").options(a), resolution=a.resolution)
 
 
 def main(argv: list[str] | None = None) -> int:

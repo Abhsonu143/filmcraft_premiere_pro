@@ -169,3 +169,15 @@ def test_clips_from_long_talk_end_to_end(tmp_path, capsys):
         assert (info.width, info.height) == (1080, 1920) and info.has_audio
         assert 10 <= info.duration <= 30.5 and c["shots"] >= 2
         assert out.endswith(".mp4") and (tmp_path / "clips" / (out.rsplit("/", 1)[1][:-4] + ".srt")).is_file()
+
+
+def test_4k_in_every_shape():
+    import autocut as ac
+
+    assert hl.output_size("vertical", 1920, 1080, "4k") == (2160, 3840)
+    assert hl.output_size("square", 1920, 1080, "4k") == (2160, 2160)
+    assert hl.output_size("horizontal", 1920, 1080, "4k") == (3840, 2160)
+    assert hl.output_size("same", 2560, 1440, "4k") == (3840, 2160)  # the video's own shape, 3840 wide
+    assert hl.output_size("same", 2560, 1440) == (1920, 1080)
+    assert hl.output_size("vertical", 1920, 1080) == (1080, 1920)
+    assert ac.bitrate_for(3840, 2160) == "40M" and ac.bitrate_for(1920, 1080) == "14M"

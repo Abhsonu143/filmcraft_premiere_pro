@@ -360,7 +360,7 @@ def find_sections(src: str, info, words: list[dict], count: int, mn: float, mx: 
 def make_sections(src: str, out_dir: str, count: int = 3, mn: float = 15, mx: float = 180, target: float = 60, aspect: str = "same",
                   captions: str = "off", title: str = "off", model: str | None = None, language: str | None = None,
                   content: str = "auto", framing: str = "auto", whisper_model: str = ac.DEFAULT_WHISPER, plan_only: bool = False,
-                  caption_style: str = "clean", workers: int = 2, sound: dict | None = None) -> dict:
+                  caption_style: str = "clean", workers: int = 2, sound: dict | None = None, resolution: str = "1080p") -> dict:
     import json
     import time
 
@@ -386,7 +386,7 @@ def make_sections(src: str, out_dir: str, count: int = 3, mn: float = 15, mx: fl
     if info.duration < mn:
         raise ac.AutocutError(f"the video ({info.duration:.0f}s) is shorter than the shortest section")
     dw, dh = info.display_size
-    W, H = hl.output_size(aspect, dw, dh)
+    W, H = hl.output_size(aspect, dw, dh, resolution)
     fps = 30.0
     t0 = time.time()
     words: list[dict] = ac.transcribe(src, model=whisper_model, language=language)["words"] if info.has_audio else []

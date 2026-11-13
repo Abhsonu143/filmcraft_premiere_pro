@@ -396,6 +396,29 @@ def rate_arg(fps: float) -> str:
     return str(Fraction(fps).limit_denominator(1001))
 
 
+RESOLUTIONS = ("1080p", "4k")
+
+
+def sized(W: int, H: int, resolution: str = "1080p") -> tuple[int, int]:
+    """A 1080p-class frame size at the chosen resolution (4k doubles both sides: 3840x2160,
+    2160x3840, 2160x2160)."""
+    if resolution not in RESOLUTIONS:
+        raise AutocutError(f"resolution must be one of {', '.join(RESOLUTIONS)}")
+    k = 2 if resolution == "4k" else 1
+    return int(W) * k // 2 * 2, int(H) * k // 2 * 2
+
+
+def long_side(resolution: str = "1080p") -> int:
+    """The longest side of a "same as the video" frame."""
+    return 3840 if resolution == "4k" else 1920
+
+
+def bitrate_for(W: int, H: int, mbit_at_1080p: float = 14.0) -> str:
+    """A bitrate that grows with the frame, a little less than the pixel count (14 Mb/s at 1080p ->
+    40 Mb/s at 4K, YouTube's recommendation for 4K at 30 fps)."""
+    return f"{max(4, int(round(mbit_at_1080p * ((W * H) / (1920 * 1080)) ** 0.75)))}M"
+
+
 def video_encoder_args(codec: str, bitrate: str) -> list[str]:
     if codec == "hevc":
         return ["-c:v", "hevc_videotoolbox", "-b:v", bitrate, "-tag:v", "hvc1"]
@@ -448,6 +471,11 @@ def make_plan(args: argparse.Namespace) -> dict:
     if not info.has_video:
         raise AutocutError("this file has no video stream.")
     preset = dict(PRESETS[args.preset])
+    res = getattr(args, "resolution", "1080p") or "1080p"
+    if res != "1080p":
+        w4, h4 = sized(preset["width"], preset["height"], res)
+        preset["video_bitrate"] = bitrate_for(w4, h4, float(preset["video_bitrate"].rstrip("M")))
+        preset["width"], preset["height"] = w4, h4
     fps = float(args.fps or preset["fps"])
     t0 = time.time()
     silences = detect_silences(src, info.duration, args.silence_db, args.min_silence)
@@ -570,6 +598,7 @@ def add_plan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("input", help="talking-head clip (needs an audio track with speech)")
     p.add_argument("--preset", choices=sorted(PRESETS), default="long")
     p.add_argument("--fps", type=float, help="timeline frame rate (default from preset)")
+    p.add_argument("--resolution", default="1080p", choices=list(RESOLUTIONS), help="1080p, or 4k (double size)")
     p.add_argument("--music", help="background music file (ducked under the voice)")
     p.add_argument("--music-db", type=float, default=-16.0, help="music level before ducking")
     p.add_argument("--captions", action="store_true", help="transcribe with Whisper and burn word captions")

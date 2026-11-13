@@ -488,7 +488,7 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
          pace: str = "medium", captions: bool = False, caption_style: str = "clean", music: str | None = None, music_db: float = -20.0,
          ambience_db: float = -24.0, describe: str = "local", model: str | None = None, story_order: bool = True, look: str = "natural",
          whisper_model: str = ac.DEFAULT_WHISPER, workers: int = 2, plan_only: bool = False, hints: dict[str, list[int]] | None = None,
-         stills: set[str] | None = None, cards: set[str] | None = None, sound: dict | None = None) -> dict:
+         stills: set[str] | None = None, cards: set[str] | None = None, sound: dict | None = None, resolution: str = "1080p") -> dict:
     """`sound`: optional emotional sound design (score.options): music per mood, hits, risers, pauses."""
     import render
 
@@ -502,7 +502,7 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
         raise AutocutError("the voiceover has no sound")
     if aspect not in ASPECTS:
         raise AutocutError(f"aspect must be one of {', '.join(ASPECTS)}")
-    W, H = ASPECTS[aspect]
+    W, H = ac.sized(*ASPECTS[aspect], resolution)
     fps = 30.0
     total = vinfo.duration
     t0 = time.time()
@@ -586,7 +586,7 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
             af = Path(tmp) / "c.ass"
             af.write_text(ass, encoding="utf-8")
             e = str(af).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-            cmd += ["-vf", f"subtitles=filename='{e}'", "-c:v", "h264_videotoolbox", "-b:v", "14M"]
+            cmd += ["-vf", f"subtitles=filename='{e}'", "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(W, H)]
         else:
             cmd += ["-c:v", "copy"]
         partial = outp.with_name(outp.stem + ".part.mp4")
@@ -606,6 +606,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--narration", help=".narration.json from voice.py (exact lines, emotions, visuals)")
     p.add_argument("--script", help=".script.json or .txt the voiceover was read from")
     p.add_argument("--aspect", default="horizontal", choices=list(ASPECTS))
+    p.add_argument("--resolution", default="1080p", choices=list(ac.RESOLUTIONS), help="1080p, or 4k in any shape")
     p.add_argument("--pace", default="medium", choices=list(PACE_MAX))
     p.add_argument("--captions", action="store_true")
     p.add_argument("--caption-style", default="clean", choices=["pop", "clean", "boxed"])
@@ -628,7 +629,7 @@ def run_args(a) -> dict:
     return make(a.voice, a.clips, a.out, narration=a.narration, script=a.script, aspect=a.aspect, pace=a.pace, captions=a.captions,
                 caption_style=a.caption_style, music=a.music, music_db=a.music_db, ambience_db=a.ambience_db, describe=a.describe,
                 model=a.llm, story_order=not a.no_story_order, look=a.look, workers=getattr(a, "workers", 2), plan_only=a.plan_only,
-                sound=score.options(a))
+                sound=score.options(a), resolution=a.resolution)
 
 
 def main(argv: list[str] | None = None) -> int:

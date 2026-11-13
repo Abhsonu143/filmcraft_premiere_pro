@@ -180,6 +180,7 @@ fn ai_menu_and_dialogs() {
                 "clipType.edited",
                 "clipType.sections",
                 "sound",
+                "resolution.4k",
                 "count",
                 "min",
                 "target",

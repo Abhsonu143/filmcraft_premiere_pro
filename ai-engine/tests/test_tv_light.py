@@ -83,7 +83,7 @@ def test_good_quad_rejects_triangles():
 def test_batch_keeps_going_and_names_outputs(tmp_path, monkeypatch):
     made = []
 
-    def fake_make(clip, folder, out, orientation="horizontal", relight=1.0, fps=30.0, recording=None, bezel=0.0):
+    def fake_make(clip, folder, out, orientation="horizontal", relight=1.0, fps=30.0, recording=None, bezel=0.0, resolution="1080p"):
         if "bad" in clip:
             raise tl.AutocutError("cannot read")
         made.append(out)
