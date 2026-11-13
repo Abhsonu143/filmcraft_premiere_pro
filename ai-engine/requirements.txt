@@ -19,3 +19,5 @@ yt-dlp>=2026.10
 mlx-audio>=0.6.5
 # Speaker verification (ECAPA, Apache-2.0) to check a cloned take sounds like you.
 speechbrain>=1.1
+# TV screen tracking and compositing for TV Light Sync (Apache-2.0).
+opencv-python-headless>=4.9

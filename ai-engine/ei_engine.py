@@ -17,6 +17,8 @@ Subcommands (all paths absolute or relative to the current folder):
     script-write --topic T --out O [--language en|hi|hinglish] [--seconds 60] [--style N] [--backend claude|local]
     voice-prompts / voice-mics / voice-record --out F / voice-enroll --name N [--files F...] [--takes T.json] / voice-list
     speak     --voice N --script S --out O.wav   a script in your cloned voice (+ .narration.json); N = mac:<voice> for macOS voices
+    tv-scan FOLDER / tv-frame REC --out P.png / tv-calibrate REC --quad … --ref-t T
+    tv-make   CLIP --recordings FOLDER --out O.mp4 [--orientation horizontal|vertical]   clip on the TV, backlight matched
     topic     TOPIC_OR_LINK [--seconds 60] [--voice N | --script-only] [--sources free youtube cards]   researched video
     clips     VIDEO --out-dir D [--count 5] [--min 10] [--max 60] [--target 48] [--aspect vertical] [--llm KEY]
     audio     FILE... [--format mp3|m4a|wav|aiff|flac|alac|opus|ogg] [--quality original|best|high|medium|small]
@@ -113,9 +115,11 @@ def run(argv: list[str]) -> dict:
     import narrate
     import script_writer
     import topic_video
+    import tv_light
     import voice
 
     script_writer.add_args(sub, "script-")
+    tv_light.add_args(sub)
     topic_video.add_args(sub.add_parser("topic", help="topic or link -> research -> script -> voice -> edited video"))
     voice.add_args(sub)
     pl = sub.add_parser("llm", help="list language models / set the default")
@@ -139,6 +143,8 @@ def run(argv: list[str]) -> dict:
         return highlights.run_args(a)
     if a.cmd == "audio":
         return extract_audio.run_args(a)
+    if a.cmd.startswith("tv-"):
+        return tv_light.run_args(a)
     if a.cmd == "topic":
         return topic_video.run_args(a)
     if a.cmd.startswith("script-"):

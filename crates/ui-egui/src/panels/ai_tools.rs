@@ -70,6 +70,7 @@ pub enum Kind {
     Script,
     Voice,
     Topic,
+    Tv,
 }
 
 impl Kind {
@@ -85,6 +86,7 @@ impl Kind {
             Kind::Script => "script",
             Kind::Voice => "voice",
             Kind::Topic => "topic",
+            Kind::Tv => "tv",
         }
     }
     fn from_command(id: &str) -> Option<Kind> {
@@ -99,6 +101,7 @@ impl Kind {
             "ai.script" => Kind::Script,
             "ai.voice" => Kind::Voice,
             "ai.topic" => Kind::Topic,
+            "ai.tv" => Kind::Tv,
             _ => return None,
         })
     }
@@ -114,6 +117,7 @@ impl Kind {
             Kind::Script => "Write Voiceover Script",
             Kind::Voice => "Voice Clone",
             Kind::Topic => "Video from Topic",
+            Kind::Tv => "TV Light Sync",
         }
     }
     fn input_label(self) -> &'static str {
@@ -121,6 +125,7 @@ impl Kind {
             Kind::Reference => "Reference video",
             Kind::Voiceover => "Voiceover audio",
             Kind::Clips => "Long video",
+            Kind::Tv => "Your clip",
             _ => "Video",
         }
     }
@@ -201,6 +206,38 @@ struct Draft {
     src_cards: bool,
     src_youtube: bool,
     fresh: bool,
+    // TV light sync
+    tv_folder: String,
+    relight: f64,
+    tv: TvState,
+}
+
+/// TV Light Sync: the recordings of the room and the corner check of one of them.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TvState {
+    scan_job: Option<u64>,
+    scanned: String,
+    recs: Vec<TvRec>,
+    calib: Option<TvCalib>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TvRec {
+    path: String,
+    orientation: String,
+    calibrated: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TvCalib {
+    path: String,
+    job: Option<u64>,
+    image: String,
+    ref_t: f64,
+    /// corners, normalised: top-left, top-right, bottom-right, bottom-left
+    quad: [[f32; 2]; 4],
+    loaded: bool,
+    saving: Option<u64>,
 }
 
 /// The sentence-by-sentence recording session of the Voice Clone dialog.
@@ -311,6 +348,9 @@ impl Draft {
             src_cards: true,
             src_youtube: false,
             fresh: false,
+            tv_folder: setting_str("tv_recordings").unwrap_or_default(),
+            relight: 1.0,
+            tv: TvState::default(),
         }
     }
 
@@ -406,6 +446,10 @@ impl Draft {
         d.src_cards = flag("cards", d.src_cards);
         d.src_youtube = flag("youtube", d.src_youtube);
         d.fresh = flag("fresh", d.fresh);
+        if let Some(v) = p.get("recordings").and_then(Value::as_str) {
+            d.tv_folder = v.to_string();
+        }
+        d.relight = num("relight", d.relight);
         if let Some(a) = p.get("takesFile").and_then(Value::as_str) {
             d.script = a.to_string();
         }
@@ -655,6 +699,20 @@ impl Draft {
                     a.push("--script-only".into());
                 }
             }
+            Kind::Tv => {
+                if !exists(&self.tv_folder) {
+                    return Err("Choose the folder with the recordings of your room.".into());
+                }
+                if !(0.0..=1.0).contains(&self.relight) {
+                    return Err("Backlight matching must be between 0 and 1.".into());
+                }
+                let orientation = if self.aspect == "vertical" { "vertical" } else { "horizontal" };
+                a = vec!["tv-make".into(), self.input.trim().into()];
+                push(&mut a, "--recordings", self.tv_folder.trim());
+                push(&mut a, "--orientation", orientation);
+                push(&mut a, "--relight", &format!("{}", self.relight));
+                push(&mut a, "--out", self.out.trim());
+            }
             Kind::Voice => {
                 let name = self.voice_name.trim();
                 if name.is_empty() {
@@ -776,6 +834,8 @@ const SCRIPT_LANGUAGES: [(&str, &str); 3] = [("hinglish", "Hinglish (Hindi + Eng
 const WRITERS: [(&str, &str); 2] = [("claude", "Claude (through Claude Code; best quality)"), ("local", "Local model (offline)")];
 const VOICE_SOURCES: [(&str, &str); 2] =
     [("record", "Record with the microphone (EI gives the sentences)"), ("files", "Recordings I already have (audio or video)")];
+const TV_SHAPES: [(&str, &str); 2] =
+    [("horizontal", "Horizontal (16:9, from the horizontal recordings)"), ("vertical", "Vertical (9:16, from the vertical recordings)")];
 const MAC_VOICES: [(&str, &str); 5] = [
     ("mac:Rishi", "Rishi: Indian English (macOS voice, quick preview)"),
     ("mac:Tara", "Tara: Indian English (macOS voice)"),
@@ -824,6 +884,11 @@ fn default_output(d: &Draft) -> String {
         Kind::Script => movies_dir().join("Scripts").join(slug(if d.topic.trim().is_empty() { "script" } else { &d.topic })).to_string_lossy().to_string(),
         Kind::Voice => voices_dir().join(slug(&d.voice_name)).to_string_lossy().to_string(),
         Kind::Topic => String::new(), // the engine names the folder after the topic (Movies/EI/Topics/…)
+        Kind::Tv => free_path(
+            &parent_dir(&d.input),
+            &format!("{} - on TV {}", file_stem(&d.input), if d.aspect == "vertical" { "vertical" } else { "horizontal" }),
+            ".mp4",
+        ),
     }
 }
 
@@ -960,6 +1025,25 @@ fn default_llm_at(path: &Path) -> &'static str {
     let saved = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
     let key = saved.as_ref().and_then(|v| v.get("llm_model")).and_then(Value::as_str).unwrap_or("qwen3-4b");
     LLMS.iter().skip(1).map(|m| m.0).find(|k| *k == key).unwrap_or("qwen3-4b")
+}
+
+/// A string setting from EI's settings file.
+fn setting_str(key: &str) -> Option<String> {
+    let saved = std::fs::read_to_string(settings_path()).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())?;
+    saved.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Save one string setting, keeping the others.
+fn save_setting(key: &str, value: &str) -> Result<(), String> {
+    let path = settings_path();
+    let mut v = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}));
+    if let Some(o) = v.as_object_mut() {
+        o.insert(key.into(), json!(value));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("could not save settings: {e}"))?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?).map_err(|e| format!("could not save settings: {e}"))
 }
 
 /// Save the default language model, keeping the other settings.
@@ -1233,6 +1317,7 @@ fn run_draft(d: &mut Draft) -> Result<u64, String> {
         Kind::Script => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Voice => format!("{}: {}", d.kind.title(), d.voice_name.trim()),
         Kind::Topic => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
+        Kind::Tv => format!("{}: {}", d.kind.title(), file_stem(&d.input)),
     };
     Ok(start_job(title, Some(d.kind), vec![step], d.import, Some(engine)))
 }
@@ -1327,6 +1412,7 @@ enum Pick {
     Script,
     Out,
     StyleSources,
+    TvFolder,
 }
 
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
@@ -1701,6 +1787,23 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             ui.end_row();
                         }
                     }
+                    Kind::Tv => {
+                        ui.label("Recordings folder");
+                        if path_row(ui, &mut d.tv_folder, &format!("{p}.recordings"), "videos of your room with the TV", &mut elems) {
+                            pick = Some(Pick::TvFolder);
+                        }
+                        ui.end_row();
+                        ui.label("Final video");
+                        radio_row(ui, &mut d.aspect, &TV_SHAPES, &format!("{p}.aspect"), &mut elems);
+                        ui.end_row();
+                        ui.label("Backlight matching");
+                        let r = ui.add(egui::Slider::new(&mut d.relight, 0.0..=1.0).text("recolour the glow"));
+                        elems.push((format!("{p}.relight"), r.rect, d.relight.to_string()));
+                        ui.end_row();
+                        ui.label("Recordings");
+                        ui.vertical(|ui| tv_recordings_ui(ui, &mut d, &p, &mut elems));
+                        ui.end_row();
+                    }
                     Kind::Topic => {
                         ui.label("Topic or link");
                         let r = ui.add(
@@ -1860,6 +1963,10 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 ui.separator();
                 recorder_ui(ui, &mut d, &p, &mut elems);
             }
+            if d.kind == Kind::Tv && d.tv.calib.is_some() {
+                ui.separator();
+                tv_calib_ui(ui, &mut d, &p, &mut elems);
+            }
             if !d.error.is_empty() {
                 ui.add_space(4.0);
                 ui.colored_label(egui::Color32::from_rgb(0xE5, 0x6B, 0x6B), &d.error);
@@ -1876,6 +1983,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Script if !d.voice.is_empty() => "Write and Speak",
                     Kind::Script => "Write Script",
                     Kind::Topic if d.make_video => "Make Video",
+                    Kind::Tv => "Make Video",
                     Kind::Topic => "Research and Write",
                     _ => "Run",
                 };
@@ -1897,6 +2005,13 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 let filter = if d.kind == Kind::Voiceover { "Audio" } else { "Video" };
                 if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f(filter, &exts)) {
                     d.input = f;
+                }
+            }
+            Pick::TvFolder => {
+                if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
+                    d.tv_folder = dir;
+                    d.tv.recs.clear();
+                    d.tv.scanned.clear();
                 }
             }
             Pick::StyleSources => {
@@ -1963,6 +2078,10 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
         }
     }
     poll_recorder(&mut d);
+    poll_tv(&mut d);
+    if run && d.kind == Kind::Tv && !d.tv_folder.trim().is_empty() {
+        let _ = save_setting("tv_recordings", d.tv_folder.trim());
+    }
     if run {
         match run_draft(&mut d) {
             Ok(job) => {
@@ -2191,7 +2310,217 @@ fn selected_sets(d: &Draft) -> Vec<String> {
     [("hi", d.lang_hi), ("mix", d.lang_mix), ("en", d.lang_en)].iter().filter(|(_, on)| *on).map(|(k, _)| k.to_string()).collect()
 }
 
-/// Pick up finished recorder jobs (sentences loaded, microphones listed, a take recorded).
+/// The recordings of the room for TV Light Sync: orientation and whether the TV corners were checked.
+fn tv_recordings_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
+    let folder = d.tv_folder.trim().to_string();
+    if folder.is_empty() || !Path::new(&folder).is_dir() {
+        ui.label(egui::RichText::new("Choose the folder above.").weak());
+        return;
+    }
+    if d.tv.scanned != folder && d.tv.scan_job.is_none() {
+        match engine_step(vec!["tv-scan".into(), folder.clone()]) {
+            Ok((step, engine)) => {
+                d.tv.scan_job = Some(start_job("TV Light Sync: recordings".into(), None, vec![step], false, Some(engine)));
+                d.tv.scanned = folder.clone();
+            }
+            Err(e) => d.error = e,
+        }
+    }
+    if d.tv.scan_job.is_some() {
+        ui.label("Looking at the recordings…");
+        return;
+    }
+    let want = if d.aspect == "vertical" { "vertical" } else { "horizontal" };
+    let mut open: Option<String> = None;
+    let busy = d.tv.calib.is_some();
+    for r in d.tv.recs.iter().filter(|r| r.orientation == want) {
+        let name = Path::new(&r.path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(&name);
+            if r.calibrated {
+                ui.colored_label(egui::Color32::from_rgb(0x5C, 0xC0, 0x7A), "✔ corners checked");
+            } else {
+                ui.colored_label(egui::Color32::from_rgb(0xE0, 0xB0, 0x40), "corners not checked yet");
+            }
+            let b = ui.add_enabled(!busy, egui::Button::new(if r.calibrated { "Re-check" } else { "Check corners" }).small());
+            elems.push((format!("{p}.calibrate.{name}"), b.rect, name.clone()));
+            if b.clicked() {
+                open = Some(r.path.clone());
+            }
+        });
+    }
+    let other = d.tv.recs.iter().filter(|r| r.orientation != want).count();
+    if d.tv.recs.iter().all(|r| r.orientation != want) {
+        ui.colored_label(egui::Color32::from_rgb(0xE5, 0x6B, 0x6B), format!("No {want} recordings in this folder."));
+    } else if other > 0 {
+        ui.label(
+            egui::RichText::new(format!("({other} {} recording(s) are used for the other shape)", if want == "vertical" { "horizontal" } else { "vertical" }))
+                .weak(),
+        );
+    }
+    ui.label(egui::RichText::new("Unchecked recordings use EI's own guess of the TV corners; checking them once (10 s each) gives a perfect fit.").weak());
+    if let Some(path) = open {
+        let png = support_dir().join("tvlight").join(format!("{}.png", file_stem(&path)));
+        let _ = std::fs::create_dir_all(support_dir().join("tvlight"));
+        match engine_step(vec!["tv-frame".into(), path.clone(), "--out".into(), png.to_string_lossy().to_string()]) {
+            Ok((step, engine)) => {
+                let job = start_job(format!("TV Light Sync: frame of {}", file_stem(&path)), None, vec![step], false, Some(engine));
+                d.tv.calib = Some(TvCalib { path, job: Some(job), ..TvCalib::default() });
+            }
+            Err(e) => d.error = e,
+        }
+    }
+}
+
+/// The corner check: a frame of the recording with four draggable corners on the TV screen.
+fn tv_calib_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
+    let Some(c) = d.tv.calib.as_mut() else { return };
+    ui.strong(format!("TV corners: {}", Path::new(&c.path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
+    if !c.loaded {
+        ui.label("Finding the TV in this recording (EI suggests the corners)…");
+        return;
+    }
+    ui.label(
+        egui::RichText::new(
+            "Drag the four green corners onto the corners of the TV's picture (inside the black frame). The monitor and laptop are never touched.",
+        )
+        .weak(),
+    );
+    let tex_id = egui::Id::new(("ei-tv-calib-tex", c.image.clone()));
+    let tex = ui.ctx().data(|m| m.get_temp::<egui::TextureHandle>(tex_id));
+    let tex = match tex {
+        Some(t) => t,
+        None => {
+            let Ok(img) = image::open(&c.image) else {
+                ui.colored_label(egui::Color32::from_rgb(0xE5, 0x6B, 0x6B), "Could not open the frame.");
+                return;
+            };
+            let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let t = ui.ctx().load_texture("ei-tv-calib", egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), egui::TextureOptions::LINEAR);
+            ui.ctx().data_mut(|m| m.insert_temp(tex_id, t.clone()));
+            t
+        }
+    };
+    let [tw, th] = tex.size();
+    let max = egui::vec2(640.0, 420.0);
+    let scale = (max.x / tw.max(1) as f32).min(max.y / th.max(1) as f32);
+    let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+    let to_screen = |q: [f32; 2]| rect.min + egui::vec2(q[0] * size.x, q[1] * size.y);
+    let pts: Vec<egui::Pos2> = c.quad.iter().map(|q| to_screen(*q)).collect();
+    let green = egui::Color32::from_rgb(0x4C, 0xE0, 0x6C);
+    for k in 0..4 {
+        if let (Some(a), Some(b)) = (pts.get(k), pts.get((k + 1) % 4)) {
+            ui.painter().line_segment([*a, *b], egui::Stroke::new(2.0, green));
+        }
+    }
+    for (k, label) in ["top-left", "top-right", "bottom-right", "bottom-left"].iter().enumerate() {
+        let Some(pt) = pts.get(k).copied() else { continue };
+        let hr = egui::Rect::from_center_size(pt, egui::vec2(18.0, 18.0));
+        let r = ui.interact(hr, egui::Id::new(("ei-tv-corner", k)), egui::Sense::drag());
+        if r.dragged()
+            && let Some(q) = c.quad.get_mut(k)
+        {
+            let dlt = r.drag_delta();
+            q[0] = (q[0] + dlt.x / size.x.max(1.0)).clamp(-0.2, 1.2);
+            q[1] = (q[1] + dlt.y / size.y.max(1.0)).clamp(-0.2, 1.2);
+        }
+        let col = if r.hovered() || r.dragged() { egui::Color32::WHITE } else { green };
+        ui.painter().circle_stroke(pt, 7.0, egui::Stroke::new(2.0, col));
+        ui.painter().circle_filled(pt, 2.0, col);
+        elems.push((format!("{p}.corner.{k}"), hr, (*label).to_string()));
+    }
+    let (mut save_clicked, mut close) = (false, false);
+    ui.horizontal(|ui| {
+        let save = ui.add_enabled(c.saving.is_none(), egui::Button::new("Save Corners"));
+        elems.push((format!("{p}.corners.save"), save.rect, "Save Corners".into()));
+        save_clicked = save.clicked();
+        let cancel = ui.button("Close");
+        elems.push((format!("{p}.corners.close"), cancel.rect, "Close".into()));
+        close = cancel.clicked();
+    });
+    if save_clicked {
+        let q: Vec<String> = c.quad.iter().flat_map(|v| [format!("{:.4}", v[0]), format!("{:.4}", v[1])]).collect();
+        match engine_step(vec!["tv-calibrate".into(), c.path.clone(), "--quad".into(), q.join(","), "--ref-t".into(), format!("{}", c.ref_t)]) {
+            Ok((step, engine)) => c.saving = Some(start_job("TV Light Sync: save corners".into(), None, vec![step], false, Some(engine))),
+            Err(e) => d.error = e,
+        }
+    }
+    if close {
+        d.tv.calib = None;
+    }
+}
+
+/// Pick up finished TV Light Sync jobs (recordings listed, a frame ready, corners saved).
+fn poll_tv(d: &mut Draft) {
+    if let Some(j) = d.tv.scan_job
+        && let Some((st, res, err)) = job_state(j)
+        && st != Status::Running
+    {
+        d.tv.scan_job = None;
+        if st == Status::Done {
+            d.tv.recs = res
+                .get("recordings")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|r| TvRec {
+                            path: r.get("path").and_then(Value::as_str).unwrap_or_default().to_string(),
+                            orientation: r.get("orientation").and_then(Value::as_str).unwrap_or_default().to_string(),
+                            calibrated: r.get("calibrated").and_then(Value::as_bool).unwrap_or(false),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        } else {
+            d.error = format!("Could not read the recordings: {err}");
+        }
+    }
+    let Some(c) = d.tv.calib.as_mut() else { return };
+    if let Some(j) = c.job
+        && let Some((st, res, err)) = job_state(j)
+        && st != Status::Running
+    {
+        c.job = None;
+        if st == Status::Done {
+            c.image = res.get("image").and_then(Value::as_str).unwrap_or_default().to_string();
+            c.ref_t = res.get("ref_t").and_then(Value::as_f64).unwrap_or(0.0);
+            if let Some(q) = res.get("quad").and_then(Value::as_array) {
+                for (k, pt) in q.iter().take(4).enumerate() {
+                    let x = pt.get(0).and_then(Value::as_f64).unwrap_or(0.5) as f32;
+                    let y = pt.get(1).and_then(Value::as_f64).unwrap_or(0.5) as f32;
+                    if let Some(slot) = c.quad.get_mut(k) {
+                        *slot = [x, y];
+                    }
+                }
+            }
+            c.loaded = true;
+        } else {
+            d.error = format!("Could not read the recording: {err}");
+            d.tv.calib = None;
+            return;
+        }
+    }
+    if let Some(j) = c.saving
+        && let Some((st, _, err)) = job_state(j)
+        && st != Status::Running
+    {
+        c.saving = None;
+        if st == Status::Done {
+            let path = c.path.clone();
+            if let Some(r) = d.tv.recs.iter_mut().find(|r| r.path == path) {
+                r.calibrated = true;
+            }
+            d.tv.calib = None;
+        } else {
+            d.error = format!("Could not save the corners: {err}");
+        }
+    }
+}
+
+/// Pick up finished recorder jobs/// Pick up finished recorder jobs (sentences loaded, microphones listed, a take recorded).
 fn poll_recorder(d: &mut Draft) {
     if let Some(j) = d.rec.loading
         && let Some((st, res, err)) = job_state(j)
@@ -2281,6 +2610,9 @@ fn description(kind: Kind) -> &'static str {
         }
         Kind::Script => {
             "Claude (or the local model) writes a voiceover script in your talking style, line by line with emotion, pace and a shot idea for each line, ready for your cloned voice. Optionally speaks it right away."
+        }
+        Kind::Tv => {
+            "Plays your clip on the big TV in a recording of your room, with the TV backlight matching your clip's colours in software (no HDMI sync box): EI picks the moments of your recordings whose light matches each part of your clip and recolours the glow for the rest. The monitor and laptop stay as recorded. Each recording is analysed once (a few minutes) and remembered."
         }
         Kind::Topic => {
             "Give a topic or a link to a post. Claude researches it on the web (facts with sources), writes the script, and EI makes the video: your cloned voice (or a macOS voice), credited free-licensed photos and videos, fact cards, your own footage, optional YouTube clips. Or make only the script with its sources."
@@ -2747,6 +3079,31 @@ mod tests {
         assert!(Draft::from_params(Kind::Topic, &json!({"topic": "x"})).engine_args().is_err());
         assert!(Draft::from_params(Kind::Topic, &json!({"topic": "x", "voice": "v", "free": false, "cards": false})).engine_args().is_err());
         assert!(Draft::from_params(Kind::Topic, &json!({"topic": " "})).engine_args().is_err());
+    }
+
+    #[test]
+    fn tv_light_arguments() {
+        let dir = std::env::temp_dir().join(format!("ei-ai-test4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        std::fs::write(&clip, b"x").unwrap();
+        let mut d = Draft::from_params(
+            Kind::Tv,
+            &json!({"input": clip.to_string_lossy(), "recordings": dir.to_string_lossy(), "aspect": "horizontal", "relight": 0.6}),
+        );
+        let a = d.engine_args().unwrap();
+        assert_eq!(a.first().map(String::as_str), Some("tv-make"));
+        for pair in [["--orientation", "horizontal"], ["--relight", "0.6"]] {
+            assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
+        }
+        assert!(d.out.ends_with("clip - on TV horizontal.mp4"), "{}", d.out);
+        let a = Draft::from_params(Kind::Tv, &json!({"input": clip.to_string_lossy(), "recordings": dir.to_string_lossy(), "aspect": "vertical"}))
+            .engine_args()
+            .unwrap();
+        assert!(a.windows(2).any(|w| w == ["--orientation", "vertical"]));
+        assert!(Draft::from_params(Kind::Tv, &json!({"input": clip.to_string_lossy(), "recordings": "/no/such"})).engine_args().is_err());
+        assert!(Draft::from_params(Kind::Tv, &json!({"recordings": dir.to_string_lossy()})).engine_args().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

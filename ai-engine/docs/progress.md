@@ -196,3 +196,18 @@ Full description: `docs/voice-and-voiceover.md`.
 - **narrate.py:** optional per-line media hints, and stills shown once. With neither option, behaviour is the
   same as before.
 - Details and timings: `docs/topic-video.md`.
+
+## TV Light Sync (2026-11-13)
+
+- **What it does:** `tv_light.py` + AI ▸ TV Light Sync… put a clip on the TV in a room recording, with the
+  backlight matched in software (no HDMI sync box).
+- **How:**
+  - one-time corner check per recording, with suggestions, cached
+  - SIFT tracking of the room
+  - room light response learned from the HDMI-synced recordings
+  - Viterbi choice of moments (1 s minimum stretches, pose-aware jumps)
+  - zone relighting
+  - perspective composite matched to the camera
+- **Results and limits:** `docs/tv-light-sync.md`.
+- **Other changes:** `docs/tasks.md` holds the voice-training plan for later. `opencv-python-headless` was
+  added to the requirements.

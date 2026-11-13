@@ -108,7 +108,7 @@ fn ai_menu_and_dialogs() {
     for id in ["ai.split", "ai.music", "ai.reference", "ai.talk", "ai.voiceover", "ai.clips", "ai.audio", "ai.jobs", "ai.setup"] {
         assert!(menu.contains(id), "{id} in the menus");
     }
-    let expect: [(&str, &[&str]); 10] = [
+    let expect: [(&str, &[&str]); 11] = [
         ("split", &["input", "clipLength", "quality.same", "quality.exact", "out", "import", "run"]),
         (
             "music",
@@ -150,6 +150,7 @@ fn ai_menu_and_dialogs() {
                 "run",
             ],
         ),
+        ("tv", &["input", "recordings", "aspect.horizontal", "aspect.vertical", "relight", "out", "run"]),
         (
             "topic",
             &[
@@ -404,4 +405,50 @@ fn voice_recorder_records_a_take() {
     d.snapshot("voice-recorded");
     let dir = settings.parent().unwrap().join("voices/My-voice/takes");
     assert!(std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).any(|f| f.path().extension().is_some_and(|x| x == "wav")));
+}
+
+/// TV Light Sync with real recordings: the folder is listed with orientations, the corner check
+/// opens with EI's suggestion, a corner can be dragged and the corners are saved. Opt-in:
+/// `EI_TEST_TV=<folder with recordings> EI_SETTINGS=<tmp>/settings.json` (and a matching
+/// `AUTOCUT_CACHE=<tmp>` keeps the calibration out of your real cache).
+#[test]
+fn tv_light_corner_check() {
+    let Some(folder) = std::env::var_os("EI_TEST_TV") else { return };
+    let Some(settings) = std::env::var_os("EI_SETTINGS").map(std::path::PathBuf::from) else { return };
+    if !have_tools() {
+        return;
+    }
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, serde_json::to_string(&json!({"tv_recordings": folder.to_string_lossy()})).unwrap()).unwrap();
+    let mut d = Driver::demo();
+    d.run("ai.tv", json!({}));
+    let wait = |d: &mut Driver, id: &str, secs: u64| {
+        let t0 = Instant::now();
+        while !d.ids(id).iter().any(|x| x.starts_with(id)) {
+            assert!(t0.elapsed() < Duration::from_secs(secs), "{id} never appeared");
+            d.frames(2);
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    };
+    wait(&mut d, "ai.tv.calibrate.", 60);
+    d.snapshot("tv-list");
+    let first = d.ids("ai.tv.calibrate.").into_iter().next().unwrap();
+    d.frames(12); // the dialog grows with the list and re-centres: let it settle before clicking
+    d.ok("ui.click", json!({"id": first}));
+    wait(&mut d, "ai.tv.corner.0", 180);
+    d.frames(3);
+    d.snapshot("tv-corners");
+    d.frames(12);
+    d.ok("ui.drag", json!({"from": {"id": "ai.tv.corner.0"}, "to": {"id": "ai.tv.corner.0", "dx": 6, "dy": 4}}));
+    d.frames(4);
+    d.ok("ui.click", json!({"id": "ai.tv.corners.save"}));
+    let t0 = Instant::now();
+    while d.ids("ai.tv.corner.0").iter().any(|x| x == "ai.tv.corner.0") {
+        assert!(t0.elapsed() < Duration::from_secs(60), "corners never saved");
+        d.frames(2);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    d.frames(3);
+    d.snapshot("tv-saved");
+    assert!(d.harness.query_by_label_contains("corners checked").is_some());
 }
