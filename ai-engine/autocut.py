@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,20 @@ import time
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+
+
+# IPv4 first: on networks where IPv6 is advertised but does not route, Python waits ~30 s per
+# connection before falling back (curl and browsers switch within milliseconds). Every download in
+# the engine (pictures, music, hooks, research) was 20-30 s slower per request because of it.
+_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_first(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002 (socket's own names)
+    infos = _getaddrinfo(host, port, family, type, proto, flags)
+    return sorted(infos, key=lambda x: 0 if x[0] == socket.AF_INET else 1)
+
+
+socket.getaddrinfo = _ipv4_first
 
 PLAN_VERSION = 1
 CACHE_DIR = Path(os.environ.get("AUTOCUT_CACHE", Path.home() / ".cache" / "autocut"))
@@ -57,6 +72,153 @@ class AutocutError(Exception):
 
 def log(msg: str) -> None:
     print(f"[autocut] {msg}", file=sys.stderr, flush=True)
+    m = _PROGRESS_LINE.match(msg)
+    if m:
+        progress_count(int(m.group(1)), int(m.group(2)), m.group(3))
+
+
+# ---------------------------------------------------------------------------------------------
+# Progress for the app's AI Jobs window: `EI_PROGRESS {"fraction": 0.42, "stage": "voice"}` on stderr.
+#
+# A command declares its stages and their share of the work (progress_plan); `with stage(name):`
+# runs one (stages may run in parallel threads; a stage can declare its own sub-stages). Inside a
+# stage, the existing "progress k/n <unit>" log lines move it along: per-item units (clips,
+# sections, niches …) count whole items, "shots"/"takes"/"frames" count inside the current item.
+# Model workers in their own process report through a small file their parent watches.
+# ---------------------------------------------------------------------------------------------
+
+import re as _re
+import threading as _threading
+from contextlib import contextmanager as _contextmanager
+
+_PROGRESS_LINE = _re.compile(r"progress (\d+)/(\d+)\s*(\w*)")
+_INNER_UNITS = {"shots", "takes", "frames", "chunks"}
+_P_LOCK = _threading.RLock()
+_TLS = _threading.local()
+
+
+class _Node:
+    def __init__(self, weights: dict[str, float]):
+        self.weights = {k: max(0.0, float(v)) for k, v in weights.items()}
+        self.frac: dict[str, float] = {k: 0.0 for k in weights}
+        self.children: dict[str, "_Node"] = {}
+        self.counts: dict[str, tuple] = {}
+
+    def fraction(self) -> float:
+        tot = sum(self.weights.values()) or 1.0
+        return sum(w * (self.children[k].fraction() if k in self.children else self.frac.get(k, 0.0)) for k, w in self.weights.items()) / tot
+
+    def active(self) -> list[str]:
+        out = []
+        for k in self.weights:
+            f = self.children[k].fraction() if k in self.children else self.frac.get(k, 0.0)
+            if 0.0 < f < 1.0 or k in getattr(self, "running", set()):
+                inner = self.children[k].active() if k in self.children else []
+                out.append(f"{k}: {', '.join(inner)}" if inner else k)
+        return out
+
+
+_ROOT: list[_Node | None] = [None]
+_LAST: dict = {"f": -1.0, "label": None, "t": 0.0}
+
+
+def _path() -> list:
+    if not hasattr(_TLS, "path"):
+        _TLS.path = []
+    return _TLS.path
+
+
+def progress_plan(weights: dict[str, float]) -> None:
+    """The stages of this command (or of the current stage) and their share of the work."""
+    with _P_LOCK:
+        node = _Node(weights)
+        path = _path()
+        if path:
+            parent, name = path[-1]
+            parent.children[name] = node
+        else:
+            _ROOT[0] = node
+        _emit(force=True)
+
+
+@_contextmanager
+def stage(name: str):
+    """Run one stage of the plan (it counts as done when the block ends without an error)."""
+    with _P_LOCK:
+        path = _path()
+        node = path[-1][0].children.get(path[-1][1]) if path else _ROOT[0]
+        if node is None or name not in node.weights:
+            node = None
+        else:
+            node.running = getattr(node, "running", set()) | {name}
+            path.append((node, name))
+            _emit(force=True)
+    ok = False
+    try:
+        yield
+        ok = True
+    finally:
+        if node is not None:
+            with _P_LOCK:
+                node.running.discard(name)
+                if ok:
+                    node.frac[name] = 1.0
+                    node.children.pop(name, None)
+                _path().pop()
+                _emit(force=True)
+
+
+def stage_progress(frac: float) -> None:
+    """How far the current stage is (0–1)."""
+    if os.environ.get("EI_PROGRESS_FILE"):  # a model worker: tell the parent process
+        try:
+            Path(os.environ["EI_PROGRESS_FILE"]).write_text(f"{max(0.0, min(1.0, frac)):.4f}")
+        except OSError:
+            pass
+        return
+    with _P_LOCK:
+        path = _path()
+        if path:
+            node, name = path[-1]
+            if name not in node.children:
+                node.frac[name] = max(node.frac.get(name, 0.0), max(0.0, min(1.0, float(frac))))
+        else:
+            if _ROOT[0] is None:
+                _ROOT[0] = _Node({"work": 1.0})
+                _ROOT[0].running = {"work"}
+            if "work" in _ROOT[0].weights:
+                _ROOT[0].frac["work"] = max(_ROOT[0].frac["work"], max(0.0, min(1.0, float(frac))))
+        _emit()
+
+
+def progress_count(k: int, n: int, unit: str = "") -> None:
+    """A "progress k/n unit" step: items, or steps inside the current item."""
+    if n <= 0:
+        return
+    key = id(_path()[-1][0]) if _path() else 0
+    if not hasattr(_TLS, "counts"):
+        _TLS.counts = {}
+    outer = _TLS.counts.get(key, {}).get("outer")
+    if unit in _INNER_UNITS:
+        inner = min(1.0, k / n)
+        frac = (outer[0] + inner) / outer[1] if outer and outer[0] < outer[1] else inner
+    else:
+        _TLS.counts.setdefault(key, {})["outer"] = (min(k, n), n)
+        frac = min(1.0, k / n)
+    stage_progress(frac)
+
+
+def _emit(force: bool = False) -> None:
+    root = _ROOT[0]
+    if root is None or os.environ.get("EI_PROGRESS_FILE"):
+        return
+    f = root.fraction()
+    label = "; ".join(root.active())
+    now = time.time()
+    if not force and label == _LAST["label"] and abs(f - _LAST["f"]) < 0.004 and now - _LAST["t"] < 2.0:
+        return
+    _LAST.update(f=f, label=label, t=now)
+    print("EI_PROGRESS " + json.dumps({"fraction": round(f, 4), "stage": label}), file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -351,8 +513,39 @@ def run_isolated(fn, *args):
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
 
-    with ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn")) as ex:
-        return ex.submit(fn, *args).result()
+    # the worker reports its progress through a file (it has no line to the app of its own)
+    pf = Path(tempfile.mkdtemp(prefix="ei-progress-")) / "p"
+    with _P_LOCK:
+        old = os.environ.get("EI_PROGRESS_FILE")
+        os.environ["EI_PROGRESS_FILE"] = str(pf)
+        try:
+            ex = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
+            fut = ex.submit(fn, *args)  # (the worker process starts here, with the variable set)
+        finally:
+            if old is None:
+                os.environ.pop("EI_PROGRESS_FILE", None)
+            else:
+                os.environ["EI_PROGRESS_FILE"] = old
+    try:
+        seen = ""
+        while True:
+            try:
+                return fut.result(timeout=1.0)
+            except TimeoutError:
+                pass
+            try:
+                txt = pf.read_text()
+            except OSError:
+                txt = ""
+            if txt and txt != seen:
+                seen = txt
+                try:
+                    stage_progress(float(txt))
+                except ValueError:
+                    pass
+    finally:
+        ex.shutdown(wait=True)
+        shutil.rmtree(pf.parent, ignore_errors=True)
 
 
 def transcribe(src: str, *, model: str = DEFAULT_WHISPER, prompt: str | None = None, language: str | None = None) -> dict:

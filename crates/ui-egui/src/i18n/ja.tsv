@@ -3497,6 +3497,11 @@
 	AI Jobs	AI ジョブ
 	AI Engine Setup…	AI エンジンの設定…
 	Cancel AI Job	AI ジョブをキャンセル
+	Pause AI Job	AIジョブを一時停止
+	Resume AI Job	AIジョブを再開
+	Retry AI Job	AIジョブを再試行
+	AI Queue	AIキュー
+	Cancel AI Queue	AIキューをキャンセル
 	Based on FilmCraft…	FilmCraft について…
 	A video editor with local AI auto-editing, based on the open-source FilmCraft editor.	ローカル AI による自動編集を備えた、オープンソースの FilmCraft エディターをもとにした動画編集ソフトです。
 	Ai	AI

@@ -33,6 +33,7 @@ What decides which picture goes where
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import re
 import sys
@@ -546,6 +547,7 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
     if not lines:
         raise AutocutError("no speech found in the voiceover")
     log(f"{len(lines)} narration lines")
+    ac.progress_plan({"understanding": 0.45, "planning": 0.15, "rendering": 0.25, "sound": 0.15})
     describe_lines(lines, describe, model)
     english_gloss(voice, lines, whisper_model)
     import narrate_craft as nc
@@ -570,7 +572,10 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
         hook_text = nc.screen_hook(lines, niche, "hi" if any(re.search(r"[ऀ-ॿ]", str(x.get("text", ""))) for x in lines) else "en",
                                    "claude", model)
         log(f"hook text on screen: “{hook_text}”")
-    clips = index_footage(vc.collect_clips(clips_in))
+    with ac.stage("understanding"):
+        clips = index_footage(vc.collect_clips(clips_in))
+    planning = contextlib.ExitStack()
+    planning.enter_context(ac.stage("planning"))
     q = line_embeddings(lines)
     slots = shots_for_lines(lines, total, pace)
     if hook != "off":
@@ -600,16 +605,23 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
     used = len({s["clip"] for s in shots})
     log(f"planned {len(shots)} shots from {used} clip(s) for {total:.0f}s of narration in {time.time() - t0:.0f}s; "
         f"mean picture match {np.mean([s['match'] for s in shots]):.2f}")
+    planning.close()
     if plan_only:
         __import__("shutil").rmtree(work, ignore_errors=True)
         return {"outputs": [], "plan": str(plan_path), "out_dir": str(outp.parent)}
     with tempfile.TemporaryDirectory(prefix="ei-narrate-") as tmp:
-        rplan = Path(tmp) / "plan.json"
+        # rendered shots are kept next to the output until the edit is done: a retry reuses them
+        rwork = outp.parent / ".ei-work" / outp.stem
+        rwork.mkdir(parents=True, exist_ok=True)
+        rplan = rwork / "plan.json"
         rplan.write_text(json.dumps({**plan, "lines": []}, default=float))
         video = Path(tmp) / "video.mp4"
-        render.render(rplan, str(video), workers=workers)
+        with ac.stage("rendering"):
+            render.render(rplan, str(video), workers=workers)
         sound = Path(tmp) / "sound.wav"
         vtotal = sum(s["frames"] for s in shots) / fps
+        sounding = contextlib.ExitStack()
+        sounding.enter_context(ac.stage("sound"))
         if sound_opts:  # voice + clip sound first, then the score over it (ducking under the voice alone)
             import score
 
@@ -650,7 +662,13 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
         partial.replace(outp)
     import shutil
 
+    sounding.close()
     shutil.rmtree(work, ignore_errors=True)
+    shutil.rmtree(outp.parent / ".ei-work" / outp.stem, ignore_errors=True)  # the edit is done: its kept shots are not needed
+    try:
+        (outp.parent / ".ei-work").rmdir()
+    except OSError:
+        pass
     if words:
         outp.with_suffix(".srt").write_text(ac.to_srt(ac.group_words(words, max_words=7, max_chars=42)), encoding="utf-8")
     log(f"done: {outp.name} in {time.time() - t0:.0f}s")

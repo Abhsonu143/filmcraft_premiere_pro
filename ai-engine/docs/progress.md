@@ -1,5 +1,33 @@
 # Progress
 
+## 2026-11-14: why a topic video took an hour and failed; faster, resumable, queued, with progress
+
+- **The failure:** two parallel render workers made the same shot (the cold open reused a photo), shared one
+  temporary file, and one crashed (`FileNotFoundError … shot_….part.mp4`). Fixed: each worker writes its own
+  file, and a shot used twice is rendered once.
+- **Why it was slow:**
+  - **IPv6 that does not route.** Python tried IPv6 first and waited ~30 s for every web request
+    (picture searches 21–33 s each; curl answered in 0.9 s). The engine now resolves IPv4 first, and yt-dlp runs
+    with `--force-ipv4`. Wikimedia search: 21 s -> 0.5 s.
+  - **Searches and voice ran one after the other.** Picture searches now run 6 at a time, and media is
+    collected while the voice is spoken. Test: 11 searches in 25 s, 13 media items in 63 s (before: 16 items in
+    27 min).
+  - **Two takes of every voice passage.** Now one take each, and a second take only where the first is unclear
+    or sounds less like you than the rest (best of two where it matters).
+- **Resumable:**
+  - Every stage records what it made (`progress.json` in the topic folder), and voice takes and rendered shots are
+    kept in `.ei-work/` until the job is done. A stage whose inputs did not change is not run again.
+  - Test: a 30 s video stopped during the edit finished on the second run in 43 s, reusing the research,
+    script, narration and media.
+- **AI Jobs window:**
+  - A progress bar per job (stage, %, time left; the engine reports `EI_PROGRESS`).
+  - Pause/Resume and Cancel act on the whole process group (ffmpeg and model workers too).
+  - Retry continues from what was made.
+  - Logs are selectable and copyable (Copy Log).
+- **Queue (Video from Topic ▸ Add to Queue):** one at a time; Pause/Resume Queue, Remove, Cancel All Queued,
+  Cancel Current and Queued. It is kept on disk: quitting EI puts a running queued video back at the front, and
+  the saved queue comes back paused.
+
 ## 2026-11-13 (night): subtle music, 4K, hook library, voiceover craft
 
 - **Music felt, not noticed:**

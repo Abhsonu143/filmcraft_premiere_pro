@@ -111,10 +111,11 @@ def yt_dlp_cmd() -> list[str]:
     """yt-dlp from EI's own Python (kept current with pip; YouTube changes often), else the system one."""
     import importlib.util
 
+    # --force-ipv4: on networks where IPv6 does not route, every request would wait ~30 s first
     if importlib.util.find_spec("yt_dlp") is not None:
-        return [sys.executable, "-m", "yt_dlp"]
+        return [sys.executable, "-m", "yt_dlp", "--force-ipv4"]
     if shutil.which("yt-dlp"):
-        return ["yt-dlp"]
+        return ["yt-dlp", "--force-ipv4"]
     raise AutocutError("yt-dlp is not installed (AI Engine Setup installs it)")
 
 

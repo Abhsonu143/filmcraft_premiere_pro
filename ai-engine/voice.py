@@ -33,6 +33,8 @@ Use it only for your own voice (or with the speaker's consent).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import math
 import os
@@ -657,7 +659,8 @@ def _speak_worker(jobs: list[dict], engine: str, repo: str) -> list[dict]:
 
     model = load_model(repo)
     out = []
-    for j in jobs:
+    for k, j in enumerate(jobs):
+        ac.progress_count(k, len(jobs), "takes")
         kw = {"text": j["text"], "ref_audio": j["ref"]}
         kw.update(lang_code=j["lang"], **j.get("params", {}))
         try:
@@ -671,6 +674,7 @@ def _speak_worker(jobs: list[dict], engine: str, repo: str) -> list[dict]:
             out.append({"out": j["out"], "ok": True})
         except Exception as e:  # one bad line must not lose the rest
             out.append({"out": j["out"], "ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
+    ac.progress_count(len(jobs), len(jobs), "takes")
     return out
 
 
@@ -782,38 +786,75 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
     anchors = {lg: anchor_ref(prof, d, lg) for lg in {c["lang"] for c in chunks}}
     for lg, (path, refs) in anchors.items():
         log(f"voice sample ({lg}): {', '.join(refs)} ({len(read_wav(path)) / SR:.1f}s), the same for every line")
+    # takes are kept next to the output until the narration is done: a stopped or failed run
+    # continues where it was (only the missing takes are spoken again)
+    work = outp.parent / ".ei-work" / outp.stem / "takes"
+    work.mkdir(parents=True, exist_ok=True)
+    anchor_keys = {lg: hashlib.sha1(Path(a[0]).read_bytes()).hexdigest()[:12] for lg, a in anchors.items()}
+    ac.progress_plan({"first takes": 0.62, "checking": 0.13, "better takes": 0.2, "assembling": 0.05})
     with tempfile.TemporaryDirectory(prefix="ei-speak-") as tmp:
         cands: dict[int, list[dict]] = {}
-        pending = list(range(len(chunks)))
-        for round_ in range(2):  # a second round regenerates passages that came out wrong
-            jobs = []
+        # 1 take of every passage; more takes only where the first is unclear or sounds less like
+        # you than the others (best of two where it matters); a last retry for what is still wrong
+        rounds = [("first takes", list(range(len(chunks))), 1)]
+        for round_ in range(3):
+            if round_ >= len(rounds):
+                break
+            stage_name, pending, n_takes = rounds[round_]
+            jobs, cached = [], []
             for ci in pending:
                 c = chunks[ci]
-                for t in range(takes):
-                    jobs.append({"chunk": ci, "text": c["text"], "lang": c["lang"], "ref": anchors[c["lang"]][0],
-                                 "params": engine_params({"energy": c["energy"], "pace": c["pace"], "emotion": c.get("emotion"), "intensity": c.get("intensity", 0.6)}, eng), "seed": 1000 * round_ + 17 * ci + t,
-                                 "out": str(Path(tmp) / f"c{ci:03d}_r{round_}_t{t}.wav")})
-            log(f"speaking {len(pending)} passage(s) ({sum(len(chunks[ci]['lines']) for ci in pending)} lines) × {takes} take(s) with {ENGINES[eng]['label']}"
-                + (" (retry)" if round_ else ""))
-            res = ac.run_isolated(_speak_worker, jobs, eng, ENGINES[eng]["repo"])
+                params = engine_params({"energy": c["energy"], "pace": c["pace"], "emotion": c.get("emotion"), "intensity": c.get("intensity", 0.6)}, eng)
+                for t in range(n_takes):
+                    seed = 1000 * round_ + 17 * ci + t
+                    key = hashlib.sha1(json.dumps([eng, c["text"], c["lang"], params, seed, anchor_keys[c["lang"]]], ensure_ascii=False).encode()).hexdigest()[:20]
+                    j = {"chunk": ci, "text": c["text"], "lang": c["lang"], "ref": anchors[c["lang"]][0], "params": params, "seed": seed,
+                         "out": str(work / f"{key}.wav"), "meta": str(work / f"{key}.json")}
+                    (cached if Path(j["out"]).is_file() and Path(j["meta"]).is_file() else jobs).append(j)
+            log(f"speaking {len(pending)} passage(s) ({sum(len(chunks[ci]['lines']) for ci in pending)} lines) × {n_takes} take(s) with {ENGINES[eng]['label']}"
+                + (f", {len(cached)} take(s) kept from before" if cached else "") + (f" ({stage_name})" if round_ else ""))
+            with ac.stage(stage_name if stage_name != "retry" else "better takes"):
+                res = ac.run_isolated(_speak_worker, jobs, eng, ENGINES[eng]["repo"]) if jobs else []
             ok = [j for j, r in zip(jobs, res) if r.get("ok")]
             for j, r in zip(jobs, res):
                 if not r.get("ok"):
                     log(f"passage {j['chunk'] + 1}: {r.get('error')}")
-            if not ok:
-                break
-            heard = asr([(j["out"], j["lang"]) for j in ok], {"en": whisper_model, "hi": whisper_model} if whisper_model else None)
-            embs = embed([j["out"] for j in ok]) if centroid is not None else [None] * len(ok)
-            for j, h, e in zip(ok, heard, embs):
-                y = read_wav(j["out"])
-                cps = len(norm_text(chunks[j["chunk"]]["text"])) / max(0.3, len(y) / SR)
-                cands.setdefault(j["chunk"], []).append({"file": j["out"], "cer": round(speech_error(h, chunks[j["chunk"]]["text"]), 3),
-                                                         "sim": None if e is None or centroid is None else round(float(e @ centroid), 3),
-                                                         "emb": e, "heard": h.strip(), "cps": round(cps, 1)})
+            with ac.stage("checking") if round_ == 0 else contextlib.nullcontext():
+                if ok:
+                    heard = asr([(j["out"], j["lang"]) for j in ok], {"en": whisper_model, "hi": whisper_model} if whisper_model else None)
+                    embs = embed([j["out"] for j in ok]) if centroid is not None else [None] * len(ok)
+                    for j, h, e in zip(ok, heard, embs):
+                        y = read_wav(j["out"])
+                        cps = len(norm_text(chunks[j["chunk"]]["text"])) / max(0.3, len(y) / SR)
+                        meta = {"cer": round(speech_error(h, chunks[j["chunk"]]["text"]), 3),
+                                "sim": None if e is None or centroid is None else round(float(e @ centroid), 3),
+                                "emb": None if e is None else [float(x) for x in e], "heard": h.strip(), "cps": round(cps, 1)}
+                        Path(j["meta"]).write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+                        cached.append(j)
+                for j in cached:
+                    try:
+                        meta = json.loads(Path(j["meta"]).read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    emb = np.asarray(meta["emb"], dtype=np.float32) if meta.get("emb") is not None else None
+                    cands.setdefault(j["chunk"], []).append({"file": j["out"], "cer": meta["cer"], "sim": meta["sim"], "emb": emb,
+                                                             "heard": meta.get("heard", ""), "cps": meta.get("cps", 0.0)})
             best = pick_takes(chunks, cands)
-            pending = [ci for ci in range(len(chunks)) if ci not in best or best[ci]["cer"] > 0.35 or (best[ci]["sim"] is not None and best[ci]["sim"] < 0.5)]
-            if not pending:
-                break
+            sims = [b["sim"] for b in best.values() if b.get("sim") is not None]
+            med = float(np.median(sims)) if sims else None
+            bad = [ci for ci in range(len(chunks)) if ci not in best or best[ci]["cer"] > 0.35 or (best[ci]["sim"] is not None and best[ci]["sim"] < 0.5)]
+            weak = [ci for ci in range(len(chunks)) if ci in best and ci not in bad and len(cands.get(ci, [])) < takes
+                    and (best[ci]["cer"] > 0.12 or (med is not None and best[ci]["sim"] is not None and best[ci]["sim"] < med - 0.05))]
+            if round_ == 0 and (bad or weak) and takes >= 1:
+                rounds.append(("better takes", sorted(set(bad) | set(weak)), max(1, takes - 1) if not bad else max(2, takes - 1)))
+                log(f"{len(chunks) - len(bad) - len(weak)} of {len(chunks)} passage(s) are good at the first take; "
+                    f"{len(weak)} get another take, {len(bad)} are spoken again")
+            elif round_ == 1 and bad:
+                rounds.append(("retry", bad, 2))
+            elif round_ == 0:
+                log(f"all {len(chunks)} passage(s) are good at the first take")
+        with ac.stage("better takes"):  # (done, or not needed)
+            pass
         best = pick_takes(chunks, cands)
         missing = [ci for ci in range(len(chunks)) if ci not in best]
         if missing:
@@ -852,6 +893,11 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
                  "duration": round(t, 3), "segments": timeline}
     nj = outp.with_suffix(".narration.json")
     nj.write_text(json.dumps(narration, ensure_ascii=False, indent=1), encoding="utf-8")
+    shutil.rmtree(work.parent, ignore_errors=True)  # the narration is done: the kept takes are no longer needed
+    try:
+        work.parent.parent.rmdir()  # (.ei-work, when nothing else is in it)
+    except OSError:
+        pass
     sims = [best[ci]["sim"] for ci in best if best[ci]["sim"] is not None]
     log(f"narration {t:.1f}s, {len(segs)} lines in {len(chunks)} passages in {time.time() - t0:.0f}s"
         + (f"; voice match {np.mean(sims):.2f} (lowest {min(sims):.2f})" if sims else "")

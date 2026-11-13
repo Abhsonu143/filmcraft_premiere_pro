@@ -1519,9 +1519,27 @@ struct Job {
     imported: bool,
     started: Instant,
     elapsed: Option<Duration>,
+    /// What ran (for Retry and the queue) and where.
+    steps: Vec<Vec<String>>,
+    cwd: Option<PathBuf>,
+    /// The engine process (its process group holds ffmpeg and model workers too).
+    pid: Option<u32>,
+    /// The engine's own estimate: (fraction done, current stage).
+    progress: Option<(f32, String)>,
+    paused_since: Option<Instant>,
+    paused_total: Duration,
+    /// Started from the queue (the next queued job waits for it).
+    queued: bool,
 }
 
 impl Job {
+    /// Time spent working (pauses not counted).
+    fn active(&self) -> Duration {
+        let total = self.elapsed.unwrap_or_else(|| self.started.elapsed());
+        let paused = self.paused_total + self.paused_since.map(|t| t.elapsed()).unwrap_or_default();
+        total.saturating_sub(paused)
+    }
+
     fn summary(&self) -> Value {
         json!({
             "job": self.id,
@@ -1531,6 +1549,10 @@ impl Job {
             "error": self.error,
             "seconds": self.elapsed.unwrap_or_else(|| self.started.elapsed()).as_secs_f64(),
             "lastLog": self.log.last(),
+            "progress": self.progress.as_ref().map(|p| p.0),
+            "stage": self.progress.as_ref().map(|p| p.1.clone()),
+            "paused": self.paused_since.is_some(),
+            "queued": self.queued,
         })
     }
 }
@@ -1558,6 +1580,10 @@ fn push_log(id: u64, line: String) {
 /// Start a job that runs `steps` (programs with arguments) one after another in a background
 /// thread. The last `EI_RESULT` line any step prints becomes the job's result.
 fn start_job(title: String, kind: Option<Kind>, steps: Vec<Vec<String>>, import: bool, cwd: Option<PathBuf>) -> u64 {
+    start_job_ex(title, kind, steps, import, cwd, false)
+}
+
+fn start_job_ex(title: String, kind: Option<Kind>, steps: Vec<Vec<String>>, import: bool, cwd: Option<PathBuf>, queued: bool) -> u64 {
     static NEXT: OnceLock<Mutex<u64>> = OnceLock::new();
     let id = {
         let mut n = NEXT.get_or_init(|| Mutex::new(0)).lock().unwrap_or_else(PoisonError::into_inner);
@@ -1588,6 +1614,13 @@ fn start_job(title: String, kind: Option<Kind>, steps: Vec<Vec<String>>, import:
             imported: false,
             started: Instant::now(),
             elapsed: None,
+            steps: steps.clone(),
+            cwd: cwd.clone(),
+            pid: None,
+            progress: None,
+            paused_since: None,
+            paused_total: Duration::ZERO,
+            queued,
         });
     }
     let spawned = std::thread::Builder::new().name(format!("ei-ai-job-{id}")).spawn(move || {
@@ -1601,7 +1634,14 @@ fn start_job(title: String, kind: Option<Kind>, steps: Vec<Vec<String>>, import:
             j.status = status;
             j.error = error;
             j.child = None;
+            j.pid = None;
+            if let Some(t) = j.paused_since.take() {
+                j.paused_total += t.elapsed();
+            }
             j.elapsed = Some(j.started.elapsed());
+            if status == Status::Done {
+                j.progress = Some((1.0, String::new()));
+            }
         });
     });
     if let Err(e) = spawned {
@@ -1625,14 +1665,28 @@ fn run_steps(id: u64, steps: &[Vec<String>], cwd: Option<&Path>) -> Result<(), S
         if let Some(d) = cwd {
             cmd.current_dir(d);
         }
+        #[cfg(unix)]
+        {
+            // its own process group: pause, resume and cancel reach ffmpeg and model workers too
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let mut child = cmd.spawn().map_err(|e| format!("could not run {prog}: {e}"))?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let pid = child.id();
         let child = Arc::new(Mutex::new(child));
-        with_job(id, |j| j.child = Some(child.clone()));
+        with_job(id, |j| {
+            j.child = Some(child.clone());
+            j.pid = Some(pid);
+        });
         let err_thread = stderr.map(|s| {
             std::thread::spawn(move || {
                 for line in BufReader::new(s).lines().map_while(Result::ok) {
+                    if let Some(p) = parse_progress(&line) {
+                        with_job(id, |j| j.progress = Some(p));
+                        continue;
+                    }
                     let line = line.strip_prefix("[autocut] ").map(str::to_string).unwrap_or(line);
                     if !line.trim().is_empty() {
                         push_log(id, line);
@@ -1675,6 +1729,7 @@ fn run_steps(id: u64, steps: &[Vec<String>], cwd: Option<&Path>) -> Result<(), S
 
 /// Stop every running AI job (EI is quitting: no engine process, recording or model keeps running).
 pub fn cancel_all() {
+    requeue_running();
     let ids: Vec<u64> = jobs().lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|j| j.status == Status::Running).map(|j| j.id).collect();
     for id in ids {
         cancel_job(id);
@@ -1684,12 +1739,217 @@ pub fn cancel_all() {
 fn cancel_job(id: u64) -> bool {
     with_job(id, |j| {
         j.cancel = true;
+        if let Some(pid) = j.pid {
+            signal_group(pid, "TERM");
+            if j.paused_since.is_some() {
+                signal_group(pid, "CONT"); // a stopped process can only exit once it runs again
+            }
+        }
         if let Some(c) = &j.child {
             let _ = c.lock().unwrap_or_else(PoisonError::into_inner).kill();
         }
         j.status == Status::Running
     })
     .unwrap_or(false)
+}
+
+/// `EI_PROGRESS {"fraction": 0.42, "stage": "voice"}` -> (0.42, "voice").
+fn parse_progress(line: &str) -> Option<(f32, String)> {
+    let v: Value = serde_json::from_str(line.strip_prefix("EI_PROGRESS ")?).ok()?;
+    let f = v.get("fraction").and_then(Value::as_f64).filter(|f| f.is_finite())?.clamp(0.0, 1.0) as f32;
+    Some((f, v.get("stage").and_then(Value::as_str).unwrap_or_default().to_string()))
+}
+
+/// Send a signal to a job's whole process group (the engine, ffmpeg, model workers).
+fn signal_group(pid: u32, sig: &str) {
+    if pid == 0 {
+        return;
+    }
+    let _ = Command::new("/bin/kill")
+        .args([format!("-{sig}"), "--".to_string(), format!("-{pid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Pause (true) or resume (false) a running job. Returns whether anything changed.
+fn pause_job(id: u64, pause: bool) -> bool {
+    with_job(id, |j| {
+        let Some(pid) = j.pid.filter(|_| j.status == Status::Running) else { return false };
+        match (pause, j.paused_since) {
+            (true, None) => {
+                signal_group(pid, "STOP");
+                j.paused_since = Some(Instant::now());
+                push_log_locked(j, "Paused".into());
+                true
+            }
+            (false, Some(t)) => {
+                signal_group(pid, "CONT");
+                j.paused_total += t.elapsed();
+                j.paused_since = None;
+                push_log_locked(j, "Resumed".into());
+                true
+            }
+            _ => false,
+        }
+    })
+    .unwrap_or(false)
+}
+
+fn push_log_locked(j: &mut Job, line: String) {
+    j.log.push(line);
+    if j.log.len() > MAX_LOG {
+        let extra = j.log.len() - MAX_LOG;
+        j.log.drain(..extra);
+    }
+}
+
+/// Run a finished, failed or cancelled job again. The engine keeps what each stage made (research,
+/// script, voice takes, media, rendered shots), so a retry continues where the job stopped.
+fn retry_job(id: u64) -> Option<u64> {
+    let (title, kind, steps, import, cwd) =
+        with_job(id, |j| (j.status != Status::Running).then(|| (j.title.clone(), j.kind, j.steps.clone(), j.import, j.cwd.clone())))??;
+    if steps.is_empty() {
+        return None;
+    }
+    let title = if title.ends_with(" (retry)") { title } else { format!("{title} (retry)") };
+    Some(start_job(title, kind, steps, import, cwd))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Queue (Video from Topic): one job at a time, kept on disk so it survives quitting EI
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct QueueItem {
+    title: String,
+    kind: String,
+    steps: Vec<Vec<String>>,
+    import: bool,
+    cwd: Option<String>,
+}
+
+#[derive(Default)]
+struct QueueState {
+    items: Vec<QueueItem>,
+    paused: bool,
+    loaded: bool,
+    note: String,
+}
+
+fn queue() -> &'static Mutex<QueueState> {
+    static Q: OnceLock<Mutex<QueueState>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(QueueState::default()))
+}
+
+fn queue_path() -> PathBuf {
+    settings_path().parent().map(Path::to_path_buf).unwrap_or_else(support_dir).join("queue.json")
+}
+
+fn save_queue(q: &QueueState) {
+    let path = queue_path();
+    if q.items.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(t) = serde_json::to_string_pretty(&json!({"items": q.items, "paused": q.paused})) {
+        let tmp = path.with_extension("json.part");
+        if std::fs::write(&tmp, t).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// The queue saved when EI last quit (paused: it waits for Resume).
+fn load_queue(q: &mut QueueState) {
+    if q.loaded {
+        return;
+    }
+    q.loaded = true;
+    let Ok(t) = std::fs::read_to_string(queue_path()) else { return };
+    let Ok(v) = serde_json::from_str::<Value>(&t) else { return };
+    let items: Vec<QueueItem> = v.get("items").and_then(|i| serde_json::from_value(i.clone()).ok()).unwrap_or_default();
+    if !items.is_empty() {
+        q.note = format!("{} video(s) waiting from last time: press Resume Queue to continue", items.len());
+        q.items = items;
+        q.paused = true;
+    }
+}
+
+fn enqueue(title: String, kind: Kind, steps: Vec<Vec<String>>, import: bool, cwd: Option<PathBuf>) -> usize {
+    let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+    load_queue(&mut q);
+    q.items.push(QueueItem { title, kind: kind.id().to_string(), steps, import, cwd: cwd.map(|c| c.to_string_lossy().to_string()) });
+    save_queue(&q);
+    q.items.len()
+}
+
+/// Start the next queued job when nothing from the queue is running (called every frame).
+fn tick_queue() {
+    let busy = jobs().lock().unwrap_or_else(PoisonError::into_inner).iter().any(|j| j.queued && j.status == Status::Running);
+    let next = {
+        let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+        load_queue(&mut q);
+        if busy || q.paused || q.items.is_empty() {
+            return;
+        }
+        let it = q.items.remove(0);
+        save_queue(&q);
+        it
+    };
+    let kind = Kind::from_command(&format!("ai.{}", next.kind));
+    let _ = start_job_ex(next.title, kind, next.steps, next.import, next.cwd.map(PathBuf::from), true);
+}
+
+/// Cancel what the queue is running and everything waiting in it.
+fn cancel_queue(include_current: bool) -> usize {
+    let n = {
+        let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+        let n = q.items.len();
+        q.items.clear();
+        q.note.clear();
+        save_queue(&q);
+        n
+    };
+    if include_current {
+        let ids: Vec<u64> =
+            jobs().lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|j| j.queued && j.status == Status::Running).map(|j| j.id).collect();
+        for id in ids {
+            cancel_job(id);
+        }
+    }
+    n
+}
+
+/// EI is quitting: a queued job that is still running goes back to the front of the saved queue
+/// (it continues from its saved stages next time).
+fn requeue_running() {
+    let running: Vec<QueueItem> = jobs()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|j| j.queued && j.status == Status::Running)
+        .map(|j| QueueItem {
+            title: j.title.clone(),
+            kind: j.kind.map(Kind::id).unwrap_or("topic").to_string(),
+            steps: j.steps.clone(),
+            import: j.import,
+            cwd: j.cwd.as_ref().map(|c| c.to_string_lossy().to_string()),
+        })
+        .collect();
+    if running.is_empty() {
+        return;
+    }
+    let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+    load_queue(&mut q);
+    for (k, it) in running.into_iter().enumerate() {
+        q.items.insert(k, it);
+    }
+    save_queue(&q);
 }
 
 /// Run a draft: returns the job id.
@@ -1714,6 +1974,16 @@ fn run_draft(d: &mut Draft) -> Result<u64, String> {
         },
     };
     Ok(start_job(title, Some(d.kind), vec![step], d.import, Some(engine)))
+}
+
+/// Put a draft in the queue instead of running it now. Returns the number waiting.
+fn queue_draft(d: &mut Draft) -> Result<usize, String> {
+    let args = d.engine_args()?;
+    let engine = engine_dir().ok_or("The AI engine was not found. Reinstall EI, or set EI_ENGINE_DIR to the ai-engine folder.")?;
+    let mut step = vec![python(Some(&engine)).to_string_lossy().to_string(), engine.join("ei_engine.py").to_string_lossy().to_string()];
+    step.extend(args);
+    let title = format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>());
+    Ok(enqueue(title, d.kind, vec![step], d.import, Some(engine)))
 }
 
 fn install_steps() -> Result<Vec<Vec<String>>, String> {
@@ -1758,6 +2028,28 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             Some(j) => Ok(json!({"cancelled": cancel_job(j)})),
             None => Err("ai.cancel needs {job}".into()),
         },
+        "ai.pause" | "ai.resume" => match params.get("job").and_then(Value::as_u64) {
+            Some(j) => Ok(json!({"changed": pause_job(j, id == "ai.pause")})),
+            None => Err(format!("{id} needs {{job}}")),
+        },
+        "ai.retry" => match params.get("job").and_then(Value::as_u64) {
+            Some(j) => retry_job(j).map(|n| json!({"job": n})).ok_or_else(|| "that job cannot be run again (still running, or unknown)".to_string()),
+            None => Err("ai.retry needs {job}".into()),
+        },
+        "ai.queue" => {
+            let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+            load_queue(&mut q);
+            if let Some(p) = params.get("paused").and_then(Value::as_bool) {
+                q.paused = p;
+                q.note.clear();
+                save_queue(&q);
+            }
+            Ok(json!({"waiting": q.items.iter().map(|i| i.title.clone()).collect::<Vec<_>>(), "paused": q.paused}))
+        }
+        "ai.queueCancel" => {
+            let all = params.get("current").and_then(Value::as_bool).unwrap_or(false);
+            Ok(json!({"removed": cancel_queue(all)}))
+        }
         "ai.setup" => {
             ctx.data_mut(|m| m.insert_temp(setup_open_id(), true));
             if let Some(k) = params.get("llm").and_then(Value::as_str) {
@@ -1776,7 +2068,13 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
         }
         _ => {
             let Some(kind) = Kind::from_command(id) else { return Some(Err(format!("unknown AI command `{id}`"))) };
-            if has_params {
+            if has_params && params.get("queue").and_then(Value::as_bool).unwrap_or(false) {
+                let mut d = Draft::from_params(kind, params);
+                queue_draft(&mut d).map(|n| {
+                    ctx.data_mut(|m| m.insert_temp(jobs_open_id(), true));
+                    json!({"queued": n})
+                })
+            } else if has_params {
                 let mut d = Draft::from_params(kind, params);
                 run_draft(&mut d).map(|job| {
                     ctx.data_mut(|m| m.insert_temp(jobs_open_id(), true));
@@ -1811,6 +2109,7 @@ enum Pick {
 }
 
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
+    tick_queue();
     show_draft(app, ctx);
     show_jobs(app, ctx);
     show_setup(app, ctx);
@@ -2030,6 +2329,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let p = format!("ai.{}", d.kind.id());
     let mut close = false;
     let mut run = false;
+    let mut add_to_queue = false;
     let mut pick: Option<Pick> = None;
     let mut learn_style = false;
     let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
@@ -2643,6 +2943,13 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Speak => "Speak",
                     _ => "Run",
                 };
+                if d.kind == Kind::Topic {
+                    let q = ui.button("Add to Queue");
+                    elems.push((format!("{p}.queue"), q.rect, "Add to Queue".into()));
+                    if q.clicked() {
+                        add_to_queue = true;
+                    }
+                }
                 let o = ui.add(egui::Button::new(egui::RichText::new(run_label).color(egui::Color32::WHITE)).fill(app.tokens.accent));
                 elems.push((format!("{p}.run"), o.rect, "Run".into()));
                 if o.clicked() {
@@ -2753,6 +3060,18 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
     poll_tv(&mut d);
     if run && d.kind == Kind::Tv && !d.tv_folder.trim().is_empty() {
         let _ = save_setting("tv_recordings", d.tv_folder.trim());
+    }
+    if add_to_queue {
+        match queue_draft(&mut d) {
+            Ok(n) => {
+                app.ui.status = format!("Added to the queue ({n} waiting; AI ▸ AI Jobs shows it)");
+                ctx.data_mut(|m| m.insert_temp(jobs_open_id(), true));
+                d.error.clear();
+                d.topic.clear(); // ready for the next topic
+                d.hook_line.clear();
+            }
+            Err(e) => d.error = e,
+        }
     }
     if run {
         match run_draft(&mut d) {
@@ -3426,10 +3745,14 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         last: String,
         error: String,
         secs: f64,
+        progress: Option<(f32, String)>,
+        paused: bool,
+        queued: bool,
+        retry: bool,
         outputs: Vec<String>,
         out_dir: Option<String>,
         importable: bool,
-        log: Vec<String>,
+        log: String,
     }
     let rows: Vec<Row> = jobs()
         .lock()
@@ -3441,13 +3764,17 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
             title: j.title.clone(),
             status: j.status,
             // the newest progress line (a "$ command" line means the step just started)
-            last: match j.log.last() {
+            last: match j.log.iter().rev().find(|l| l.as_str() != "Paused" && l.as_str() != "Resumed") {
                 Some(l) if l.starts_with("$ ") => "Starting…".to_string(),
                 Some(l) => l.clone(),
                 None => "Starting…".to_string(),
             },
             error: j.error.clone(),
-            secs: j.elapsed.unwrap_or_else(|| j.started.elapsed()).as_secs_f64(),
+            secs: j.active().as_secs_f64(),
+            progress: j.progress.clone(),
+            paused: j.paused_since.is_some(),
+            queued: j.queued,
+            retry: j.status != Status::Running && !j.steps.is_empty(),
             outputs: j
                 .result
                 .get("outputs")
@@ -3456,22 +3783,70 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 .unwrap_or_default(),
             out_dir: j.result.get("out_dir").and_then(Value::as_str).map(str::to_string),
             importable: j.kind.is_some() && j.status == Status::Done,
-            log: j.log.iter().rev().take(12).rev().cloned().collect(),
+            log: j.log.join("\n"),
         })
         .collect();
+    let (waiting, queue_paused, queue_note) = {
+        let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+        load_queue(&mut q);
+        (q.items.iter().map(|i| i.title.clone()).collect::<Vec<_>>(), q.paused, q.note.clone())
+    };
     let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
     let mut cancel: Option<u64> = None;
+    let mut pause: Option<(u64, bool)> = None;
+    let mut retry: Option<u64> = None;
     let mut reveal: Option<String> = None;
     let mut open_file: Option<String> = None;
     let mut import: Option<u64> = None;
+    let mut copy: Option<String> = None;
+    let mut queue_action: Option<&str> = None;
+    let mut remove_waiting: Option<usize> = None;
     let mut clear = false;
-    egui::Window::new("AI Jobs").id(egui::Id::new("ei-ai-jobs")).open(&mut open).default_width(560.0).resizable(true).show(ctx, |ui| {
-        if rows.is_empty() {
+    egui::Window::new("AI Jobs").id(egui::Id::new("ei-ai-jobs")).open(&mut open).default_width(600.0).resizable(true).show(ctx, |ui| {
+        // the queue (Video from Topic): what waits, and its controls
+        if !waiting.is_empty() || queue_paused {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(format!("Queue: {} waiting{}", waiting.len(), if queue_paused { " (paused)" } else { "" }));
+                    let b = ui.button(if queue_paused { "Resume Queue" } else { "Pause Queue" });
+                    elems.push(("ai.jobs.queue.pause".into(), b.rect, b.clicked().to_string()));
+                    if b.clicked() {
+                        queue_action = Some(if queue_paused { "resume" } else { "pause" });
+                    }
+                    let c = ui.button("Cancel All Queued");
+                    elems.push(("ai.jobs.queue.cancelAll".into(), c.rect, "Cancel All Queued".into()));
+                    if c.clicked() {
+                        queue_action = Some("clear");
+                    }
+                    let c2 = ui.button("Cancel Current and Queued");
+                    elems.push(("ai.jobs.queue.cancelEverything".into(), c2.rect, "Cancel Current and Queued".into()));
+                    if c2.clicked() {
+                        queue_action = Some("everything");
+                    }
+                });
+                if !queue_note.is_empty() {
+                    ui.weak(&queue_note);
+                }
+                for (k, t) in waiting.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}. {t}", k + 1));
+                        let r = ui.small_button("Remove");
+                        elems.push((format!("ai.jobs.queue.{k}.remove"), r.rect, "Remove".into()));
+                        if r.clicked() {
+                            remove_waiting = Some(k);
+                        }
+                    });
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if rows.is_empty() && waiting.is_empty() {
             ui.label("No AI jobs yet. Start one from the AI menu.");
         }
-        egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
             for r in &rows {
                 let (icon, color) = match r.status {
+                    Status::Running if r.paused => ("⏸", egui::Color32::from_rgb(0x9A, 0x9A, 0xA8)),
                     Status::Running => ("⏳", egui::Color32::from_rgb(0xE0, 0xB0, 0x40)),
                     Status::Done => ("✔", egui::Color32::from_rgb(0x5C, 0xC0, 0x7A)),
                     Status::Failed => ("✖", egui::Color32::from_rgb(0xE5, 0x6B, 0x6B)),
@@ -3480,11 +3855,27 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 ui.horizontal(|ui| {
                     ui.colored_label(color, icon);
                     ui.strong(&r.title);
-                    ui.weak(format!("{:.0}s", r.secs));
+                    if r.queued {
+                        ui.weak("(queue)");
+                    }
+                    ui.weak(fmt_duration(r.secs));
                 });
                 match r.status {
                     Status::Running => {
-                        ui.label(&r.last);
+                        let (frac, stage) = r.progress.clone().unwrap_or((0.0, String::new()));
+                        let left = remaining(r.secs, frac).map(|t| format!(" · about {} left", fmt_duration(t))).unwrap_or_default();
+                        let what = if r.paused {
+                            "paused".to_string()
+                        } else if stage.is_empty() {
+                            "working".to_string()
+                        } else {
+                            stage.clone()
+                        };
+                        let bar =
+                            egui::ProgressBar::new(frac).text(format!("{:.0}% · {what}{left}", frac * 100.0)).desired_width(ui.available_width().min(560.0));
+                        let br = ui.add(if r.progress.is_none() && !r.paused { bar.animate(true) } else { bar });
+                        elems.push((format!("ai.jobs.{}.progress", r.id), br.rect, format!("{frac:.3}")));
+                        ui.weak(&r.last);
                     }
                     Status::Failed | Status::Cancelled => {
                         ui.colored_label(color, if r.error.is_empty() { "Stopped" } else { &r.error });
@@ -3501,10 +3892,22 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 ui.horizontal(|ui| {
                     let pid = format!("ai.jobs.{}", r.id);
                     if r.status == Status::Running {
+                        let pb = ui.button(if r.paused { "Resume" } else { "Pause" });
+                        elems.push((format!("{pid}.pause"), pb.rect, if r.paused { "Resume" } else { "Pause" }.into()));
+                        if pb.clicked() {
+                            pause = Some((r.id, !r.paused));
+                        }
                         let b = ui.button("Cancel");
                         elems.push((format!("{pid}.cancel"), b.rect, "Cancel".into()));
                         if b.clicked() {
                             cancel = Some(r.id);
+                        }
+                    }
+                    if r.retry && r.status != Status::Done {
+                        let b = ui.button("Retry").on_hover_text("Run it again: it continues from what was already made");
+                        elems.push((format!("{pid}.retry"), b.rect, "Retry".into()));
+                        if b.clicked() {
+                            retry = Some(r.id);
                         }
                     }
                     if let Some(first) = r.outputs.first() {
@@ -3528,9 +3931,17 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     }
                 });
                 egui::CollapsingHeader::new("Log").id_salt(("ei-ai-log", r.id)).show(ui, |ui| {
-                    for l in &r.log {
-                        ui.monospace(l);
+                    let c = ui.small_button("Copy Log");
+                    elems.push((format!("ai.jobs.{}.copyLog", r.id), c.rect, "Copy Log".into()));
+                    if c.clicked() {
+                        copy = Some(r.log.clone());
                     }
+                    // selectable text: drag to select, ⌘C to copy, ⌘A to select all
+                    let mut text: &str = &r.log;
+                    egui::ScrollArea::vertical().id_salt(("ei-ai-log-scroll", r.id)).max_height(220.0).stick_to_bottom(true).show(ui, |ui| {
+                        let t = ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(4));
+                        elems.push((format!("ai.jobs.{}.log", r.id), t.rect, String::new()));
+                    });
                 });
                 ui.separator();
             }
@@ -3542,8 +3953,42 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     for (id, r, l) in elems {
         app.auto.add(&id, r, &l);
     }
+    if let Some(t) = copy {
+        ctx.copy_text(t);
+        app.ui.status = "Log copied".into();
+    }
     if let Some(j) = cancel {
         cancel_job(j);
+    }
+    if let Some((j, p)) = pause {
+        pause_job(j, p);
+    }
+    if let Some(j) = retry
+        && retry_job(j).is_some()
+    {
+        app.ui.status = "Running it again: it continues from what was already made".into();
+    }
+    if let Some(k) = remove_waiting {
+        let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+        if k < q.items.len() {
+            q.items.remove(k);
+            save_queue(&q);
+        }
+    }
+    match queue_action {
+        Some("pause") | Some("resume") => {
+            let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+            q.paused = queue_action == Some("pause");
+            q.note.clear();
+            save_queue(&q);
+        }
+        Some("clear") => {
+            cancel_queue(false);
+        }
+        Some("everything") => {
+            cancel_queue(true);
+        }
+        _ => {}
     }
     for (path, reveal_it) in [(reveal, true), (open_file, false)] {
         if let Some(p) = path
@@ -3563,6 +4008,22 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         jobs().lock().unwrap_or_else(PoisonError::into_inner).retain(|j| j.status == Status::Running);
     }
     ctx.data_mut(|m| m.insert_temp(jobs_open_id(), open));
+}
+
+/// "45s", "3m 20s", "1h 05m".
+fn fmt_duration(secs: f64) -> String {
+    let s = if secs.is_finite() { secs.max(0.0) as u64 } else { 0 };
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m {:02}s", s / 60, s % 60),
+        _ => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// Time left from the time spent and the fraction done (None until there is enough to go on).
+fn remaining(spent: f64, frac: f32) -> Option<f64> {
+    let f = f64::from(frac);
+    ((0.03..0.999).contains(&f) && spent >= 5.0).then(|| spent * (1.0 - f) / f)
 }
 
 /// Import finished jobs' results into the project (on the UI thread: the session lives here).
@@ -3868,6 +4329,62 @@ mod tests {
         let mut off = Draft::from_params(Kind::Clips, &json!({"input": clip.to_string_lossy()}));
         assert!(!off.engine_args().unwrap().contains(&"--sound-design".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn progress_lines_and_times() {
+        assert_eq!(parse_progress(r#"EI_PROGRESS {"fraction": 0.42, "stage": "voice"}"#), Some((0.42, "voice".to_string())));
+        assert_eq!(parse_progress(r#"EI_PROGRESS {"fraction": 7, "stage": ""}"#), Some((1.0, String::new())));
+        assert_eq!(parse_progress("EI_PROGRESS not json"), None);
+        assert_eq!(parse_progress("progress 3/10 shots"), None);
+        assert_eq!(fmt_duration(42.4), "42s");
+        assert_eq!(fmt_duration(200.0), "3m 20s");
+        assert_eq!(fmt_duration(3751.0), "1h 02m");
+        assert_eq!(fmt_duration(f64::NAN), "0s");
+        assert_eq!(remaining(60.0, 0.25), Some(180.0));
+        assert_eq!(remaining(60.0, 0.01), None); // too early to tell
+        assert_eq!(remaining(2.0, 0.5), None);
+    }
+
+    #[test]
+    fn queue_items_round_trip() {
+        let it = QueueItem {
+            title: "Video from Topic: GTA 6".into(),
+            kind: "topic".into(),
+            steps: vec![vec!["python".into(), "ei_engine.py".into(), "topic".into(), "GTA 6".into()]],
+            import: false,
+            cwd: Some("/tmp".into()),
+        };
+        let v = json!({"items": [it.clone()], "paused": true});
+        let back: Vec<QueueItem> = serde_json::from_value(v["items"].clone()).unwrap();
+        assert_eq!(back, vec![it]);
+        assert_eq!(Kind::from_command(&format!("ai.{}", back[0].kind)), Some(Kind::Topic));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pause_resume_and_cancel_reach_the_whole_process_group() {
+        use std::os::unix::process::CommandExt;
+        // a shell with a child of its own (like the engine with ffmpeg)
+        let mut child = Command::new("/bin/sh").args(["-c", "sleep 30 & wait"]).process_group(0).spawn().unwrap();
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(300));
+        let state = |p: u32| {
+            let out = Command::new("/bin/ps").args(["-o", "stat=", "-g", &p.to_string()]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().chars().next().unwrap_or(' ')).collect::<String>()
+        };
+        signal_group(pid, "STOP");
+        std::thread::sleep(Duration::from_millis(200));
+        let s = state(pid);
+        assert!(!s.is_empty() && s.chars().all(|c| c == 'T'), "every process stopped: {s}");
+        signal_group(pid, "CONT");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!state(pid).contains('T'), "running again: {}", state(pid));
+        signal_group(pid, "TERM");
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(state(pid).is_empty(), "the child sleep is gone too: {}", state(pid));
     }
 
     #[test]

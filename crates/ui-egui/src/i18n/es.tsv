@@ -3504,6 +3504,11 @@
 	AI Jobs	Tareas de IA
 	AI Engine Setup…	Configurar el motor de IA…
 	Cancel AI Job	Cancelar tarea de IA
+	Pause AI Job	Pausar trabajo de IA
+	Resume AI Job	Reanudar trabajo de IA
+	Retry AI Job	Reintentar trabajo de IA
+	AI Queue	Cola de IA
+	Cancel AI Queue	Cancelar cola de IA
 	Based on FilmCraft…	Basado en FilmCraft…
 	A video editor with local AI auto-editing, based on the open-source FilmCraft editor.	Un editor de video con edición automática por IA local, basado en el editor de código abierto FilmCraft.
 	Ai	IA

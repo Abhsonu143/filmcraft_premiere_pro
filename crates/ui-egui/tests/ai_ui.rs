@@ -182,6 +182,7 @@ fn ai_menu_and_dialogs() {
                 "fresh",
                 "hookLine",
                 "findHook",
+                "queue",
                 "voice",
                 "free",
                 "cards",

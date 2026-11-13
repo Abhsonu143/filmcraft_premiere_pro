@@ -31,6 +31,7 @@ description.txt (ready to paste, with credits), media/, narration .wav and the v
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import re
@@ -360,11 +361,19 @@ def collect_media(script: dict, data: dict, folder: Path, sources: list[str], W:
             if i not in covered:
                 subj = nr.subject_only(s.get("visual") or s["text"]).split()
                 queries.append((i, " ".join(([topic_words] if topic_words else []) + subj[:3])))
-        for i, q in queries:
-            q = " ".join(q.split()[:6])
-            if not q:
-                continue
-            found = commons_search(q, 5) + openverse_search(q, 5)
+        queries = [(i, " ".join(q.split()[:6])) for i, q in queries if q.strip()]
+
+        def search(q: str) -> list[dict]:
+            return commons_search(q, 5) + openverse_search(q, 5)
+
+        # all searches at once (the picture sites answer slowly, not heavily)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            results = list(ex.map(search, [q for _, q in queries]))
+        log(f"searched {len(queries)} subjects in {time.time() - t0:.0f}s")
+        for qi, ((i, q), found) in enumerate(zip(queries, results), 1):
+            log(f"progress {qi}/{len(queries)} media")
             if i is not None and topic_words and len(found) < 2:
                 found += commons_search(f"{topic_words} {q}", 4)
             got = 0
@@ -374,11 +383,12 @@ def collect_media(script: dict, data: dict, folder: Path, sources: list[str], W:
                 seen.add(c["url"])
                 ext = Path(urllib.parse.urlparse(c["url"]).path).suffix.lower() or ".jpg"
                 k = len(items)
-                src = raw / f"m{k:03d}{ext}"
-                if not download(c["url"], src):
+                uid = hashlib.sha1(c["url"].encode()).hexdigest()[:10]  # the same picture keeps its files: a retry reuses them
+                src = raw / f"m{uid}{ext}"
+                if not (src.is_file() and src.stat().st_size >= 5000) and not download(c["url"], src):
                     continue
-                clip = folder / f"m{k:03d}_{'line' + str(i) if i is not None else 'topic'}.mp4"
-                ok = image_to_clip(src, clip, W, H, push_in=k % 2 == 0) if c["kind"] == "image" else _normalise_video(src, clip)
+                clip = folder / f"m{uid}_{W}x{H}_{'line' + str(i) if i is not None else 'topic'}.mp4"
+                ok = clip.is_file() or (image_to_clip(src, clip, W, H, push_in=k % 2 == 0) if c["kind"] == "image" else _normalise_video(src, clip))
                 if not ok:
                     continue
                 items.append({**c, "file": str(clip), "original": str(src), "query": q, "line": i})
@@ -452,6 +462,34 @@ def description_txt(data: dict, items: list[dict], script: dict) -> str:
 # ---------------------------------------------------------------------------------------------
 
 
+class State:
+    """What a topic folder already has (progress.json): a stage whose inputs did not change is
+    not run again, so a stopped or failed video continues where it was."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        try:
+            self.data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.data = {}
+
+    @staticmethod
+    def sig(*parts) -> str:
+        h = hashlib.sha1()
+        for x in parts:
+            h.update(x if isinstance(x, bytes) else json.dumps(x, sort_keys=True, default=str).encode())
+        return h.hexdigest()[:16]
+
+    def done(self, stage: str, sig: str) -> bool:
+        return self.data.get(stage) == sig
+
+    def mark(self, stage: str, sig: str) -> None:
+        self.data[stage] = sig
+        tmp = self.path.with_suffix(".json.part")
+        tmp.write_text(json.dumps(self.data, indent=1), encoding="utf-8")
+        tmp.replace(self.path)
+
+
 def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, language: str = "en", aspect: str = "horizontal", voice: str | None = None,
          script_only: bool = False, style: str | None = None, writer: str = "claude", model: str | None = None, tone: str = "", niche: str = "",
          sources: list[str] | None = None, footage: list[str] | None = None, music: str | None = None, captions: bool = True,
@@ -472,6 +510,9 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
     name = sw.safe(re.sub(r"https?://(www\.)?", "", topic))[:50] or "topic"
     folder = Path(out_dir).expanduser().resolve() if out_dir else Path.home() / "Movies" / "EI" / "Topics" / name
     folder.mkdir(parents=True, exist_ok=True)
+    state = State(folder / "progress.json")
+    ac.progress_plan({"research": 0.08, "hook": 0.02, "script": 0.03} if script_only else
+                     {"research": 0.06, "hook": 0.02, "script": 0.02, "voice": 0.42, "media": 0.13, "edit": 0.35})
     # 1. research (kept in the folder: running the same topic again reuses it unless asked to refresh)
     rj = folder / "research.json"
     data = None
@@ -483,36 +524,82 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
                 log(f"reusing the research from {time.strftime('%d %b %H:%M', time.localtime(rj.stat().st_mtime))} (fresh research: --fresh)")
         except ValueError:
             data = None
-    if data is None:
-        data = research(topic, seconds, language, writer, model)
-        rj.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    with ac.stage("research"):
+        if data is None:
+            data = research(topic, seconds, language, writer, model)
+            rj.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     # 2. script (sized to the voice's pace when there is one)
     clone = voice if (voice and not voice.startswith("mac") and not script_only) else None
+    # 2. script: kept when it was written with these same settings (a retry does not rewrite it)
+    script_path = folder / f"{name}.script.json"
+    script_sig = state.sig(rj.read_bytes(), seconds, language, tone, niche, style, writer, hook_line, find_hook, clone)
     found = []
-    if hook_line and hook_line.strip():
-        log(f"hook: your line “{hook_line.strip()[:80]}”")
-    elif find_hook:  # hooks for exactly this topic, looked up online now
-        import hooks as hk
+    if state.done("script", script_sig) and script_path.is_file() and not fresh:
+        log(f"reusing the script from {time.strftime('%d %b %H:%M', time.localtime(script_path.stat().st_mtime))}")
+        with ac.stage("hook"), ac.stage("script"):
+            pass
+    else:
+        with ac.stage("hook"):
+            if hook_line and hook_line.strip():
+                log(f"hook: your line “{hook_line.strip()[:80]}”")
+            elif find_hook:  # hooks for exactly this topic, looked up online now
+                import hooks as hk
 
-        # search with your own words (a link: the researched topic), not the script's title idea
-        query = data.get("topic") or data.get("title_idea") or topic if re.match(r"https?://", topic.strip()) else topic
-        found = hk.find_for_topic(query, niche, language, facts=facts_notes(data)[:3000], model=model if writer == "claude" else None)
-    res = sw.write_script(data.get("title_idea") or topic, str(folder / name), niche=niche, seconds=seconds, language=language, tone=tone,
-                          notes=facts_notes(data), style=style, backend=writer, model=model if writer == "claude" else None, pace_voice=clone,
-                          hook_line=hook_line, found_hooks=found)
-    script_path = Path(res["script"])
+                # search with your own words (a link: the researched topic), not the script's title idea
+                query = data.get("topic") or data.get("title_idea") or topic if re.match(r"https?://", topic.strip()) else topic
+                found = hk.find_for_topic(query, niche, language, facts=facts_notes(data)[:3000], model=model if writer == "claude" else None)
+        with ac.stage("script"):
+            res = sw.write_script(data.get("title_idea") or topic, str(folder / name), niche=niche, seconds=seconds, language=language, tone=tone,
+                                  notes=facts_notes(data), style=style, backend=writer, model=model if writer == "claude" else None, pace_voice=clone,
+                                  hook_line=hook_line, found_hooks=found)
+        script_path = Path(res["script"])
+        state.mark("script", script_sig)
     script = json.loads(script_path.read_text(encoding="utf-8"))
     outputs = [str(script_path), str(script_path.with_name(script_path.name.replace(".script.json", ".txt")))]
     items: list[dict] = []
     video_out = None
     if not script_only:
+        import threading
+
         import voice as vo
 
-        # 3. voice
-        sp = vo.speak(voice, str(script_path), str(folder / f"{name}.wav"), takes=takes)
+        # 3 + 4. voice and media at the same time (media needs only the script, not the voice)
+        media_sig = state.sig(script_path.read_bytes(), sources, W, H)
+        media_json = folder / "media" / "media.json"
+        got: dict = {}
+
+        def media_job() -> None:
+            try:
+                with ac.stage("media"):
+                    if state.done("media", media_sig) and media_json.is_file():
+                        saved = json.loads(media_json.read_text(encoding="utf-8"))
+                        if all(Path(i["file"]).is_file() for i in saved["items"]):
+                            log(f"reusing {len(saved['items'])} media item(s)")
+                            got["media"] = (saved["items"], saved["hints"])
+                            return
+                    its, hs = collect_media(script, data, folder / "media", sources, W, H)
+                    media_json.write_text(json.dumps({"items": its, "hints": hs}, ensure_ascii=False, indent=1), encoding="utf-8")
+                    state.mark("media", media_sig)
+                    got["media"] = (its, hs)
+            except Exception as e:  # reported after the voice is done
+                got["error"] = e
+
+        mt = threading.Thread(target=media_job, name="ei-topic-media", daemon=True)
+        mt.start()
+        wav = folder / f"{name}.wav"
+        voice_sig = state.sig(script_path.read_bytes(), voice, takes)
+        with ac.stage("voice"):
+            if state.done("voice", voice_sig) and wav.is_file() and wav.with_suffix(".narration.json").is_file():
+                log("reusing the narration (the script and voice did not change)")
+                sp = {"outputs": [str(wav)], "narration": str(wav.with_suffix(".narration.json"))}
+            else:
+                sp = vo.speak(voice, str(script_path), str(wav), takes=takes)
+                state.mark("voice", voice_sig)
         outputs.append(sp["outputs"][0])
-        # 4. media
-        items, hints = collect_media(script, data, folder / "media", sources, W, H)
+        mt.join()
+        if "error" in got:
+            raise got["error"]
+        items, hints = got["media"]
         clips = [i["file"] for i in items] + list(footage or [])
         if not clips:
             raise AutocutError("no media was found or allowed for this topic: allow more sources or add your own footage")
@@ -522,11 +609,13 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         video_out = folder / f"{name}.mp4"
         stills = {str(Path(i["file"]).resolve()) for i in items if i["kind"] == "image"}
         cards = {str(Path(i["file"]).resolve()) for i in items if i["kind"] == "card"}
-        nr.make(sp["outputs"][0], clips, str(video_out), narration=sp["narration"], aspect=aspect, pace=pace, captions=captions,
-                caption_style=caption_style or ("pop" if aspect == "vertical" else "clean"), music=music, describe="none", hints=hints, stills=stills, cards=cards,
-                ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound, resolution=resolution, niche=niche,
-                # your own hook opens the video: no cold open before it, and it is the on-screen hook too
-                hook="text" if hook_line and hook_line.strip() else "auto", screen_text=hook_line)
+        with ac.stage("edit"):
+            nr.make(sp["outputs"][0], clips, str(video_out), narration=sp["narration"], aspect=aspect, pace=pace, captions=captions,
+                    caption_style=caption_style or ("pop" if aspect == "vertical" else "clean"), music=music, describe="none", hints=hints, stills=stills, cards=cards,
+                    ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound, resolution=resolution, niche=niche,
+                    # your own hook opens the video: no cold open before it, and it is the on-screen hook too
+                    hook="text" if hook_line and hook_line.strip() else "auto", screen_text=hook_line)
+        state.mark("edit", "done")
         outputs.insert(0, str(video_out))
     (folder / "sources.md").write_text(sources_md(data, items, script), encoding="utf-8")
     desc = description_txt(data, items, script)

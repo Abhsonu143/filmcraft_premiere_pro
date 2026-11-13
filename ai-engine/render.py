@@ -24,6 +24,7 @@ import json
 import math
 import os
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -204,7 +205,7 @@ def render_shot(plan: dict, shot: dict, pre: int, post: int, dst: Path, codec: s
            "-frames:v", str(total), "-fps_mode", "cfr", "-r", ac.rate_arg(fps)]
     rate = ac.bitrate_for(int(plan["width"]), int(plan["height"]), 24.0)  # SHOT_BITRATE at 1080p, more at 4K
     cmd += ["-c:v", "h264_videotoolbox", "-b:v", rate] if codec == "h264" else ac.video_encoder_args(codec, rate)
-    tmp = dst.with_suffix(".part.mp4")
+    tmp = dst.with_name(f"{dst.stem}.{os.getpid()}.{threading.get_ident()}.part.mp4")  # never shared between workers
     ac.run(cmd + [str(tmp)])
     tmp.replace(dst)
 
@@ -263,7 +264,11 @@ def render(plan_path: Path, out: str | None = None, workers: int = 2) -> Path:
     work.mkdir(exist_ok=True)
     hand = handles(shots)
     files = [work / f"shot_{shot_key(plan, s, *h)}.mp4" for s, h in zip(shots, hand)]
-    todo = [(s, h, f) for s, h, f in zip(shots, hand, files) if not f.is_file()]
+    todo, seen = [], set()
+    for s, h, f in zip(shots, hand, files):  # a shot used twice (a cold open, a photo) is rendered once
+        if not f.is_file() and f not in seen:
+            seen.add(f)
+            todo.append((s, h, f))
     log(f"rendering {len(todo)} of {len(shots)} shots ({len(shots) - len(todo)} reused), {workers} workers")
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
