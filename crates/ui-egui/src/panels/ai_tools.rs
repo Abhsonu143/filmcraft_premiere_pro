@@ -130,10 +130,10 @@ impl Kind {
         }
     }
     fn needs_input(self) -> bool {
-        !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic)
+        !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Tv)
     }
     fn needs_clips(self) -> bool {
-        matches!(self, Kind::Music | Kind::Reference | Kind::Voiceover | Kind::Audio)
+        matches!(self, Kind::Music | Kind::Reference | Kind::Voiceover | Kind::Audio | Kind::Tv)
     }
 }
 
@@ -238,6 +238,14 @@ struct TvCalib {
     quad: [[f32; 2]; 4],
     loaded: bool,
     saving: Option<u64>,
+    /// recording length, the moment shown, and where its corners came from (suggested/saved/tracked)
+    duration: f64,
+    at: f64,
+    source: String,
+    /// the corner last touched (arrow keys nudge it)
+    active: Option<usize>,
+    preview_job: Option<u64>,
+    preview_image: String,
 }
 
 /// The sentence-by-sentence recording session of the Voice Clone dialog.
@@ -448,6 +456,9 @@ impl Draft {
         d.fresh = flag("fresh", d.fresh);
         if let Some(v) = p.get("recordings").and_then(Value::as_str) {
             d.tv_folder = v.to_string();
+        }
+        if kind == Kind::Tv && d.clips.is_empty() && !d.input.trim().is_empty() {
+            d.clips.push(d.input.trim().to_string()); // one clip given as "input"
         }
         d.relight = num("relight", d.relight);
         if let Some(a) = p.get("takesFile").and_then(Value::as_str) {
@@ -707,11 +718,12 @@ impl Draft {
                     return Err("Backlight matching must be between 0 and 1.".into());
                 }
                 let orientation = if self.aspect == "vertical" { "vertical" } else { "horizontal" };
-                a = vec!["tv-make".into(), self.input.trim().into()];
+                a = vec!["tv-make".into()];
+                a.extend(self.clips.iter().cloned());
                 push(&mut a, "--recordings", self.tv_folder.trim());
                 push(&mut a, "--orientation", orientation);
                 push(&mut a, "--relight", &format!("{}", self.relight));
-                push(&mut a, "--out", self.out.trim());
+                push(&mut a, "--out-dir", self.out.trim());
             }
             Kind::Voice => {
                 let name = self.voice_name.trim();
@@ -884,11 +896,11 @@ fn default_output(d: &Draft) -> String {
         Kind::Script => movies_dir().join("Scripts").join(slug(if d.topic.trim().is_empty() { "script" } else { &d.topic })).to_string_lossy().to_string(),
         Kind::Voice => voices_dir().join(slug(&d.voice_name)).to_string_lossy().to_string(),
         Kind::Topic => String::new(), // the engine names the folder after the topic (Movies/EI/Topics/…)
-        Kind::Tv => free_path(
-            &parent_dir(&d.input),
-            &format!("{} - on TV {}", file_stem(&d.input), if d.aspect == "vertical" { "vertical" } else { "horizontal" }),
-            ".mp4",
-        ),
+        Kind::Tv => d
+            .clips
+            .first()
+            .map(|c| parent_dir(c).join("EI on TV").to_string_lossy().to_string())
+            .unwrap_or_else(|| movies_dir().join("TV").to_string_lossy().to_string()),
     }
 }
 
@@ -1317,7 +1329,10 @@ fn run_draft(d: &mut Draft) -> Result<u64, String> {
         Kind::Script => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Voice => format!("{}: {}", d.kind.title(), d.voice_name.trim()),
         Kind::Topic => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
-        Kind::Tv => format!("{}: {}", d.kind.title(), file_stem(&d.input)),
+        Kind::Tv => match d.clips.len() {
+            1 => format!("{}: {}", d.kind.title(), d.clips.first().map(|c| file_stem(c)).unwrap_or_default()),
+            n => format!("{}: {n} clips", d.kind.title()),
+        },
     };
     Ok(start_job(title, Some(d.kind), vec![step], d.import, Some(engine)))
 }
@@ -1496,477 +1511,484 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
             ui.set_min_width(520.0);
             ui.label(egui::RichText::new(description(d.kind)).weak());
             ui.add_space(6.0);
-            egui::Grid::new("ei-ai-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                if d.kind.needs_input() {
-                    ui.label(d.kind.input_label());
-                    if path_row(ui, &mut d.input, &format!("{p}.input"), "a file", &mut elems) {
-                        pick = Some(Pick::Input);
+            // the dialog never grows past the screen: its content scrolls, the buttons stay visible
+            let max_h = (ui.ctx().content_rect().height() - 190.0).max(240.0);
+            egui::ScrollArea::vertical().max_height(max_h).auto_shrink([true, true]).show(ui, |ui| {
+                egui::Grid::new("ei-ai-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    if d.kind.needs_input() {
+                        ui.label(d.kind.input_label());
+                        if path_row(ui, &mut d.input, &format!("{p}.input"), "a file", &mut elems) {
+                            pick = Some(Pick::Input);
+                        }
+                        ui.end_row();
                     }
-                    ui.end_row();
-                }
-                if d.kind.needs_clips() || d.kind == Kind::Script || (d.kind == Kind::Voice && d.source == "files") || (d.kind == Kind::Topic && d.make_video) {
-                    ui.label(match d.kind {
-                        Kind::Audio => "Videos",
-                        Kind::Script | Kind::Topic => "Your footage (optional)",
-                        Kind::Voice => "Your recordings",
-                        Kind::Voiceover => "Footage",
-                        _ => "Clips",
-                    });
-                    ui.vertical(|ui| {
-                        let summary = match d.clips.len() {
-                            0 => "No clips yet".to_string(),
-                            1 => d.clips.first().map(|c| file_stem(c)).unwrap_or_default(),
-                            n => format!("{n} items: {}…", d.clips.iter().take(3).map(|c| file_stem(c)).collect::<Vec<_>>().join(", ")),
-                        };
-                        ui.label(summary);
-                        ui.horizontal(|ui| {
-                            let a = ui.button("Add Files…");
-                            elems.push((format!("{p}.clips.add"), a.rect, "Add Files…".into()));
-                            if a.clicked() {
-                                pick = Some(Pick::ClipsAdd);
-                            }
-                            let f = ui.button("Add Folder…");
-                            elems.push((format!("{p}.clips.addFolder"), f.rect, "Add Folder…".into()));
-                            if f.clicked() {
-                                pick = Some(Pick::ClipsFolder);
-                            }
-                            let c = ui.add_enabled(!d.clips.is_empty(), egui::Button::new("Clear"));
-                            elems.push((format!("{p}.clips.clear"), c.rect, "Clear".into()));
-                            if c.clicked() {
-                                d.clips.clear();
-                            }
+                    if d.kind.needs_clips()
+                        || d.kind == Kind::Script
+                        || (d.kind == Kind::Voice && d.source == "files")
+                        || (d.kind == Kind::Topic && d.make_video)
+                    {
+                        ui.label(match d.kind {
+                            Kind::Audio => "Videos",
+                            Kind::Script | Kind::Topic => "Your footage (optional)",
+                            Kind::Voice => "Your recordings",
+                            Kind::Voiceover => "Footage",
+                            Kind::Tv => "Your clips",
+                            _ => "Clips",
                         });
-                    });
-                    ui.end_row();
-                }
-                if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover | Kind::Reference | Kind::Clips) || (d.kind == Kind::Topic && d.make_video) {
-                    ui.label(match d.kind {
-                        Kind::Music => "Music",
-                        Kind::Reference => "Other soundtrack (optional)",
-                        _ => "Music (optional)",
-                    });
-                    let hint = if d.kind == Kind::Reference { "empty: the reference's own sound" } else { "a song, or any video: its sound is used" };
-                    if path_row(ui, &mut d.music, &format!("{p}.music"), hint, &mut elems) {
-                        pick = Some(Pick::Music);
-                    }
-                    ui.end_row();
-                }
-                if d.kind == Kind::Voiceover {
-                    ui.label("Script (optional)");
-                    if path_row(ui, &mut d.script, &format!("{p}.script"), "the .script.json / .txt it was read from", &mut elems) {
-                        pick = Some(Pick::Script);
-                    }
-                    ui.end_row();
-                }
-                match d.kind {
-                    Kind::Split => {
-                        ui.label("Clip length (seconds)");
-                        let r = ui.add(egui::DragValue::new(&mut d.clip_len).range(1.0..=86_400.0).speed(1.0));
-                        elems.push((format!("{p}.clipLength"), r.rect, d.clip_len.to_string()));
-                        ui.end_row();
-                        ui.label("Quality");
-                        radio_row(ui, &mut d.quality, &QUALITIES, &format!("{p}.quality"), &mut elems);
-                        ui.end_row();
-                    }
-                    Kind::Music => {
-                        ui.label("Length (seconds)");
-                        let r = ui.add(egui::DragValue::new(&mut d.length).range(1.0..=3_600.0).speed(1.0));
-                        elems.push((format!("{p}.length"), r.rect, d.length.to_string()));
-                        ui.end_row();
-                        ui.label("Aspect ratio");
-                        radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
-                        ui.end_row();
-                        ui.label("Pace");
-                        radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
-                        ui.end_row();
-                        ui.label("Music start (s)");
-                        let r = ui.add(egui::TextEdit::singleline(&mut d.music_start).hint_text("automatic: the best part of the song").desired_width(200.0));
-                        elems.push((format!("{p}.musicStart"), r.rect, d.music_start.clone()));
-                        ui.end_row();
-                        style_rows(ui, &mut d, &p, false, &mut elems);
-                    }
-                    Kind::Reference => {
-                        ui.label("Aspect ratio");
-                        radio_row(ui, &mut d.aspect, &ASPECTS, &format!("{p}.aspect"), &mut elems);
-                        ui.end_row();
-                        style_rows(ui, &mut d, &p, true, &mut elems);
-                    }
-                    Kind::Clips => {
-                        ui.label("Number of clips");
-                        let r = ui.add(egui::DragValue::new(&mut d.count).range(1.0..=50.0).speed(0.1).max_decimals(0));
-                        elems.push((format!("{p}.count"), r.rect, d.count.to_string()));
-                        ui.end_row();
-                        ui.label("Clip length (s)");
-                        ui.horizontal(|ui| {
-                            for (key, label, v) in
-                                [("min", "shortest", &mut d.min_len), ("target", "mostly", &mut d.target_len), ("max", "longest", &mut d.max_len)]
-                            {
-                                ui.label(label);
-                                let r = ui.add(egui::DragValue::new(v).range(3.0..=600.0).speed(1.0).max_decimals(0));
-                                elems.push((format!("{p}.{key}"), r.rect, v.to_string()));
-                            }
-                        });
-                        ui.end_row();
-                        ui.label("Shape");
-                        radio_row(ui, &mut d.aspect, &CLIP_ASPECTS, &format!("{p}.aspect"), &mut elems);
-                        ui.end_row();
-                        ui.label("Content");
-                        combo_row(ui, &mut d.content, &CONTENTS, &format!("{p}.content"), &mut elems);
-                        ui.end_row();
-                        ui.label("Framing");
-                        combo_row(ui, &mut d.framing, &FRAMINGS, &format!("{p}.framing"), &mut elems);
-                        ui.end_row();
-                        ui.label("Pace");
-                        radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
-                        ui.end_row();
-                        ui.label("Captions");
-                        combo_row(ui, &mut d.caption_mode, &CAPTION_MODES, &format!("{p}.captions"), &mut elems);
-                        ui.end_row();
-                        ui.label("Caption style");
-                        combo_row(ui, &mut d.caption_style, &CAPTION_STYLES, &format!("{p}.captionStyle"), &mut elems);
-                        ui.end_row();
-                        ui.label("Title in the video");
-                        combo_row(ui, &mut d.title_mode, &TITLE_MODES, &format!("{p}.titleMode"), &mut elems);
-                        ui.end_row();
-                        ui.label("Language model");
-                        combo_row(ui, &mut d.llm, &LLMS, &format!("{p}.llm"), &mut elems);
-                        ui.end_row();
-                        ui.label("");
                         ui.vertical(|ui| {
-                            let r = ui.checkbox(&mut d.hook, "Open each clip with a teaser of its best moment");
-                            elems.push((format!("{p}.hook"), r.rect, d.hook.to_string()));
+                            let summary = match d.clips.len() {
+                                0 => "No clips yet".to_string(),
+                                1 => d.clips.first().map(|c| file_stem(c)).unwrap_or_default(),
+                                n => format!("{n} items: {}…", d.clips.iter().take(3).map(|c| file_stem(c)).collect::<Vec<_>>().join(", ")),
+                            };
+                            ui.label(summary);
+                            ui.horizontal(|ui| {
+                                let a = ui.button("Add Files…");
+                                elems.push((format!("{p}.clips.add"), a.rect, "Add Files…".into()));
+                                if a.clicked() {
+                                    pick = Some(Pick::ClipsAdd);
+                                }
+                                let f = ui.button("Add Folder…");
+                                elems.push((format!("{p}.clips.addFolder"), f.rect, "Add Folder…".into()));
+                                if f.clicked() {
+                                    pick = Some(Pick::ClipsFolder);
+                                }
+                                let c = ui.add_enabled(!d.clips.is_empty(), egui::Button::new("Clear"));
+                                elems.push((format!("{p}.clips.clear"), c.rect, "Clear".into()));
+                                if c.clicked() {
+                                    d.clips.clear();
+                                }
+                            });
                         });
                         ui.end_row();
                     }
-                    Kind::Audio => {
-                        ui.label("Format");
-                        combo_row(ui, &mut d.format, &AUDIO_FORMATS, &format!("{p}.format"), &mut elems);
-                        ui.end_row();
-                        ui.label("Quality");
-                        combo_row(ui, &mut d.audio_quality, &AUDIO_QUALITIES, &format!("{p}.quality"), &mut elems);
-                        ui.end_row();
-                        ui.label("Range (s)");
-                        ui.horizontal(|ui| {
-                            ui.label("from");
-                            let r = ui.add(egui::TextEdit::singleline(&mut d.start).hint_text("start").desired_width(70.0));
-                            elems.push((format!("{p}.start"), r.rect, d.start.clone()));
-                            ui.label("to");
-                            let r = ui.add(egui::TextEdit::singleline(&mut d.end).hint_text("end").desired_width(70.0));
-                            elems.push((format!("{p}.end"), r.rect, d.end.clone()));
+                    if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover | Kind::Reference | Kind::Clips) || (d.kind == Kind::Topic && d.make_video) {
+                        ui.label(match d.kind {
+                            Kind::Music => "Music",
+                            Kind::Reference => "Other soundtrack (optional)",
+                            _ => "Music (optional)",
                         });
-                        ui.end_row();
-                        ui.label("");
-                        ui.horizontal(|ui| {
-                            let r = ui.checkbox(&mut d.mono, "Mono");
-                            elems.push((format!("{p}.mono"), r.rect, d.mono.to_string()));
-                            let r = ui.checkbox(&mut d.normalize, "Normalise loudness (-14 LUFS)");
-                            elems.push((format!("{p}.normalize"), r.rect, d.normalize.to_string()));
-                        });
+                        let hint = if d.kind == Kind::Reference { "empty: the reference's own sound" } else { "a song, or any video: its sound is used" };
+                        if path_row(ui, &mut d.music, &format!("{p}.music"), hint, &mut elems) {
+                            pick = Some(Pick::Music);
+                        }
                         ui.end_row();
                     }
-                    Kind::Voiceover => {
-                        ui.label("Shape");
-                        radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
+                    if d.kind == Kind::Voiceover {
+                        ui.label("Script (optional)");
+                        if path_row(ui, &mut d.script, &format!("{p}.script"), "the .script.json / .txt it was read from", &mut elems) {
+                            pick = Some(Pick::Script);
+                        }
                         ui.end_row();
-                        ui.label("Pace");
-                        radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
-                        ui.end_row();
-                        ui.label("Shot ideas");
-                        combo_row(ui, &mut d.describe, &DESCRIBERS, &format!("{p}.describe"), &mut elems);
-                        ui.end_row();
-                        ui.label("Captions");
-                        ui.horizontal(|ui| {
-                            let r = ui.checkbox(&mut d.captions, "Burn in");
-                            elems.push((format!("{p}.captions"), r.rect, d.captions.to_string()));
+                    }
+                    match d.kind {
+                        Kind::Split => {
+                            ui.label("Clip length (seconds)");
+                            let r = ui.add(egui::DragValue::new(&mut d.clip_len).range(1.0..=86_400.0).speed(1.0));
+                            elems.push((format!("{p}.clipLength"), r.rect, d.clip_len.to_string()));
+                            ui.end_row();
+                            ui.label("Quality");
+                            radio_row(ui, &mut d.quality, &QUALITIES, &format!("{p}.quality"), &mut elems);
+                            ui.end_row();
+                        }
+                        Kind::Music => {
+                            ui.label("Length (seconds)");
+                            let r = ui.add(egui::DragValue::new(&mut d.length).range(1.0..=3_600.0).speed(1.0));
+                            elems.push((format!("{p}.length"), r.rect, d.length.to_string()));
+                            ui.end_row();
+                            ui.label("Aspect ratio");
+                            radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
+                            ui.end_row();
+                            ui.label("Pace");
+                            radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
+                            ui.end_row();
+                            ui.label("Music start (s)");
+                            let r =
+                                ui.add(egui::TextEdit::singleline(&mut d.music_start).hint_text("automatic: the best part of the song").desired_width(200.0));
+                            elems.push((format!("{p}.musicStart"), r.rect, d.music_start.clone()));
+                            ui.end_row();
+                            style_rows(ui, &mut d, &p, false, &mut elems);
+                        }
+                        Kind::Reference => {
+                            ui.label("Aspect ratio");
+                            radio_row(ui, &mut d.aspect, &ASPECTS, &format!("{p}.aspect"), &mut elems);
+                            ui.end_row();
+                            style_rows(ui, &mut d, &p, true, &mut elems);
+                        }
+                        Kind::Clips => {
+                            ui.label("Number of clips");
+                            let r = ui.add(egui::DragValue::new(&mut d.count).range(1.0..=50.0).speed(0.1).max_decimals(0));
+                            elems.push((format!("{p}.count"), r.rect, d.count.to_string()));
+                            ui.end_row();
+                            ui.label("Clip length (s)");
+                            ui.horizontal(|ui| {
+                                for (key, label, v) in
+                                    [("min", "shortest", &mut d.min_len), ("target", "mostly", &mut d.target_len), ("max", "longest", &mut d.max_len)]
+                                {
+                                    ui.label(label);
+                                    let r = ui.add(egui::DragValue::new(v).range(3.0..=600.0).speed(1.0).max_decimals(0));
+                                    elems.push((format!("{p}.{key}"), r.rect, v.to_string()));
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Shape");
+                            radio_row(ui, &mut d.aspect, &CLIP_ASPECTS, &format!("{p}.aspect"), &mut elems);
+                            ui.end_row();
+                            ui.label("Content");
+                            combo_row(ui, &mut d.content, &CONTENTS, &format!("{p}.content"), &mut elems);
+                            ui.end_row();
+                            ui.label("Framing");
+                            combo_row(ui, &mut d.framing, &FRAMINGS, &format!("{p}.framing"), &mut elems);
+                            ui.end_row();
+                            ui.label("Pace");
+                            radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
+                            ui.end_row();
+                            ui.label("Captions");
+                            combo_row(ui, &mut d.caption_mode, &CAPTION_MODES, &format!("{p}.captions"), &mut elems);
+                            ui.end_row();
+                            ui.label("Caption style");
                             combo_row(ui, &mut d.caption_style, &CAPTION_STYLES, &format!("{p}.captionStyle"), &mut elems);
-                        });
-                        ui.end_row();
-                        ui.label("");
-                        let r = ui.checkbox(&mut d.ambience, "Keep a little of each clip's own sound under the voice");
-                        elems.push((format!("{p}.ambience"), r.rect, d.ambience.to_string()));
-                        ui.end_row();
-                    }
-                    Kind::Script => {
-                        ui.label("Topic");
-                        let r = ui.add(egui::TextEdit::singleline(&mut d.topic).hint_text("what the video is about").desired_width(380.0));
-                        elems.push((format!("{p}.topic"), r.rect, d.topic.clone()));
-                        ui.end_row();
-                        for (key, label, hint, v) in [
-                            ("niche", "Niche", "e.g. travel vlog, tech review, finance", &mut d.niche),
-                            ("tone", "Tone", "e.g. excited, calm documentary, funny", &mut d.tone),
-                            ("audience", "Audience", "who is watching", &mut d.audience),
-                        ] {
-                            ui.label(label);
-                            let r = ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(380.0));
-                            elems.push((format!("{p}.{key}"), r.rect, v.clone()));
+                            ui.end_row();
+                            ui.label("Title in the video");
+                            combo_row(ui, &mut d.title_mode, &TITLE_MODES, &format!("{p}.titleMode"), &mut elems);
+                            ui.end_row();
+                            ui.label("Language model");
+                            combo_row(ui, &mut d.llm, &LLMS, &format!("{p}.llm"), &mut elems);
+                            ui.end_row();
+                            ui.label("");
+                            ui.vertical(|ui| {
+                                let r = ui.checkbox(&mut d.hook, "Open each clip with a teaser of its best moment");
+                                elems.push((format!("{p}.hook"), r.rect, d.hook.to_string()));
+                            });
                             ui.end_row();
                         }
-                        ui.label("Notes");
-                        let r = ui.add(
-                            egui::TextEdit::multiline(&mut d.notes)
-                                .hint_text("facts, places, what happened, what to mention")
-                                .desired_rows(3)
-                                .desired_width(380.0),
-                        );
-                        elems.push((format!("{p}.notes"), r.rect, d.notes.clone()));
-                        ui.end_row();
-                        ui.label("Length (seconds)");
-                        let r = ui.add(egui::DragValue::new(&mut d.seconds).range(5.0..=1800.0).speed(1.0).max_decimals(0));
-                        elems.push((format!("{p}.seconds"), r.rect, d.seconds.to_string()));
-                        ui.end_row();
-                        ui.label("Language");
-                        radio_row(ui, &mut d.language, &SCRIPT_LANGUAGES, &format!("{p}.language"), &mut elems);
-                        ui.end_row();
-                        ui.label("Talking style");
-                        let styles = saved_styles();
-                        let shown = if d.style.is_empty() { "None (a natural creator style)".to_string() } else { d.style.clone() };
-                        let r = egui::ComboBox::from_id_salt(format!("{p}.style")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
-                            let o = ui.selectable_value(&mut d.style, String::new(), "None (a natural creator style)");
-                            elems.push((format!("{p}.style.none"), o.rect, "None".into()));
-                            for st in &styles {
-                                let o = ui.selectable_value(&mut d.style, st.clone(), st);
-                                elems.push((format!("{p}.style.{st}"), o.rect, st.clone()));
-                            }
-                        });
-                        elems.push((format!("{p}.style"), r.response.rect, shown));
-                        ui.end_row();
-                        ui.label("Learn a style");
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(
-                                    "From transcripts (.txt, .srt, .vtt) and/or YouTube links (one per line): how you or a creator you like talks.",
-                                )
-                                .weak(),
-                            );
+                        Kind::Audio => {
+                            ui.label("Format");
+                            combo_row(ui, &mut d.format, &AUDIO_FORMATS, &format!("{p}.format"), &mut elems);
+                            ui.end_row();
+                            ui.label("Quality");
+                            combo_row(ui, &mut d.audio_quality, &AUDIO_QUALITIES, &format!("{p}.quality"), &mut elems);
+                            ui.end_row();
+                            ui.label("Range (s)");
                             ui.horizontal(|ui| {
-                                let b = ui.button("Add Transcripts…");
-                                elems.push((format!("{p}.styleSources.add"), b.rect, "Add Transcripts…".into()));
-                                if b.clicked() {
-                                    pick = Some(Pick::StyleSources);
-                                }
-                                ui.label(format!("{} file(s)", d.style_sources.len()));
+                                ui.label("from");
+                                let r = ui.add(egui::TextEdit::singleline(&mut d.start).hint_text("start").desired_width(70.0));
+                                elems.push((format!("{p}.start"), r.rect, d.start.clone()));
+                                ui.label("to");
+                                let r = ui.add(egui::TextEdit::singleline(&mut d.end).hint_text("end").desired_width(70.0));
+                                elems.push((format!("{p}.end"), r.rect, d.end.clone()));
                             });
-                            let r = ui.add(
-                                egui::TextEdit::multiline(&mut d.style_links)
-                                    .hint_text("https://www.youtube.com/watch?v=…")
-                                    .desired_rows(2)
-                                    .desired_width(380.0),
-                            );
-                            elems.push((format!("{p}.styleLinks"), r.rect, d.style_links.clone()));
+                            ui.end_row();
+                            ui.label("");
                             ui.horizontal(|ui| {
-                                let r = ui.add(egui::TextEdit::singleline(&mut d.new_style).hint_text("style name").desired_width(160.0));
-                                elems.push((format!("{p}.newStyle"), r.rect, d.new_style.clone()));
-                                let b = ui.button("Learn Style");
-                                elems.push((format!("{p}.learnStyle"), b.rect, "Learn Style".into()));
-                                if b.clicked() {
-                                    learn_style = true;
-                                }
+                                let r = ui.checkbox(&mut d.mono, "Mono");
+                                elems.push((format!("{p}.mono"), r.rect, d.mono.to_string()));
+                                let r = ui.checkbox(&mut d.normalize, "Normalise loudness (-14 LUFS)");
+                                elems.push((format!("{p}.normalize"), r.rect, d.normalize.to_string()));
                             });
-                        });
-                        ui.end_row();
-                        ui.label("Written by");
-                        combo_row(ui, &mut d.writer, &WRITERS, &format!("{p}.writer"), &mut elems);
-                        ui.end_row();
-                        ui.label("Speak it with");
-                        let voices = saved_voices();
-                        let shown = if d.voice.is_empty() { "Don't speak (script only)".to_string() } else { d.voice.clone() };
-                        let r = egui::ComboBox::from_id_salt(format!("{p}.voice")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
-                            let o = ui.selectable_value(&mut d.voice, String::new(), "Don't speak (script only)");
-                            elems.push((format!("{p}.voice.none"), o.rect, "none".into()));
-                            for v in &voices {
-                                let o = ui.selectable_value(&mut d.voice, v.clone(), v);
-                                elems.push((format!("{p}.voice.{v}"), o.rect, v.clone()));
-                            }
-                        });
-                        elems.push((format!("{p}.voice"), r.response.rect, shown));
-                        ui.end_row();
-                        if !d.voice.is_empty() {
-                            ui.label("Takes per line");
-                            let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
-                            elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
                             ui.end_row();
                         }
-                    }
-                    Kind::Tv => {
-                        ui.label("Recordings folder");
-                        if path_row(ui, &mut d.tv_folder, &format!("{p}.recordings"), "videos of your room with the TV", &mut elems) {
-                            pick = Some(Pick::TvFolder);
-                        }
-                        ui.end_row();
-                        ui.label("Final video");
-                        radio_row(ui, &mut d.aspect, &TV_SHAPES, &format!("{p}.aspect"), &mut elems);
-                        ui.end_row();
-                        ui.label("Backlight matching");
-                        let r = ui.add(egui::Slider::new(&mut d.relight, 0.0..=1.0).text("recolour the glow"));
-                        elems.push((format!("{p}.relight"), r.rect, d.relight.to_string()));
-                        ui.end_row();
-                        ui.label("Recordings");
-                        ui.vertical(|ui| tv_recordings_ui(ui, &mut d, &p, &mut elems));
-                        ui.end_row();
-                    }
-                    Kind::Topic => {
-                        ui.label("Topic or link");
-                        let r = ui.add(
-                            egui::TextEdit::multiline(&mut d.topic)
-                                .hint_text("e.g. GTA 6 release, or a link to a post/article")
-                                .desired_rows(2)
-                                .desired_width(380.0),
-                        );
-                        elems.push((format!("{p}.topic"), r.rect, d.topic.clone()));
-                        ui.end_row();
-                        ui.label("Length (seconds)");
-                        ui.horizontal(|ui| {
-                            let r = ui.add(egui::DragValue::new(&mut d.seconds).range(5.0..=1800.0).speed(1.0).max_decimals(0));
-                            elems.push((format!("{p}.seconds"), r.rect, d.seconds.to_string()));
-                            for (label, v) in [("Short 30 s", 30.0), ("60 s", 60.0), ("3 min", 180.0), ("8 min", 480.0)] {
-                                let b = ui.small_button(label);
-                                elems.push((format!("{p}.seconds.{}", v as u32), b.rect, label.into()));
-                                if b.clicked() {
-                                    d.seconds = v;
-                                }
-                            }
-                        });
-                        ui.end_row();
-                        ui.label("Language");
-                        radio_row(ui, &mut d.language, &SCRIPT_LANGUAGES, &format!("{p}.language"), &mut elems);
-                        ui.end_row();
-                        ui.label("Talking style");
-                        let styles = saved_styles();
-                        let shown = if d.style.is_empty() { "None (a natural creator style)".to_string() } else { d.style.clone() };
-                        let r = egui::ComboBox::from_id_salt(format!("{p}.style")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
-                            let o = ui.selectable_value(&mut d.style, String::new(), "None (a natural creator style)");
-                            elems.push((format!("{p}.style.none"), o.rect, "None".into()));
-                            for st in &styles {
-                                let o = ui.selectable_value(&mut d.style, st.clone(), st);
-                                elems.push((format!("{p}.style.{st}"), o.rect, st.clone()));
-                            }
-                        });
-                        elems.push((format!("{p}.style"), r.response.rect, shown));
-                        ui.end_row();
-                        ui.label("Research & writing");
-                        combo_row(ui, &mut d.writer, &WRITERS, &format!("{p}.writer"), &mut elems);
-                        ui.end_row();
-                        ui.label("");
-                        ui.vertical(|ui| {
-                            let r = ui.checkbox(&mut d.make_video, "Make the video (untick for the script and sources only)");
-                            elems.push((format!("{p}.video"), r.rect, d.make_video.to_string()));
-                            let r = ui.checkbox(&mut d.fresh, "Research again (otherwise the last research of this topic is reused)");
-                            elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
-                        });
-                        ui.end_row();
-                        if d.make_video {
-                            ui.label("Voiceover");
-                            let mut voices: Vec<(String, String)> = saved_voices().into_iter().map(|v| (v.clone(), format!("{v} (your clone)"))).collect();
-                            for (k, l) in MAC_VOICES {
-                                voices.push((k.to_string(), l.to_string()));
-                            }
-                            let shown = voices.iter().find(|v| v.0 == d.voice).map(|v| v.1.clone()).unwrap_or_else(|| "Choose a voice…".into());
-                            let r = egui::ComboBox::from_id_salt(format!("{p}.voice")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
-                                for (k, l) in &voices {
-                                    let o = ui.selectable_value(&mut d.voice, k.clone(), l);
-                                    elems.push((format!("{p}.voice.{k}"), o.rect, l.clone()));
-                                }
-                            });
-                            elems.push((format!("{p}.voice"), r.response.rect, shown));
-                            ui.end_row();
-                            if !d.voice.starts_with("mac") && !d.voice.is_empty() {
-                                ui.label("Takes per line");
-                                let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
-                                elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
-                                ui.end_row();
-                            }
+                        Kind::Voiceover => {
                             ui.label("Shape");
                             radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
                             ui.end_row();
                             ui.label("Pace");
                             radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
                             ui.end_row();
-                            ui.label("Pictures from");
-                            ui.vertical(|ui| {
-                                let r = ui.checkbox(&mut d.src_free, "Free-licensed photos and videos (Wikimedia Commons, Openverse; credited)");
-                                elems.push((format!("{p}.free"), r.rect, d.src_free.to_string()));
-                                let r = ui.checkbox(&mut d.src_cards, "Headline and fact cards from the research");
-                                elems.push((format!("{p}.cards"), r.rect, d.src_cards.to_string()));
-                                let r = ui.checkbox(&mut d.src_youtube, "Short clips from YouTube videos the research finds");
-                                elems.push((format!("{p}.youtube"), r.rect, d.src_youtube.to_string()));
-                                if d.src_youtube {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Only where you have the right to use them (e.g. commentary or news). Every source is listed in sources.md.",
-                                        )
-                                        .weak(),
-                                    );
-                                }
+                            ui.label("Shot ideas");
+                            combo_row(ui, &mut d.describe, &DESCRIBERS, &format!("{p}.describe"), &mut elems);
+                            ui.end_row();
+                            ui.label("Captions");
+                            ui.horizontal(|ui| {
+                                let r = ui.checkbox(&mut d.captions, "Burn in");
+                                elems.push((format!("{p}.captions"), r.rect, d.captions.to_string()));
+                                combo_row(ui, &mut d.caption_style, &CAPTION_STYLES, &format!("{p}.captionStyle"), &mut elems);
                             });
                             ui.end_row();
                             ui.label("");
-                            let r = ui.checkbox(&mut d.captions, "Captions");
+                            let r = ui.checkbox(&mut d.ambience, "Keep a little of each clip's own sound under the voice");
+                            elems.push((format!("{p}.ambience"), r.rect, d.ambience.to_string()));
+                            ui.end_row();
+                        }
+                        Kind::Script => {
+                            ui.label("Topic");
+                            let r = ui.add(egui::TextEdit::singleline(&mut d.topic).hint_text("what the video is about").desired_width(380.0));
+                            elems.push((format!("{p}.topic"), r.rect, d.topic.clone()));
+                            ui.end_row();
+                            for (key, label, hint, v) in [
+                                ("niche", "Niche", "e.g. travel vlog, tech review, finance", &mut d.niche),
+                                ("tone", "Tone", "e.g. excited, calm documentary, funny", &mut d.tone),
+                                ("audience", "Audience", "who is watching", &mut d.audience),
+                            ] {
+                                ui.label(label);
+                                let r = ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(380.0));
+                                elems.push((format!("{p}.{key}"), r.rect, v.clone()));
+                                ui.end_row();
+                            }
+                            ui.label("Notes");
+                            let r = ui.add(
+                                egui::TextEdit::multiline(&mut d.notes)
+                                    .hint_text("facts, places, what happened, what to mention")
+                                    .desired_rows(3)
+                                    .desired_width(380.0),
+                            );
+                            elems.push((format!("{p}.notes"), r.rect, d.notes.clone()));
+                            ui.end_row();
+                            ui.label("Length (seconds)");
+                            let r = ui.add(egui::DragValue::new(&mut d.seconds).range(5.0..=1800.0).speed(1.0).max_decimals(0));
+                            elems.push((format!("{p}.seconds"), r.rect, d.seconds.to_string()));
+                            ui.end_row();
+                            ui.label("Language");
+                            radio_row(ui, &mut d.language, &SCRIPT_LANGUAGES, &format!("{p}.language"), &mut elems);
+                            ui.end_row();
+                            ui.label("Talking style");
+                            let styles = saved_styles();
+                            let shown = if d.style.is_empty() { "None (a natural creator style)".to_string() } else { d.style.clone() };
+                            let r = egui::ComboBox::from_id_salt(format!("{p}.style")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+                                let o = ui.selectable_value(&mut d.style, String::new(), "None (a natural creator style)");
+                                elems.push((format!("{p}.style.none"), o.rect, "None".into()));
+                                for st in &styles {
+                                    let o = ui.selectable_value(&mut d.style, st.clone(), st);
+                                    elems.push((format!("{p}.style.{st}"), o.rect, st.clone()));
+                                }
+                            });
+                            elems.push((format!("{p}.style"), r.response.rect, shown));
+                            ui.end_row();
+                            ui.label("Learn a style");
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "From transcripts (.txt, .srt, .vtt) and/or YouTube links (one per line): how you or a creator you like talks.",
+                                    )
+                                    .weak(),
+                                );
+                                ui.horizontal(|ui| {
+                                    let b = ui.button("Add Transcripts…");
+                                    elems.push((format!("{p}.styleSources.add"), b.rect, "Add Transcripts…".into()));
+                                    if b.clicked() {
+                                        pick = Some(Pick::StyleSources);
+                                    }
+                                    ui.label(format!("{} file(s)", d.style_sources.len()));
+                                });
+                                let r = ui.add(
+                                    egui::TextEdit::multiline(&mut d.style_links)
+                                        .hint_text("https://www.youtube.com/watch?v=…")
+                                        .desired_rows(2)
+                                        .desired_width(380.0),
+                                );
+                                elems.push((format!("{p}.styleLinks"), r.rect, d.style_links.clone()));
+                                ui.horizontal(|ui| {
+                                    let r = ui.add(egui::TextEdit::singleline(&mut d.new_style).hint_text("style name").desired_width(160.0));
+                                    elems.push((format!("{p}.newStyle"), r.rect, d.new_style.clone()));
+                                    let b = ui.button("Learn Style");
+                                    elems.push((format!("{p}.learnStyle"), b.rect, "Learn Style".into()));
+                                    if b.clicked() {
+                                        learn_style = true;
+                                    }
+                                });
+                            });
+                            ui.end_row();
+                            ui.label("Written by");
+                            combo_row(ui, &mut d.writer, &WRITERS, &format!("{p}.writer"), &mut elems);
+                            ui.end_row();
+                            ui.label("Speak it with");
+                            let voices = saved_voices();
+                            let shown = if d.voice.is_empty() { "Don't speak (script only)".to_string() } else { d.voice.clone() };
+                            let r = egui::ComboBox::from_id_salt(format!("{p}.voice")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+                                let o = ui.selectable_value(&mut d.voice, String::new(), "Don't speak (script only)");
+                                elems.push((format!("{p}.voice.none"), o.rect, "none".into()));
+                                for v in &voices {
+                                    let o = ui.selectable_value(&mut d.voice, v.clone(), v);
+                                    elems.push((format!("{p}.voice.{v}"), o.rect, v.clone()));
+                                }
+                            });
+                            elems.push((format!("{p}.voice"), r.response.rect, shown));
+                            ui.end_row();
+                            if !d.voice.is_empty() {
+                                ui.label("Takes per line");
+                                let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
+                                elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
+                                ui.end_row();
+                            }
+                        }
+                        Kind::Tv => {
+                            ui.label("Recordings folder");
+                            if path_row(ui, &mut d.tv_folder, &format!("{p}.recordings"), "videos of your room with the TV", &mut elems) {
+                                pick = Some(Pick::TvFolder);
+                            }
+                            ui.end_row();
+                            ui.label("Final video");
+                            radio_row(ui, &mut d.aspect, &TV_SHAPES, &format!("{p}.aspect"), &mut elems);
+                            ui.end_row();
+                            ui.label("Backlight matching");
+                            let r = ui.add(egui::Slider::new(&mut d.relight, 0.0..=1.0).text("recolour the glow"));
+                            elems.push((format!("{p}.relight"), r.rect, d.relight.to_string()));
+                            ui.end_row();
+                            ui.label("Recordings");
+                            ui.vertical(|ui| tv_recordings_ui(ui, &mut d, &p, &mut elems));
+                            ui.end_row();
+                        }
+                        Kind::Topic => {
+                            ui.label("Topic or link");
+                            let r = ui.add(
+                                egui::TextEdit::multiline(&mut d.topic)
+                                    .hint_text("e.g. GTA 6 release, or a link to a post/article")
+                                    .desired_rows(2)
+                                    .desired_width(380.0),
+                            );
+                            elems.push((format!("{p}.topic"), r.rect, d.topic.clone()));
+                            ui.end_row();
+                            ui.label("Length (seconds)");
+                            ui.horizontal(|ui| {
+                                let r = ui.add(egui::DragValue::new(&mut d.seconds).range(5.0..=1800.0).speed(1.0).max_decimals(0));
+                                elems.push((format!("{p}.seconds"), r.rect, d.seconds.to_string()));
+                                for (label, v) in [("Short 30 s", 30.0), ("60 s", 60.0), ("3 min", 180.0), ("8 min", 480.0)] {
+                                    let b = ui.small_button(label);
+                                    elems.push((format!("{p}.seconds.{}", v as u32), b.rect, label.into()));
+                                    if b.clicked() {
+                                        d.seconds = v;
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Language");
+                            radio_row(ui, &mut d.language, &SCRIPT_LANGUAGES, &format!("{p}.language"), &mut elems);
+                            ui.end_row();
+                            ui.label("Talking style");
+                            let styles = saved_styles();
+                            let shown = if d.style.is_empty() { "None (a natural creator style)".to_string() } else { d.style.clone() };
+                            let r = egui::ComboBox::from_id_salt(format!("{p}.style")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+                                let o = ui.selectable_value(&mut d.style, String::new(), "None (a natural creator style)");
+                                elems.push((format!("{p}.style.none"), o.rect, "None".into()));
+                                for st in &styles {
+                                    let o = ui.selectable_value(&mut d.style, st.clone(), st);
+                                    elems.push((format!("{p}.style.{st}"), o.rect, st.clone()));
+                                }
+                            });
+                            elems.push((format!("{p}.style"), r.response.rect, shown));
+                            ui.end_row();
+                            ui.label("Research & writing");
+                            combo_row(ui, &mut d.writer, &WRITERS, &format!("{p}.writer"), &mut elems);
+                            ui.end_row();
+                            ui.label("");
+                            ui.vertical(|ui| {
+                                let r = ui.checkbox(&mut d.make_video, "Make the video (untick for the script and sources only)");
+                                elems.push((format!("{p}.video"), r.rect, d.make_video.to_string()));
+                                let r = ui.checkbox(&mut d.fresh, "Research again (otherwise the last research of this topic is reused)");
+                                elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
+                            });
+                            ui.end_row();
+                            if d.make_video {
+                                ui.label("Voiceover");
+                                let mut voices: Vec<(String, String)> = saved_voices().into_iter().map(|v| (v.clone(), format!("{v} (your clone)"))).collect();
+                                for (k, l) in MAC_VOICES {
+                                    voices.push((k.to_string(), l.to_string()));
+                                }
+                                let shown = voices.iter().find(|v| v.0 == d.voice).map(|v| v.1.clone()).unwrap_or_else(|| "Choose a voice…".into());
+                                let r = egui::ComboBox::from_id_salt(format!("{p}.voice")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+                                    for (k, l) in &voices {
+                                        let o = ui.selectable_value(&mut d.voice, k.clone(), l);
+                                        elems.push((format!("{p}.voice.{k}"), o.rect, l.clone()));
+                                    }
+                                });
+                                elems.push((format!("{p}.voice"), r.response.rect, shown));
+                                ui.end_row();
+                                if !d.voice.starts_with("mac") && !d.voice.is_empty() {
+                                    ui.label("Takes per line");
+                                    let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
+                                    elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
+                                    ui.end_row();
+                                }
+                                ui.label("Shape");
+                                radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
+                                ui.end_row();
+                                ui.label("Pace");
+                                radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
+                                ui.end_row();
+                                ui.label("Pictures from");
+                                ui.vertical(|ui| {
+                                    let r = ui.checkbox(&mut d.src_free, "Free-licensed photos and videos (Wikimedia Commons, Openverse; credited)");
+                                    elems.push((format!("{p}.free"), r.rect, d.src_free.to_string()));
+                                    let r = ui.checkbox(&mut d.src_cards, "Headline and fact cards from the research");
+                                    elems.push((format!("{p}.cards"), r.rect, d.src_cards.to_string()));
+                                    let r = ui.checkbox(&mut d.src_youtube, "Short clips from YouTube videos the research finds");
+                                    elems.push((format!("{p}.youtube"), r.rect, d.src_youtube.to_string()));
+                                    if d.src_youtube {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Only where you have the right to use them (e.g. commentary or news). Every source is listed in sources.md.",
+                                            )
+                                            .weak(),
+                                        );
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label("");
+                                let r = ui.checkbox(&mut d.captions, "Captions");
+                                elems.push((format!("{p}.captions"), r.rect, d.captions.to_string()));
+                                ui.end_row();
+                            }
+                        }
+                        Kind::Voice => {
+                            ui.label("Voice name");
+                            let r = ui.add(egui::TextEdit::singleline(&mut d.voice_name).hint_text("e.g. my voice").desired_width(240.0));
+                            elems.push((format!("{p}.name"), r.rect, d.voice_name.clone()));
+                            ui.end_row();
+                            ui.label("Languages");
+                            ui.horizontal(|ui| {
+                                let r = ui.checkbox(&mut d.lang_hi, "Hindi");
+                                elems.push((format!("{p}.lang.hi"), r.rect, d.lang_hi.to_string()));
+                                let r = ui.checkbox(&mut d.lang_mix, "Hinglish");
+                                elems.push((format!("{p}.lang.mix"), r.rect, d.lang_mix.to_string()));
+                                let r = ui.checkbox(&mut d.lang_en, "English");
+                                elems.push((format!("{p}.lang.en"), r.rect, d.lang_en.to_string()));
+                            });
+                            ui.end_row();
+                            ui.label("Source");
+                            radio_row(ui, &mut d.source, &VOICE_SOURCES, &format!("{p}.source"), &mut elems);
+                            ui.end_row();
+                        }
+                        Kind::Talk => {
+                            ui.label("Format");
+                            radio_row(ui, &mut d.preset, &PRESETS, &format!("{p}.preset"), &mut elems);
+                            ui.end_row();
+                            ui.label("");
+                            let r = ui.checkbox(&mut d.captions, "Burn in captions (speech to text, on this Mac)");
                             elems.push((format!("{p}.captions"), r.rect, d.captions.to_string()));
                             ui.end_row();
                         }
                     }
-                    Kind::Voice => {
-                        ui.label("Voice name");
-                        let r = ui.add(egui::TextEdit::singleline(&mut d.voice_name).hint_text("e.g. my voice").desired_width(240.0));
-                        elems.push((format!("{p}.name"), r.rect, d.voice_name.clone()));
-                        ui.end_row();
-                        ui.label("Languages");
-                        ui.horizontal(|ui| {
-                            let r = ui.checkbox(&mut d.lang_hi, "Hindi");
-                            elems.push((format!("{p}.lang.hi"), r.rect, d.lang_hi.to_string()));
-                            let r = ui.checkbox(&mut d.lang_mix, "Hinglish");
-                            elems.push((format!("{p}.lang.mix"), r.rect, d.lang_mix.to_string()));
-                            let r = ui.checkbox(&mut d.lang_en, "English");
-                            elems.push((format!("{p}.lang.en"), r.rect, d.lang_en.to_string()));
-                        });
-                        ui.end_row();
-                        ui.label("Source");
-                        radio_row(ui, &mut d.source, &VOICE_SOURCES, &format!("{p}.source"), &mut elems);
+                    if d.kind != Kind::Voice {
+                        let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv);
+                        ui.label(if folder_out { "Output folder" } else { "Save as" });
+                        let hint = match d.kind {
+                            Kind::Script => "automatic (Movies/EI/Scripts)",
+                            Kind::Topic => "automatic (Movies/EI/Topics/<topic>)",
+                            Kind::Tv => "automatic (“EI on TV” next to the clips)",
+                            _ => "automatic (next to the source)",
+                        };
+                        if path_row(ui, &mut d.out, &format!("{p}.out"), hint, &mut elems) {
+                            pick = Some(Pick::Out);
+                        }
                         ui.end_row();
                     }
-                    Kind::Talk => {
-                        ui.label("Format");
-                        radio_row(ui, &mut d.preset, &PRESETS, &format!("{p}.preset"), &mut elems);
-                        ui.end_row();
+                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic) {
                         ui.label("");
-                        let r = ui.checkbox(&mut d.captions, "Burn in captions (speech to text, on this Mac)");
-                        elems.push((format!("{p}.captions"), r.rect, d.captions.to_string()));
+                        let label = match d.kind {
+                            Kind::Split | Kind::Clips | Kind::Tv => "Import the videos into the project",
+                            Kind::Audio => "Import the audio into the project",
+                            _ => "Open the edit in the timeline when done",
+                        };
+                        let r = ui.checkbox(&mut d.import, label);
+                        elems.push((format!("{p}.import"), r.rect, d.import.to_string()));
                         ui.end_row();
                     }
-                }
-                if d.kind != Kind::Voice {
-                    let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic);
-                    ui.label(if folder_out { "Output folder" } else { "Save as" });
-                    let hint = match d.kind {
-                        Kind::Script => "automatic (Movies/EI/Scripts)",
-                        Kind::Topic => "automatic (Movies/EI/Topics/<topic>)",
-                        _ => "automatic (next to the source)",
-                    };
-                    if path_row(ui, &mut d.out, &format!("{p}.out"), hint, &mut elems) {
-                        pick = Some(Pick::Out);
-                    }
-                    ui.end_row();
-                }
-                if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic) {
-                    ui.label("");
-                    let label = match d.kind {
-                        Kind::Split | Kind::Clips => "Import the clips into the project",
-                        Kind::Audio => "Import the audio into the project",
-                        _ => "Open the edit in the timeline when done",
-                    };
-                    let r = ui.checkbox(&mut d.import, label);
-                    elems.push((format!("{p}.import"), r.rect, d.import.to_string()));
-                    ui.end_row();
+                });
+                if d.kind == Kind::Voice && d.source == "record" {
+                    ui.separator();
+                    recorder_ui(ui, &mut d, &p, &mut elems);
                 }
             });
-            if d.kind == Kind::Voice && d.source == "record" {
-                ui.separator();
-                recorder_ui(ui, &mut d, &p, &mut elems);
-            }
-            if d.kind == Kind::Tv && d.tv.calib.is_some() {
-                ui.separator();
-                tv_calib_ui(ui, &mut d, &p, &mut elems);
-            }
             if !d.error.is_empty() {
                 ui.add_space(4.0);
                 ui.colored_label(egui::Color32::from_rgb(0xE5, 0x6B, 0x6B), &d.error);
@@ -1994,6 +2016,16 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 }
             });
         });
+    if d.kind == Kind::Tv && d.tv.calib.is_some() {
+        // the corner check: its own window on top, everything visible at once
+        egui::Window::new("Check TV Corners")
+            .id(egui::Id::new("ei-ai-tv-corners"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| tv_calib_ui(ui, &mut d, &p, &mut elems));
+    }
     for (id, r, l) in elems {
         app.auto.add(&id, r, &l);
     }
@@ -2382,10 +2414,38 @@ fn tv_calib_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
     }
     ui.label(
         egui::RichText::new(
-            "Drag the four green corners onto the corners of the TV's picture (inside the black frame). The monitor and laptop are never touched.",
+            "Drag the four green corners onto the corners of the TV's picture (inside the black frame); arrow keys nudge the last corner you touched. Check other moments with the slider: if the outline drifts there, fix it at that moment and save.",
         )
         .weak(),
     );
+    let mut load_at: Option<f64> = None;
+    ui.horizontal(|ui| {
+        ui.label("Moment");
+        let dur = c.duration.max(1.0);
+        let r = ui.add(egui::Slider::new(&mut c.at, 0.0..=dur).suffix(" s").max_decimals(1));
+        elems.push((format!("{p}.moment"), r.rect, format!("{:.1}", c.at)));
+        let b = ui.add_enabled(c.job.is_none(), egui::Button::new("Show This Moment"));
+        elems.push((format!("{p}.moment.show"), b.rect, "Show This Moment".into()));
+        if b.clicked() {
+            load_at = Some(c.at);
+        }
+        ui.weak(match c.source.as_str() {
+            "tracked" => "corners: where EI tracked the TV here",
+            "saved" => "corners: your saved ones",
+            _ => "corners: EI's suggestion",
+        });
+    });
+    if let Some(t) = load_at {
+        let png = support_dir().join("tvlight").join(format!("{}-{:.0}.png", file_stem(&c.path), t * 10.0));
+        match engine_step(vec!["tv-frame".into(), c.path.clone(), "--out".into(), png.to_string_lossy().to_string(), "--t".into(), format!("{t:.2}")]) {
+            Ok((step, engine)) => {
+                c.job = Some(start_job(format!("TV Light Sync: moment {t:.0}s"), None, vec![step], false, Some(engine)));
+                c.loaded = false;
+            }
+            Err(e) => d.error = e,
+        }
+        return;
+    }
     let tex_id = egui::Id::new(("ei-tv-calib-tex", c.image.clone()));
     let tex = ui.ctx().data(|m| m.get_temp::<egui::TextureHandle>(tex_id));
     let tex = match tex {
@@ -2403,7 +2463,8 @@ fn tv_calib_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
         }
     };
     let [tw, th] = tex.size();
-    let max = egui::vec2(640.0, 420.0);
+    // sized to the screen: the corners must be reachable on a laptop screen too
+    let max = egui::vec2(720.0, (ui.ctx().content_rect().height() - 300.0).clamp(220.0, 560.0));
     let scale = (max.x / tw.max(1) as f32).min(max.y / th.max(1) as f32);
     let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -2427,20 +2488,84 @@ fn tv_calib_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
             q[0] = (q[0] + dlt.x / size.x.max(1.0)).clamp(-0.2, 1.2);
             q[1] = (q[1] + dlt.y / size.y.max(1.0)).clamp(-0.2, 1.2);
         }
-        let col = if r.hovered() || r.dragged() { egui::Color32::WHITE } else { green };
+        if r.dragged() || r.clicked() || r.drag_started() {
+            c.active = Some(k);
+        }
+        let col = if r.hovered() || r.dragged() || c.active == Some(k) { egui::Color32::WHITE } else { green };
         ui.painter().circle_stroke(pt, 7.0, egui::Stroke::new(2.0, col));
         ui.painter().circle_filled(pt, 2.0, col);
         elems.push((format!("{p}.corner.{k}"), hr, (*label).to_string()));
     }
-    let (mut save_clicked, mut close) = (false, false);
+    // arrow keys nudge the active corner by one pixel of the frame
+    if let Some(k) = c.active
+        && let Some(q) = c.quad.get_mut(k)
+    {
+        let (dx, dy) = ui.input(|i| {
+            let mut v = (0.0f32, 0.0f32);
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                v.0 -= 1.0;
+            }
+            if i.key_pressed(egui::Key::ArrowRight) {
+                v.0 += 1.0;
+            }
+            if i.key_pressed(egui::Key::ArrowUp) {
+                v.1 -= 1.0;
+            }
+            if i.key_pressed(egui::Key::ArrowDown) {
+                v.1 += 1.0;
+            }
+            v
+        });
+        q[0] = (q[0] + dx / tw.max(1) as f32).clamp(-0.2, 1.2);
+        q[1] = (q[1] + dy / th.max(1) as f32).clamp(-0.2, 1.2);
+        // magnifier: the area around the active corner, enlarged, in the image's top-right
+        let zoom = 0.05f32;
+        let aspect = tw as f32 / th.max(1) as f32;
+        let (cx, cy) = (q[0].clamp(0.0, 1.0), q[1].clamp(0.0, 1.0));
+        let uv = egui::Rect::from_min_max(egui::pos2(cx - zoom * 0.5, cy - zoom * 0.5 * aspect), egui::pos2(cx + zoom * 0.5, cy + zoom * 0.5 * aspect));
+        let side = 130.0;
+        let inset = egui::Rect::from_min_size(egui::pos2(rect.max.x - side - 6.0, rect.min.y + 6.0), egui::vec2(side, side));
+        ui.painter().rect_filled(inset.expand(2.0), 2.0, egui::Color32::BLACK);
+        ui.painter().image(tex.id(), inset, uv, egui::Color32::WHITE);
+        let mid = inset.center();
+        ui.painter().line_segment([egui::pos2(mid.x - 10.0, mid.y), egui::pos2(mid.x + 10.0, mid.y)], egui::Stroke::new(1.0, green));
+        ui.painter().line_segment([egui::pos2(mid.x, mid.y - 10.0), egui::pos2(mid.x, mid.y + 10.0)], egui::Stroke::new(1.0, green));
+    }
+    let (mut save_clicked, mut close, mut want_preview) = (false, false, false);
     ui.horizontal(|ui| {
         let save = ui.add_enabled(c.saving.is_none(), egui::Button::new("Save Corners"));
         elems.push((format!("{p}.corners.save"), save.rect, "Save Corners".into()));
         save_clicked = save.clicked();
+        let pv = ui.add_enabled(c.preview_job.is_none(), egui::Button::new(if c.preview_job.is_some() { "Checking alignment…" } else { "Preview Alignment" }));
+        elems.push((format!("{p}.corners.preview"), pv.rect, "Preview Alignment".into()));
+        want_preview = pv.clicked();
         let cancel = ui.button("Close");
         elems.push((format!("{p}.corners.close"), cancel.rect, "Close".into()));
         close = cancel.clicked();
     });
+    if !c.preview_image.is_empty() {
+        let pid = egui::Id::new(("ei-tv-preview-tex", c.preview_image.clone()));
+        let ptex = ui.ctx().data(|m| m.get_temp::<egui::TextureHandle>(pid)).or_else(|| {
+            let img = image::open(&c.preview_image).ok()?.to_rgba8();
+            let size = [img.width() as usize, img.height() as usize];
+            let t = ui.ctx().load_texture("ei-tv-preview", egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR);
+            ui.ctx().data_mut(|m| m.insert_temp(pid, t.clone()));
+            Some(t)
+        });
+        if let Some(t) = ptex {
+            let [pw, ph] = t.size();
+            let sc = (640.0 / pw.max(1) as f32).min(360.0 / ph.max(1) as f32);
+            ui.label(egui::RichText::new("The tracked outline across the recording (saved corners):").weak());
+            ui.image((t.id(), egui::vec2(pw as f32 * sc, ph as f32 * sc)));
+        }
+    }
+    if want_preview {
+        let png = support_dir().join("tvlight").join(format!("{}-preview.png", file_stem(&c.path)));
+        match engine_step(vec!["tv-preview".into(), c.path.clone(), "--out".into(), png.to_string_lossy().to_string()]) {
+            Ok((step, engine)) => c.preview_job = Some(start_job("TV Light Sync: alignment preview".into(), None, vec![step], false, Some(engine))),
+            Err(e) => d.error = e,
+        }
+    }
     if save_clicked {
         let q: Vec<String> = c.quad.iter().flat_map(|v| [format!("{:.4}", v[0]), format!("{:.4}", v[1])]).collect();
         match engine_step(vec!["tv-calibrate".into(), c.path.clone(), "--quad".into(), q.join(","), "--ref-t".into(), format!("{}", c.ref_t)]) {
@@ -2487,6 +2612,9 @@ fn poll_tv(d: &mut Draft) {
         if st == Status::Done {
             c.image = res.get("image").and_then(Value::as_str).unwrap_or_default().to_string();
             c.ref_t = res.get("ref_t").and_then(Value::as_f64).unwrap_or(0.0);
+            c.at = c.ref_t;
+            c.duration = res.get("duration").and_then(Value::as_f64).unwrap_or(c.duration);
+            c.source = res.get("source").and_then(Value::as_str).unwrap_or("suggested").to_string();
             if let Some(q) = res.get("quad").and_then(Value::as_array) {
                 for (k, pt) in q.iter().take(4).enumerate() {
                     let x = pt.get(0).and_then(Value::as_f64).unwrap_or(0.5) as f32;
@@ -2500,6 +2628,18 @@ fn poll_tv(d: &mut Draft) {
         } else {
             d.error = format!("Could not read the recording: {err}");
             d.tv.calib = None;
+            return;
+        }
+    }
+    if let Some(j) = c.preview_job
+        && let Some((st, res, err)) = job_state(j)
+        && st != Status::Running
+    {
+        c.preview_job = None;
+        if st == Status::Done {
+            c.preview_image = res.get("image").and_then(Value::as_str).unwrap_or_default().to_string();
+        } else {
+            d.error = format!("Could not check the alignment: {err}");
             return;
         }
     }
@@ -3085,23 +3225,28 @@ mod tests {
     fn tv_light_arguments() {
         let dir = std::env::temp_dir().join(format!("ei-ai-test4-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let clip = dir.join("clip.mp4");
-        std::fs::write(&clip, b"x").unwrap();
+        let (c1, c2) = (dir.join("a.mp4"), dir.join("b.mp4"));
+        std::fs::write(&c1, b"x").unwrap();
+        std::fs::write(&c2, b"x").unwrap();
+        // a list of clips: one background job, output folder
         let mut d = Draft::from_params(
             Kind::Tv,
-            &json!({"input": clip.to_string_lossy(), "recordings": dir.to_string_lossy(), "aspect": "horizontal", "relight": 0.6}),
+            &json!({"clips": [c1.to_string_lossy(), c2.to_string_lossy()], "recordings": dir.to_string_lossy(), "aspect": "horizontal", "relight": 0.6}),
         );
         let a = d.engine_args().unwrap();
         assert_eq!(a.first().map(String::as_str), Some("tv-make"));
+        assert!(a.contains(&c1.to_string_lossy().to_string()) && a.contains(&c2.to_string_lossy().to_string()));
         for pair in [["--orientation", "horizontal"], ["--relight", "0.6"]] {
             assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
         }
-        assert!(d.out.ends_with("clip - on TV horizontal.mp4"), "{}", d.out);
-        let a = Draft::from_params(Kind::Tv, &json!({"input": clip.to_string_lossy(), "recordings": dir.to_string_lossy(), "aspect": "vertical"}))
+        assert!(a.windows(2).any(|w| w[0] == "--out-dir" && w[1].ends_with("EI on TV")), "{a:?}");
+        assert!(d.out.ends_with("EI on TV"), "{}", d.out);
+        // one clip given the old way ("input") still works
+        let a = Draft::from_params(Kind::Tv, &json!({"input": c1.to_string_lossy(), "recordings": dir.to_string_lossy(), "aspect": "vertical"}))
             .engine_args()
             .unwrap();
-        assert!(a.windows(2).any(|w| w == ["--orientation", "vertical"]));
-        assert!(Draft::from_params(Kind::Tv, &json!({"input": clip.to_string_lossy(), "recordings": "/no/such"})).engine_args().is_err());
+        assert!(a.windows(2).any(|w| w == ["--orientation", "vertical"]) && a.contains(&c1.to_string_lossy().to_string()));
+        assert!(Draft::from_params(Kind::Tv, &json!({"clips": [c1.to_string_lossy()], "recordings": "/no/such"})).engine_args().is_err());
         assert!(Draft::from_params(Kind::Tv, &json!({"recordings": dir.to_string_lossy()})).engine_args().is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

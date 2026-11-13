@@ -150,7 +150,7 @@ fn ai_menu_and_dialogs() {
                 "run",
             ],
         ),
-        ("tv", &["input", "recordings", "aspect.horizontal", "aspect.vertical", "relight", "out", "run"]),
+        ("tv", &["clips.add", "clips.addFolder", "recordings", "aspect.horizontal", "aspect.vertical", "relight", "out", "run"]),
         (
             "topic",
             &[
@@ -421,6 +421,8 @@ fn tv_light_corner_check() {
     std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
     std::fs::write(&settings, serde_json::to_string(&json!({"tv_recordings": folder.to_string_lossy()})).unwrap()).unwrap();
     let mut d = Driver::demo();
+    d.ok("ui.resize", json!({"width": 1512, "height": 869}));
+    d.frames(4);
     d.run("ai.tv", json!({}));
     let wait = |d: &mut Driver, id: &str, secs: u64| {
         let t0 = Instant::now();
@@ -438,6 +440,7 @@ fn tv_light_corner_check() {
     wait(&mut d, "ai.tv.corner.0", 180);
     d.frames(3);
     d.snapshot("tv-corners");
+    assert!(d.ids("ai.tv.moment").iter().any(|x| x == "ai.tv.moment.show") && d.ids("ai.tv.corners.preview").len() == 1);
     d.frames(12);
     d.ok("ui.drag", json!({"from": {"id": "ai.tv.corner.0"}, "to": {"id": "ai.tv.corner.0", "dx": 6, "dy": 4}}));
     d.frames(4);

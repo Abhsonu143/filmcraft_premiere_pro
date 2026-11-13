@@ -78,3 +78,21 @@ def test_good_quad_rejects_triangles():
     assert tl.good_quad(np.float32([[0.1, 0.2], [0.8, 0.25], [0.78, 0.6], [0.12, 0.65]]))
     assert not tl.good_quad(np.float32([[0.02, 0.53], [0.74, 0.28], [0.72, 0.51], [0.02, 0.53]]))  # GX011573's first guess
     assert not tl.good_quad(np.float32([[0.1, 0.1], [0.12, 0.1], [0.12, 0.12], [0.1, 0.12]]))
+
+
+def test_batch_keeps_going_and_names_outputs(tmp_path, monkeypatch):
+    made = []
+
+    def fake_make(clip, folder, out, orientation="horizontal", relight=1.0, fps=30.0, recording=None):
+        if "bad" in clip:
+            raise tl.AutocutError("cannot read")
+        made.append(out)
+
+    monkeypatch.setattr(tl, "make", fake_make)
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "a - on TV vertical.mp4").write_bytes(b"old")  # never overwritten
+    res = tl.make_batch([str(tmp_path / "a.mp4"), str(tmp_path / "bad.mp4"), str(tmp_path / "c.mp4")], str(tmp_path), str(tmp_path / "out"), "vertical")
+    assert [p.split("/")[-1] for p in res["outputs"]] == ["a - on TV vertical 2.mp4", "c - on TV vertical.mp4"]
+    assert res["failed"][0]["clip"].endswith("bad.mp4")
+    with pytest.raises(tl.AutocutError):
+        tl.make_batch([str(tmp_path / "bad.mp4")], str(tmp_path), str(tmp_path / "out"))

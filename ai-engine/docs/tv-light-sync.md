@@ -25,6 +25,27 @@ recorded.
 - **Untouched areas:** the monitor, laptop and lamps are bright in every frame whatever the backlight does,
   so they are found that way and never recoloured.
 
+## Checking and re-checking corners
+
+AI ▸ TV Light Sync ▸ **Check corners** (or **Re-check**) opens its own window, sized to the screen.
+
+- **Drag the corners.** Drag the four corners onto the TV's picture. The corner you last touched shows
+  enlarged in a magnifier, and the arrow keys nudge it one pixel at a time.
+- **Moment slider + Show This Moment:** look at any moment of the recording. Once the recording has been
+  analysed, the corners start where EI tracked the TV at that moment. If the outline drifted there, fix it and
+  save: tracking then starts again from that moment.
+- **Preview Alignment:** shows six moments across the recording with the tracked outline, so drift is visible
+  at a glance. The first time, it analyses the recording.
+
+## Several clips
+
+Add as many clips as you like. They run one after another in one background job (AI ▸ AI Jobs shows
+"clip 2/5"). The room analysis is shared, so after the first clip each one takes about its render time.
+
+- A clip that can't be made, or is missing, is reported and the rest carry on.
+- Videos are saved as `<clip> - on TV <shape>.mp4` in the output folder (default: "EI on TV" next to the clips).
+  An existing file is never overwritten.
+
 ## Making a video
 
 1. **Predict the glow.** The glow your clip would cause is predicted every 0.1 s: its edge colours, at the

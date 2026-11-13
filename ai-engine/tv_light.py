@@ -666,9 +666,13 @@ def suggest(path: str, n: int = 16) -> dict:
             break
     if quad is not None and not good_quad(quad):
         quad = None  # e.g. two corners on top of each other (a triangle): use the TV area's box instead
-    if quad is None:
-        x, y, w, h = cv2.boundingRect(hull)
-        quad = np.float32([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
+    if quad is None:  # the largest single rectangle Vision saw on the TV, else the area's box
+        biggest = order_quad(max(same_frame, key=lambda r: cv2.contourArea(np.float32(r))))
+        if good_quad(biggest):
+            quad = biggest
+        else:
+            x, y, w, h = cv2.boundingRect(hull)
+            quad = np.float32([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
     others = [order_quad(rects[g[0]][1]).tolist() for k, g in enumerate(groups) if g is not tv and rects[g[0]][0] == best_t]
     conf = float(len(tv) / max(1, len(frames)))
     return {"ref_t": best_t, "quad": quad.tolist(), "others": others, "confidence": round(min(1.0, conf), 2)}
@@ -714,18 +718,96 @@ def scan_status(folder: str) -> list[dict]:
     return out
 
 
-def frame_for_calibration(path: str, out_png: str) -> dict:
-    """A frame to place the corners on (the suggested one) and the suggestion itself."""
+def cached_analysis(path: str) -> dict | None:
+    """The analysis of a recording for its current calibration, if it was already made (never computes)."""
+    cal = calibration(path)
+    if not cal:
+        return None
+    key = ac.file_key(path, VERSION, json.dumps([cal["ref_t"], cal["quad"], cal.get("others") or []]))
+    f = cache_dir() / f"{key}.json"
+    try:
+        return json.loads(f.read_text()) if f.is_file() else None
+    except ValueError:
+        return None
+
+
+def frame_for_calibration(path: str, out_png: str, t: float | None = None) -> dict:
+    """A frame to place the corners on, and the corners to start from: at time `t` the TV where
+    the tracking found it (when the recording was analysed), else the saved or suggested corners."""
     import cv2
 
+    meta = probe_rec(path)
     cal = calibration(path)
     sug = cal if cal else suggest(path)
     if not cal:
         save_calibration(path, sug["ref_t"], sug["quad"], sug.get("others"), confirmed=False)
-    f = frame_at(path, sug["ref_t"], 1280)
+    at = float(sug["ref_t"] if t is None else np.clip(t, 0.0, max(0.0, meta["duration"] - 0.2)))
+    quad, source = sug["quad"], "saved" if (cal and cal.get("confirmed")) else "suggested"
+    if t is not None and abs(at - float(sug["ref_t"])) > 0.05:
+        a = cached_analysis(path)
+        if a and a.get("quads"):
+            i = int(np.clip(round(at * HZ), 0, len(a["quads"]) - 1))
+            quad, source = a["quads"][i], "tracked"
+    f = frame_at(path, at, 1280)
     cv2.imwrite(out_png, f)
-    return {"image": out_png, "width": f.shape[1], "height": f.shape[0], "ref_t": sug["ref_t"], "quad": sug["quad"],
-            "confirmed": bool(cal and cal.get("confirmed")), "others": sug.get("others", [])}
+    return {"image": out_png, "width": f.shape[1], "height": f.shape[0], "ref_t": at, "quad": quad, "duration": meta["duration"],
+            "confirmed": bool(cal and cal.get("confirmed")), "source": source, "others": sug.get("others", [])}
+
+
+def preview(path: str, out_png: str, n: int = 6) -> dict:
+    """Moments across the recording with the tracked TV outline drawn: shows drift at a glance
+    (analyses the recording first if needed)."""
+    import cv2
+
+    cal = calibration(path)
+    if not cal:
+        s = suggest(path)
+        cal = save_calibration(path, s["ref_t"], s["quad"], s.get("others"), confirmed=False)
+    a = analyse(path, cal["ref_t"], cal["quad"], cal.get("others"))
+    Q = np.float32(a["quads"])
+    tiles = []
+    times = []
+    for k in range(n):
+        t = float(a["duration"]) * (0.05 + 0.9 * k / max(1, n - 1))
+        i = int(np.clip(round(t * HZ), 0, len(Q) - 1))
+        f = frame_at(path, t, 640)
+        h, w = f.shape[:2]
+        cv2.polylines(f, [(Q[i] * [w, h]).astype(np.int32)], True, (60, 230, 90), 2, cv2.LINE_AA)
+        cv2.putText(f, f"{t:.0f}s", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        tiles.append(f)
+        times.append(round(t, 1))
+    cols = 3
+    rows = [np.hstack(tiles[r * cols : (r + 1) * cols]) for r in range((len(tiles) + cols - 1) // cols) if len(tiles[r * cols : (r + 1) * cols]) == cols]
+    sheet = np.vstack(rows) if rows else tiles[0]
+    cv2.imwrite(out_png, sheet)
+    locked = float(np.mean(np.float32(a["quality"]) > 0))
+    return {"image": out_png, "times": times, "locked": round(locked, 3)}
+
+
+def make_batch(clips: list[str], folder: str, out_dir: str, orientation: str = "horizontal", relight: float = 1.0,
+               recording: str | None = None) -> dict:
+    """Several clips one after another (the room analysis is shared, so later clips go faster).
+    A clip that fails is reported and the rest carry on."""
+    outd = Path(out_dir).expanduser().resolve()
+    outd.mkdir(parents=True, exist_ok=True)
+    done, failed = [], []
+    for k, c in enumerate(clips, 1):
+        out = outd / f"{Path(c).stem} - on TV {orientation}.mp4"
+        n = 2
+        while out.exists():
+            out = outd / f"{Path(c).stem} - on TV {orientation} {n}.mp4"
+            n += 1
+        log(f"clip {k}/{len(clips)}: {Path(c).name}")
+        try:
+            make(c, folder, str(out), orientation, relight, recording=recording)
+            done.append(str(out))
+        except AutocutError as e:
+            log(f"{Path(c).name} failed: {e}")
+            failed.append({"clip": c, "error": str(e)})
+        log(f"progress {k}/{len(clips)} clips")
+    if not done:
+        raise AutocutError("no clip could be made" + (f": {failed[0]['error']}" if failed else ""))
+    return {"outputs": done, "out_dir": str(outd), "failed": failed}
 
 
 def make(clip: str, folder: str, out: str, orientation: str = "horizontal", relight: float = 1.0, fps: float = 30.0,
@@ -778,14 +860,19 @@ def add_args(sub) -> None:
     p = sub.add_parser("tv-frame", help="a frame and suggested TV corners for calibration")
     p.add_argument("recording")
     p.add_argument("--out", required=True, help="PNG to write")
+    p.add_argument("--t", type=float, help="this moment of the recording (the tracked corners there)")
+    p = sub.add_parser("tv-preview", help="moments across a recording with the tracked TV outline (checks alignment)")
+    p.add_argument("recording")
+    p.add_argument("--out", required=True, help="PNG to write")
     p = sub.add_parser("tv-calibrate", help="save the TV corners of a recording")
     p.add_argument("recording")
     p.add_argument("--quad", required=True, help="x1,y1,x2,y2,x3,y3,x4,y4 normalised (top-left, top-right, bottom-right, bottom-left)")
     p.add_argument("--ref-t", type=float, required=True)
-    p = sub.add_parser("tv-make", help="your clip on the TV, backlight matched in software")
-    p.add_argument("clip")
+    p = sub.add_parser("tv-make", help="your clip(s) on the TV, backlight matched in software")
+    p.add_argument("clips", nargs="+")
     p.add_argument("--recordings", required=True)
-    p.add_argument("--out", required=True)
+    p.add_argument("--out", help="output file (one clip)")
+    p.add_argument("--out-dir", help="output folder (several clips: '<clip> - on TV <shape>.mp4')")
     p.add_argument("--orientation", default="horizontal", choices=list(SIZES))
     p.add_argument("--relight", type=float, default=1.0, help="0 = only choose matching moments, 1 = also recolour the glow fully")
     p.add_argument("--recording", help="use this recording only")
@@ -797,7 +884,9 @@ def run_args(a) -> dict:
         recs = scan_status(a.folder)
         return {"recordings": [{k: r[k] for k in ("path", "orientation", "duration", "width", "height", "calibrated")} for r in recs]}
     if a.cmd == "tv-frame":
-        return frame_for_calibration(a.recording, a.out)
+        return frame_for_calibration(a.recording, a.out, a.t)
+    if a.cmd == "tv-preview":
+        return preview(a.recording, a.out)
     if a.cmd == "tv-calibrate":
         v = [float(x) for x in a.quad.split(",")]
         if len(v) != 8 or not all(-0.5 <= x <= 1.5 for x in v):
@@ -805,5 +894,21 @@ def run_args(a) -> dict:
         e = save_calibration(a.recording, a.ref_t, [v[0:2], v[2:4], v[4:6], v[6:8]], confirmed=True)
         return {"calibration": e}
     if a.cmd == "tv-make":
-        return make(a.clip, a.recordings, a.out, a.orientation, a.relight, recording=a.recording)
+        import voiceover_cut as vc
+
+        clips, missing = [], []
+        for item in a.clips:  # a missing clip is reported, the others still run
+            try:
+                clips += vc.collect_clips([item])
+            except AutocutError:
+                missing.append({"clip": item, "error": "not found"})
+                log(f"skipping {item}: not found")
+        if not clips:
+            raise AutocutError("none of the clips were found")
+        if len(clips) == 1 and a.out and not a.out_dir:
+            return make(clips[0], a.recordings, a.out, a.orientation, a.relight, recording=a.recording)
+        out_dir = a.out_dir or (str(Path(a.out).parent) if a.out else str(Path(clips[0]).parent / "EI on TV"))
+        res = make_batch(clips, a.recordings, out_dir, a.orientation, a.relight, recording=a.recording)
+        res["failed"] = missing + res.get("failed", [])
+        return res
     raise AutocutError(f"unknown command {a.cmd}")
