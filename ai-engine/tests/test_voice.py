@@ -183,3 +183,21 @@ def test_end_of_speech_in_a_noisy_room():
         dbs.append(d)
         quiet = vo.quiet_after(dbs, quiet, 0.05)
     assert quiet < 0.3
+
+
+def test_lines_grouped_into_passages():
+    segs = [{"text": "One short line.", "pause_after": 0.3}, {"text": "Two short line.", "pause_after": 0.3}, {"text": "Three.", "pause_after": 1.0},
+            {"text": "After a long pause.", "pause_after": 0.3}, {"text": "नमस्ते दोस्तों।", "pause_after": 0.3}]
+    plan = [{"lang": "en", "energy": 0.5}] * 4 + [{"lang": "hi", "energy": 0.5}]
+    ch = vo.group_lines(segs, plan)
+    assert [c["lines"] for c in ch] == [[0, 1, 2], [3], [4]]  # a long pause and a language change start new passages
+    assert ch[0]["text"] == "One short line. Two short line. Three." and ch[2]["lang"] == "hi"
+
+
+def test_split_points_find_the_breath():
+    t = np.arange(vo.SR * 2) / vo.SR
+    speech = (0.3 * np.sin(2 * np.pi * 150 * t)).astype(np.float32)
+    y = np.concatenate([speech, np.zeros(int(0.3 * vo.SR), np.float32), speech[: vo.SR]])  # 2 s, breath, 1 s
+    pts = vo.split_points(y, ["a much longer first sentence here", "short"])
+    assert pts[0] == 0 and pts[-1] == pytest.approx(len(y) / vo.SR)
+    assert 2.0 <= pts[1] <= 2.3  # inside the breath, not at the proportional guess
