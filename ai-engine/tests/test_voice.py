@@ -63,7 +63,10 @@ def test_script_prompt_and_cleaning():
     assert "Hinglish" in p and "JSON" in p and "river" in p
     assert sw.target_words(60, "en", None, wpm_override=120) < sw.target_words(60, "en", None, wpm_override=180)
     seg = sw.clean_segment({"text": "  Hello (laughs) **world** #travel ", "emotion": "ANGRY", "energy": "x", "pause_after": 9})
-    assert seg["text"] == "Hello world travel" and seg["emotion"] == "neutral" and seg["energy"] == 0.5 and seg["pause_after"] == 2.0
+    assert seg["text"] == "Hello world travel" and seg["emotion"] == "Anger" and seg["energy"] == 0.5 and seg["pause_after"] == 2.0
+    assert sw.clean_segment({"text": "x", "emotion": "bored"})["emotion"] == "Neutral"
+    assert sw.clean_segment({"text": "x", "emotion": "awe", "intensity": 3})["intensity"] == 1.0
+    assert "Triumph" in p and "intensity" in p
     data = sw.extract_json('Sure!\n```json\n{"title": "T", "segments": []}\n```')
     assert data["title"] == "T"
 
@@ -109,8 +112,8 @@ def test_script_segments_from_json_and_text(tmp_path):
     j.write_text(json.dumps({"language": "hinglish", "segments": [{"text": "नमस्ते", "emotion": "warm"}, {"text": " "}]}), encoding="utf-8")
     segs, lang = vo.script_segments(str(j))
     assert lang == "hi" and len(segs) == 1
-    segs, lang = vo.script_segments("[excited] What a view! [calm] Then silence.")
-    assert lang == "en" and [s["emotion"] for s in segs] == ["excited", "calm"]
+    segs, lang = vo.script_segments("[excited] What a view! [calm] Then silence. [Awe 0.9] Look up.")
+    assert lang == "en" and [s["emotion"] for s in segs] == ["Excitement", "Calmness", "Awe"] and segs[2]["intensity"] == 0.9
 
 
 # ---------------------------------------------------------------- voiceover editor

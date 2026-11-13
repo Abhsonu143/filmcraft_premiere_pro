@@ -48,6 +48,7 @@ from pathlib import Path
 import numpy as np
 
 import autocut as ac
+import emotions as em
 from autocut import AutocutError, log
 
 SR = 24000
@@ -623,7 +624,21 @@ def choose_ref(prof: dict, lang: str, emotion: str, energy: float, used: dict[st
     return max(refs, key=score)
 
 
+def line_energy(seg: dict) -> float:
+    """How energetic a line is (0–1): its own energy/intensity, else from its emotion."""
+    emo = seg.get("emotion", "neutral")
+    if "energy" in seg:
+        return float(seg["energy"])
+    if emo in EMOTION_ENERGY:
+        return EMOTION_ENERGY[emo]
+    e = em.info(emo)
+    return float(0.2 + 0.6 * e["arousal"] * (0.6 + 0.4 * float(seg.get("intensity", 0.6))))
+
+
 def engine_params(seg: dict, engine: str) -> dict:
+    if engine == "chatterbox" and seg.get("emotion") and seg.get("emotion") not in EMOTION_ENERGY:
+        # the 42 emotions: their own delivery (expressiveness, pacing) at the line's intensity
+        return em.voice_params(seg["emotion"], float(seg.get("intensity", 0.6)))
     energy = float(seg.get("energy", EMOTION_ENERGY.get(seg.get("emotion", "neutral"), 0.45)))
     if engine == "chatterbox":
         # one voice sample for the whole narration: the delivery comes from exaggeration (emotion
@@ -671,9 +686,18 @@ def script_segments(script: str) -> tuple[list[dict], str]:
     parts = [x.strip() for x in re.split(r"(?<=[.!?।])\s+|\n+", text) if x.strip()]
     segs = []
     for x in parts:
-        m = re.match(r"\[(\w+)\]\s*(.+)", x)
-        emo, t = (m.group(1).lower(), m.group(2)) if m else ("neutral", x)
-        segs.append({"text": t, "emotion": emo, "pause_after": 0.35})
+        # "[Suspense 0.8] text", "[awe] text" or plain text
+        m = re.match(r"\[\s*([A-Za-z]+)(?:\s+([0-9.]+))?\s*\]\s*(.+)", x)
+        if m:
+            seg = {"text": m.group(3), "emotion": em.resolve(m.group(1)), "pause_after": 0.35}
+            if m.group(2):
+                try:
+                    seg["intensity"] = min(1.0, max(0.0, float(m.group(2))))
+                except ValueError:
+                    pass
+            segs.append(seg)
+        else:
+            segs.append({"text": x, "emotion": "Neutral", "pause_after": 0.35})
     return segs, ("hi" if detect_lang(text) == "hi" else "en")
 
 
@@ -753,7 +777,7 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
     for i, sg in enumerate(segs):
         lang = language or ("hi" if detect_lang(sg["text"]) == "hi" else default_lang)
         emo = sg.get("emotion", "neutral")
-        plan.append({"i": i, "lang": lang, "emotion": emo, "energy": float(sg.get("energy", EMOTION_ENERGY.get(emo, 0.45)))})
+        plan.append({"i": i, "lang": lang, "emotion": emo, "energy": line_energy(sg)})
     chunks = group_lines(segs, plan)
     anchors = {lg: anchor_ref(prof, d, lg) for lg in {c["lang"] for c in chunks}}
     for lg, (path, refs) in anchors.items():
@@ -767,7 +791,7 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
                 c = chunks[ci]
                 for t in range(takes):
                     jobs.append({"chunk": ci, "text": c["text"], "lang": c["lang"], "ref": anchors[c["lang"]][0],
-                                 "params": engine_params({"energy": c["energy"], "pace": c["pace"]}, eng), "seed": 1000 * round_ + 17 * ci + t,
+                                 "params": engine_params({"energy": c["energy"], "pace": c["pace"], "emotion": c.get("emotion"), "intensity": c.get("intensity", 0.6)}, eng), "seed": 1000 * round_ + 17 * ci + t,
                                  "out": str(Path(tmp) / f"c{ci:03d}_r{round_}_t{t}.wav")})
             log(f"speaking {len(pending)} passage(s) ({sum(len(chunks[ci]['lines']) for ci in pending)} lines) × {takes} take(s) with {ENGINES[eng]['label']}"
                 + (" (retry)" if round_ else ""))
@@ -809,12 +833,14 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
             for k, i in enumerate(c["lines"]):
                 a_, b_ = bounds[k], bounds[k + 1]
                 timeline.append({"start": round(t + a_, 3), "end": round(t + b_, 3), "text": segs[i]["text"], "emotion": segs[i].get("emotion", "neutral"),
+                                 "intensity": float(segs[i].get("intensity", 0.6)),
                                  "section": segs[i].get("section"), "visual": segs[i].get("visual", ""), "lang": c["lang"],
                                  "check": {"cer": best[ci]["cer"], "sim": best[ci]["sim"], "heard": best[ci]["heard"], "ref": "anchor", "passage": ci}})
             parts.append(y)
             t += len(y) / SR
             last = c["lines"][-1]
-            gap = float(segs[last].get("pause_after", 0.35)) if ci < len(chunks) - 1 else 0.6
+            # the script's pause, or the dramatic pause the next line's emotion asks for (before a reveal, awe, grief)
+            gap = max(float(segs[last].get("pause_after", 0.35)), pause_before(segs[chunks[ci + 1]["lines"][0]])) if ci < len(chunks) - 1 else 0.6
             n = int(gap * SR)
             parts.append(np.tile(tone, int(np.ceil(n / max(1, len(tone)))))[:n] * 0.9)
             t += gap
@@ -833,6 +859,12 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
     return {"outputs": [str(outp)], "narration": str(nj), "out_dir": str(outp.parent), "duration": round(t, 2)}
 
 
+def pause_before(seg: dict) -> float:
+    """Silence wanted before a line: its emotion's pause (Surprise, Awe, Grief …) at its intensity."""
+    e = em.info(seg.get("emotion"))
+    return float(e["pause_before"]) * (0.5 + 0.5 * float(seg.get("intensity", 0.6)))
+
+
 def group_lines(segs: list[dict], plan: list[dict], max_chars: int = 240, max_lines: int = 3) -> list[dict]:
     """Consecutive lines spoken together (2–3 sentences), so the voice flows from one sentence into
     the next like a real read; a long pause in the script, a language change or ~240 characters
@@ -844,8 +876,10 @@ def group_lines(segs: list[dict], plan: list[dict], max_chars: int = 240, max_li
         if cur:
             lang = plan[cur[0]]["lang"]
             paces = [segs[i].get("pace", "normal") for i in cur]
+            top = max(cur, key=lambda i: float(segs[i].get("intensity", 0.6)))
             out.append({"lines": list(cur), "lang": lang, "text": " ".join(segs[i]["text"].strip() for i in cur),
-                        "energy": float(np.mean([plan[i]["energy"] for i in cur])), "pace": max(set(paces), key=paces.count)})
+                        "energy": float(np.mean([plan[i]["energy"] for i in cur])), "pace": max(set(paces), key=paces.count),
+                        "emotion": segs[top].get("emotion"), "intensity": float(segs[top].get("intensity", 0.6))})
             cur.clear()
 
     for i, sg in enumerate(segs):
@@ -853,7 +887,8 @@ def group_lines(segs: list[dict], plan: list[dict], max_chars: int = 240, max_li
             chars = sum(len(segs[k]["text"]) for k in cur) + len(sg["text"])
             prev = segs[cur[-1]]
             if (plan[i]["lang"] != plan[cur[0]]["lang"] or chars > max_chars or len(cur) >= max_lines
-                    or float(prev.get("pause_after", 0.35)) >= 0.8 or abs(plan[i]["energy"] - plan[cur[-1]]["energy"]) > 0.35):
+                    or float(prev.get("pause_after", 0.35)) >= 0.8 or abs(plan[i]["energy"] - plan[cur[-1]]["energy"]) > 0.35
+                    or em.family(sg.get("emotion")) != em.family(prev.get("emotion")) or pause_before(sg) >= 0.2):
                 flush()
         cur.append(i)
     flush()
@@ -968,6 +1003,9 @@ def add_args(sub) -> None:
     p.add_argument("--engine", choices=list(ENGINES))
     p.add_argument("--takes", type=int, default=2, help="takes per line (best one kept): 1 fast … 4 best")
     p.add_argument("--language", choices=["en", "hi"])
+    import score
+
+    score.add_sound_args(p)
 
 
 def run_args(a) -> dict:
@@ -985,7 +1023,19 @@ def run_args(a) -> dict:
         takes = json.loads(Path(a.takes).read_text(encoding="utf-8")) if a.takes else None
         return enroll(a.name, a.files, takes, a.languages, a.engine, a.add)
     if a.cmd == "speak":
-        return speak(a.voice, a.script, a.out, engine=a.engine, takes=a.takes, language=a.language)
+        import score
+
+        opts = score.options(a)
+        res = speak(a.voice, a.script, a.out, engine=a.engine, takes=a.takes, language=a.language)
+        if opts:  # the voice alone stays; the scored version is written next to it
+            wav = res["outputs"][0]
+            scored = str(Path(wav).with_name(Path(wav).stem + " - scored.wav"))
+            nar = json.loads(Path(res["narration"]).read_text(encoding="utf-8"))
+            sc = score.score_narration(wav, nar, scored, opts)
+            res["outputs"] = [scored, wav]
+            res["credits"] = sc["credits"]
+            log("credits: " + ("; ".join(sc["credits"]) or "none needed"))
+        return res
     raise AutocutError(f"unknown command {a.cmd}")
 
 

@@ -37,9 +37,10 @@ from collections import Counter
 from pathlib import Path
 
 import autocut as ac
+import emotions as em
 from autocut import AutocutError, log
 
-EMOTIONS = ("neutral", "calm", "warm", "story", "excited", "curious", "serious", "suspense", "hook", "cta")
+EMOTIONS = tuple(em.EMOTIONS)  # the 42 emotions of the sound design (+ Neutral)
 LANGUAGES = {"en": "English", "hi": "Hindi (Devanagari script)", "hinglish": "Hinglish: Hindi in Devanagari with the English words people really use written in English"}
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 LATIN_WORD = re.compile(r"\b[A-Za-z][A-Za-z']+\b")
@@ -356,12 +357,17 @@ def build_prompt(topic: str, *, niche: str, seconds: float, language: str, tone:
 - Depth: concrete details, numbers, sensory words, one small story or personal moment. No filler sentences.
 - For the speech model: write numbers, dates, units and symbols as words in the script's language (e.g. "दो हज़ार", "fifteen percent"); no emojis, hashtags, brackets, stage directions or abbreviations inside "text".
 - One segment = one breath / one idea, 4 to 25 words. Mark the delivery of every segment.
+- Emotion: give every segment the one emotion the listener should feel, from this list (grouped by mood): {em.prompt_list()}.
+  Give the script an emotional arc, like a trailer: open on a strong hook emotion (Surprise, Curiosity, Awe, Thrill, Mystery…),
+  move through at least three different moods in a minute (e.g. Curiosity -> Nostalgia -> Tension -> Triumph -> Hope), put a
+  reveal or twist on a Surprise/Amazement line, build to one peak, and land the ending. "intensity" 0.0–1.0 is how strongly it is
+  felt (0.3 gentle, 0.6 clear, 0.9 peak; only one or two lines above 0.85). The voice, music and sound effects follow these.
 - "visual" is an English description of the ideal shot for that segment (what is in frame, shot type), used to choose footage.
 
 ## Output
 Reply with only a JSON object, no commentary, in exactly this form:
 {{"title": "...", "language": "{language}", "hook": "the hook line",
- "segments": [{{"section": "hook|intro|build|core|peak|outro|cta", "text": "...", "emotion": "one of {', '.join(EMOTIONS)}",
+ "segments": [{{"section": "hook|intro|build|core|peak|outro|cta", "text": "...", "emotion": "one emotion from the list", "intensity": 0.0-1.0,
    "pace": "slow|normal|fast", "energy": 0.0-1.0, "pitch": "low|mid|high", "pause_after": 0.2-1.5, "emphasis": ["word"], "visual": "..."}}]}}
 """
 
@@ -411,11 +417,15 @@ def clean_segment(s: dict) -> dict | None:
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return None
-    emo = str(s.get("emotion", "neutral")).lower()
+    emo = em.resolve(s.get("emotion"))
     try:
         energy = float(s.get("energy", 0.5))
     except (TypeError, ValueError):
         energy = 0.5
+    try:
+        intensity = float(s.get("intensity", energy))
+    except (TypeError, ValueError):
+        intensity = energy
     try:
         pause = float(s.get("pause_after", 0.35))
     except (TypeError, ValueError):
@@ -423,7 +433,8 @@ def clean_segment(s: dict) -> dict | None:
     return {
         "section": str(s.get("section", "core")),
         "text": text,
-        "emotion": emo if emo in EMOTIONS else "neutral",
+        "emotion": emo,
+        "intensity": round(min(1.0, max(0.0, intensity)), 2),
         "pace": s.get("pace") if s.get("pace") in ("slow", "normal", "fast") else "normal",
         "energy": min(1.0, max(0.0, energy)),
         "pitch": s.get("pitch") if s.get("pitch") in ("low", "mid", "high") else "mid",
@@ -464,7 +475,7 @@ def write_script(topic: str, out: str, *, niche: str = "", seconds: float = 60, 
     jpath = outp.parent / f"{outp.name}.script.json"
     jpath.write_text(json.dumps(script, ensure_ascii=False, indent=1), encoding="utf-8")
     tpath = outp.parent / f"{outp.name}.txt"
-    tpath.write_text(f"{script['title']}\n\n" + "\n".join(f"[{s['emotion']}] {s['text']}" for s in segs) + "\n", encoding="utf-8")
+    tpath.write_text(f"{script['title']}\n\n" + "\n".join(f"[{s['emotion']} {s.get('intensity', 0.6):.1f}] {s['text']}" for s in segs) + "\n", encoding="utf-8")
     log(f"script: {len(segs)} segments, {script['words']} words (aim {target_words(seconds, language, prof, wpm)}) in {time.time() - t0:.0f}s")
     res = {"outputs": [str(jpath), str(tpath)], "script": str(jpath), "out_dir": str(jpath.parent), "title": script["title"]}
     if voice:  # write and speak in one go

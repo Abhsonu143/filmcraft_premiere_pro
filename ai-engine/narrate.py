@@ -77,7 +77,8 @@ def lines_from_words(words: list[dict], duration: float, min_len: float = 1.2, m
 
 def lines_from_narration(nar: dict) -> list[dict]:
     return [{"start": float(s["start"]), "end": float(s["end"]), "text": s["text"], "emotion": s.get("emotion", "neutral"),
-             "visual": s.get("visual", ""), "section": s.get("section"), "words": []} for s in nar.get("segments", [])]
+             "intensity": float(s.get("intensity", 0.6)), "visual": s.get("visual", ""), "section": s.get("section"), "words": []}
+            for s in nar.get("segments", [])]
 
 
 def align_script(lines: list[dict], script: dict) -> None:
@@ -97,6 +98,8 @@ def align_script(lines: list[dict], script: dict) -> None:
                 best, best_s = s, j
         if best and best_s >= 0.25:
             l["emotion"] = best.get("emotion", l["emotion"])
+            if "intensity" in best:
+                l["intensity"] = best["intensity"]
             l["visual"] = l["visual"] or best.get("visual", "")
             l["section"] = best.get("section")
 
@@ -286,7 +289,8 @@ def shots_for_lines(lines: list[dict], total: float, pace: str, lead: float = 0.
 def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], first: bool, k: int = 30, hinted: set[int] | None = None) -> list[dict]:
     """Best windows (clip, in) of the slot's length, with their unary score."""
     dur = slot["end"] - slot["start"]
-    want_motion = EMOTION_MOTION.get(line.get("emotion", "neutral"), 0.4)
+    emo = line.get("emotion", "neutral")
+    want_motion = EMOTION_MOTION[emo] if emo in EMOTION_MOTION else 0.15 + 0.7 * __import__("emotions").info(emo)["arousal"]
     out = []
     for ci, c in enumerate(clips):
         if c["duration"] < dur + 0.1:
@@ -484,8 +488,11 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
          pace: str = "medium", captions: bool = False, caption_style: str = "clean", music: str | None = None, music_db: float = -20.0,
          ambience_db: float = -24.0, describe: str = "local", model: str | None = None, story_order: bool = True, look: str = "natural",
          whisper_model: str = ac.DEFAULT_WHISPER, workers: int = 2, plan_only: bool = False, hints: dict[str, list[int]] | None = None,
-         stills: set[str] | None = None, cards: set[str] | None = None) -> dict:
+         stills: set[str] | None = None, cards: set[str] | None = None, sound: dict | None = None) -> dict:
+    """`sound`: optional emotional sound design (score.options): music per mood, hits, risers, pauses."""
     import render
+
+    sound_opts = sound
     import voiceover_cut as vc
 
     ac.require_tools()
@@ -549,7 +556,25 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
         video = Path(tmp) / "video.mp4"
         render.render(rplan, str(video), workers=workers)
         sound = Path(tmp) / "sound.wav"
-        build_sound(voice, shots, clips, fps, sum(s["frames"] for s in shots) / fps, sound, str(Path(music).resolve()) if music else None, ambience_db, music_db)
+        vtotal = sum(s["frames"] for s in shots) / fps
+        if sound_opts:  # voice + clip sound first, then the score over it (ducking under the voice alone)
+            import score
+
+            base = Path(tmp) / "base.wav"
+            build_sound(voice, shots, clips, fps, vtotal, base, None, ambience_db, music_db)
+            who = score.tag_emotions(lines, sound_opts.get("tag", "claude"), model)
+            cuts, t_ = [], 0.0
+            for s_ in shots[:-1]:
+                t_ += s_["frames"] / fps
+                cuts.append(round(t_, 3))
+            sp = score.render(str(base), lines, vtotal, sound, duck_source=voice, cuts=cuts, plan_path=outp.with_suffix(".score.json"),
+                              **{k: v for k, v in sound_opts.items() if k != "tag"})
+            credits = score.credits(sp)
+            if credits:
+                outp.with_suffix(".credits.txt").write_text("\n".join(credits) + "\n", encoding="utf-8")
+            log(f"sound design: emotions from {who}; " + ("; ".join(credits) or "no music credits needed"))
+        else:
+            build_sound(voice, shots, clips, fps, vtotal, sound, str(Path(music).resolve()) if music else None, ambience_db, music_db)
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(sound)]
         words = caption_words(lines)
         if captions and words:
@@ -592,12 +617,18 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-story-order", action="store_true")
     p.add_argument("--look", default="natural")
     p.add_argument("--plan-only", action="store_true")
+    import score
+
+    score.add_sound_args(p)
 
 
 def run_args(a) -> dict:
+    import score
+
     return make(a.voice, a.clips, a.out, narration=a.narration, script=a.script, aspect=a.aspect, pace=a.pace, captions=a.captions,
                 caption_style=a.caption_style, music=a.music, music_db=a.music_db, ambience_db=a.ambience_db, describe=a.describe,
-                model=a.llm, story_order=not a.no_story_order, look=a.look, workers=getattr(a, "workers", 2), plan_only=a.plan_only)
+                model=a.llm, story_order=not a.no_story_order, look=a.look, workers=getattr(a, "workers", 2), plan_only=a.plan_only,
+                sound=score.options(a))
 
 
 def main(argv: list[str] | None = None) -> int:

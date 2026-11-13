@@ -25,6 +25,9 @@
 //! - `ai.clips {input, outDir?, clipType?=edited|sections, count?=5, min?=10, target?=48, max?=60,
 //!   aspect?=vertical|square|horizontal|same, content?=auto|talk|gameplay, framing?=auto|center|blur|bars, captionMode?=auto|on|off, captionStyle?=pop|clean|boxed,
 //!   titleMode?=off|intro|always, pace?=fast|medium|slow, music?, llm?=default|<model>|none, hook?, import?}`
+//! - `ai.speak {script (file) or notes (text), voice, takes?, out?}`: a script spoken (audio only).
+//! - sound design (speak, voiceover, topic, clips, music): `soundDesign?, musicSource?=internet|folder|ai|none,
+//!   musicFolder?, licence?=monetized|personal, soundEffects?, musicLevel?` (dB).
 //! - `ai.audio {clips: [files or folders], outDir?, format?=mp3|m4a|wav|aiff|flac|alac|opus|ogg,
 //!   audioQuality?=original|best|high|medium|small, start?, end?, mono?, normalize?, import?}`
 //! - each returns `{job}`; `ai.jobs` returns every job (and shows the window); `ai.cancel {job}`;
@@ -71,6 +74,7 @@ pub enum Kind {
     Voice,
     Topic,
     Tv,
+    Speak,
 }
 
 impl Kind {
@@ -87,6 +91,7 @@ impl Kind {
             Kind::Voice => "voice",
             Kind::Topic => "topic",
             Kind::Tv => "tv",
+            Kind::Speak => "speak",
         }
     }
     fn from_command(id: &str) -> Option<Kind> {
@@ -102,6 +107,7 @@ impl Kind {
             "ai.voice" => Kind::Voice,
             "ai.topic" => Kind::Topic,
             "ai.tv" => Kind::Tv,
+            "ai.speak" => Kind::Speak,
             _ => return None,
         })
     }
@@ -118,6 +124,7 @@ impl Kind {
             Kind::Voice => "Voice Clone",
             Kind::Topic => "Video from Topic",
             Kind::Tv => "TV Light Sync",
+            Kind::Speak => "Speak Script",
         }
     }
     fn input_label(self) -> &'static str {
@@ -130,7 +137,11 @@ impl Kind {
         }
     }
     fn needs_input(self) -> bool {
-        !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Tv)
+        !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Tv | Kind::Speak)
+    }
+    /// Tools that can add the optional emotional sound design.
+    fn has_sound_design(self) -> bool {
+        matches!(self, Kind::Speak | Kind::Voiceover | Kind::Topic | Kind::Clips | Kind::Music)
     }
     fn needs_clips(self) -> bool {
         matches!(self, Kind::Music | Kind::Reference | Kind::Voiceover | Kind::Audio | Kind::Tv)
@@ -212,6 +223,14 @@ struct Draft {
     tv_bezel: bool,
     // short clips: "edited" (best moments cut together) or "sections" (one continuous part each)
     clip_type: &'static str,
+    // optional emotional sound design (music per mood, hits, risers, pauses)
+    sound: bool,
+    music_source: &'static str,
+    music_folder: String,
+    licence: &'static str,
+    sound_effects: bool,
+    music_level: f64,
+    emo: EmotionEditor,
     tv: TvState,
 }
 
@@ -363,6 +382,13 @@ impl Draft {
             relight: 1.0,
             tv_bezel: false,
             clip_type: "edited",
+            sound: false,
+            music_source: "internet",
+            music_folder: setting_str("music_folder").unwrap_or_default(),
+            licence: "monetized",
+            sound_effects: true,
+            music_level: -2.0,
+            emo: EmotionEditor::default(),
             tv: TvState::default(),
         }
     }
@@ -468,6 +494,14 @@ impl Draft {
         d.relight = num("relight", d.relight);
         d.tv_bezel = flag("bezel", d.tv_bezel);
         d.clip_type = pick("clipType", &CLIP_TYPES.map(|a| a.0), d.clip_type);
+        d.sound = flag("soundDesign", d.sound);
+        d.music_source = pick("musicSource", &MUSIC_SOURCES.map(|a| a.0), d.music_source);
+        d.licence = pick("licence", &LICENCES.map(|a| a.0), d.licence);
+        d.sound_effects = flag("soundEffects", d.sound_effects);
+        d.music_level = num("musicLevel", d.music_level);
+        if let Some(f) = s("musicFolder") {
+            d.music_folder = f;
+        }
         if d.clip_type == "sections" {
             d.min_len = num("min", SECTION_LENGTHS.0);
             d.target_len = num("target", SECTION_LENGTHS.1);
@@ -487,6 +521,33 @@ impl Draft {
     }
 
     /// Fill defaults (output paths) and check that the job can run; returns the engine arguments.
+    /// The optional sound design: a music edit only gets effects (the song is its music).
+    fn sound_args(&self, a: &mut Vec<String>) -> Result<(), String> {
+        a.push("--sound-design".into());
+        let source = if self.kind == Kind::Music { "none" } else { self.music_source };
+        if source == "folder" {
+            if self.music_folder.trim().is_empty() || !Path::new(self.music_folder.trim()).is_dir() {
+                return Err("Choose your music folder (or another music source).".into());
+            }
+            a.extend(["--music-folder".into(), self.music_folder.trim().into()]);
+        }
+        a.extend(["--music-source".into(), source.into()]);
+        if source == "internet" {
+            a.extend(["--licence".into(), self.licence.into()]);
+        }
+        if !self.sound_effects {
+            if source == "none" {
+                return Err("Sound design without music needs the sound effects.".into());
+            }
+            a.push("--no-effects".into());
+        }
+        if !(-20.0..=6.0).contains(&self.music_level) {
+            return Err("Music level must be between -20 and +6 dB.".into());
+        }
+        a.extend(["--music-level".into(), format!("{}", self.music_level)]);
+        Ok(())
+    }
+
     fn engine_args(&mut self) -> Result<Vec<String>, String> {
         let exists = |p: &str| !p.trim().is_empty() && Path::new(p.trim()).exists();
         if self.kind.needs_input() && !exists(&self.input) {
@@ -582,7 +643,7 @@ impl Draft {
                     a.push("--sections".into());
                 } else {
                     push(&mut a, "--pace", self.pace);
-                    if !self.music.trim().is_empty() {
+                    if !self.music.trim().is_empty() && !self.sound {
                         push(&mut a, "--music", self.music.trim());
                     }
                     if !self.hook {
@@ -637,7 +698,7 @@ impl Draft {
                 if !self.ambience {
                     push(&mut a, "--ambience-db", "-60");
                 }
-                if !self.music.trim().is_empty() {
+                if !self.music.trim().is_empty() && !self.sound {
                     push(&mut a, "--music", self.music.trim());
                 }
                 let script = self.script.trim();
@@ -718,7 +779,7 @@ impl Draft {
                         a.push("--footage".into());
                         a.extend(self.clips.iter().cloned());
                     }
-                    if !self.music.trim().is_empty() {
+                    if !self.music.trim().is_empty() && !self.sound {
                         push(&mut a, "--music", self.music.trim());
                     }
                     if !self.captions {
@@ -726,6 +787,24 @@ impl Draft {
                     }
                 } else {
                     a.push("--script-only".into());
+                }
+            }
+            Kind::Speak => {
+                let text = self.notes.trim();
+                if self.script.trim().is_empty() && text.is_empty() {
+                    return Err("Choose a script file, or type the text to speak.".into());
+                }
+                if self.voice.trim().is_empty() {
+                    return Err("Choose the voice.".into());
+                }
+                if !(1.0..=4.0).contains(&self.takes) {
+                    return Err("Takes per line must be 1 to 4.".into());
+                }
+                push(&mut a, "--voice", self.voice.trim());
+                push(&mut a, "--script", if self.script.trim().is_empty() { text } else { self.script.trim() });
+                push(&mut a, "--out", self.out.trim());
+                if !self.voice.starts_with("mac") {
+                    push(&mut a, "--takes", &format!("{}", self.takes.round()));
                 }
             }
             Kind::Tv => {
@@ -791,6 +870,9 @@ impl Draft {
                 }
             }
         }
+        if self.kind.has_sound_design() && self.sound && !(self.kind == Kind::Topic && !self.make_video) {
+            self.sound_args(&mut a)?;
+        }
         Ok(a)
     }
 }
@@ -815,6 +897,188 @@ const LOOKS: [(&str, &str); 6] = [
 const EFFECTS: [(&str, &str); 3] =
     [("full", "Full: speed ramps, punch-ins, flashes, transitions"), ("subtle", "Subtle: slow motion, push-ins, dissolves"), ("none", "Clean cuts only")];
 const ORDERS: [(&str, &str); 2] = [("time", "Follow the trip (shooting order)"), ("free", "Best shots first")];
+
+const MUSIC_SOURCES: [(&str, &str); 4] = [
+    ("internet", "Free music from the internet, chosen by mood (credited in the description)"),
+    ("folder", "My music folder (EI sorts it by mood)"),
+    ("ai", "AI-composed score on this Mac (slow; personal use only)"),
+    ("none", "No music, sound effects only"),
+];
+const LICENCES: [(&str, &str); 2] =
+    [("monetized", "Safe for monetized videos (CC0, CC BY, CC BY-SA)"), ("personal", "Personal use (more music, incl. non-commercial licences)")];
+/// The emotions of the sound design (`ai-engine/emotions.py`), grouped by mood.
+const EMOTION_NAMES: [&str; 43] = [
+    "Neutral",
+    "Joy",
+    "Happiness",
+    "Cheerful",
+    "Delight",
+    "Bliss",
+    "Euphoria",
+    "Excitement",
+    "Thrill",
+    "Energy",
+    "Love",
+    "Passion",
+    "Affection",
+    "Romance",
+    "Nostalgia",
+    "Melancholy",
+    "Sorrow",
+    "Grief",
+    "Fear",
+    "Dread",
+    "Anxiety",
+    "Suspense",
+    "Tension",
+    "Anticipation",
+    "Mystery",
+    "Curiosity",
+    "Fascination",
+    "Wonder",
+    "Awe",
+    "Amazement",
+    "Wonderment",
+    "Surprise",
+    "Serenity",
+    "Tranquility",
+    "Peace",
+    "Calmness",
+    "Courage",
+    "Triumph",
+    "Pride",
+    "Hope",
+    "Freedom",
+    "Anger",
+    "Rage",
+];
+
+/// One line of a script with its emotion (the per-line override of the sound design).
+#[derive(Clone, Debug, PartialEq)]
+struct EmoLine {
+    text: String,
+    emotion: String,
+    intensity: f64,
+}
+
+/// The emotions of a script file, editable line by line; changes are written back to the file.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct EmotionEditor {
+    path: String,
+    lines: Vec<EmoLine>,
+    error: String,
+}
+
+/// The canonical emotion name for a tag ("hook", "excited" and other old tags included).
+fn emotion_name(tag: &str) -> String {
+    let t = tag.trim();
+    if let Some(n) = EMOTION_NAMES.iter().find(|n| n.eq_ignore_ascii_case(t)) {
+        return (*n).to_string();
+    }
+    let alias = match t.to_lowercase().as_str() {
+        "calm" => "Calmness",
+        "warm" => "Affection",
+        "story" => "Nostalgia",
+        "excited" => "Excitement",
+        "curious" => "Curiosity",
+        "serious" => "Tension",
+        "suspense" => "Suspense",
+        "hook" => "Surprise",
+        "cta" => "Hope",
+        "happy" => "Happiness",
+        "sad" => "Sorrow",
+        "angry" => "Anger",
+        _ => "Neutral",
+    };
+    alias.to_string()
+}
+
+/// "[Awe 0.8] text" -> (Some(("Awe", Some(0.8))), "text"); plain text -> (None, text).
+fn parse_tagged(line: &str) -> (Option<(String, Option<f64>)>, String) {
+    let l = line.trim();
+    if let Some(rest) = l.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let inside = rest.get(..end).unwrap_or_default();
+        let text = rest.get(end + 1..).unwrap_or_default().trim().to_string();
+        let mut parts = inside.split_whitespace();
+        let name = parts.next().unwrap_or_default().to_string();
+        let inten = parts.next().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0));
+        if !name.is_empty() {
+            return (Some((name, inten)), text);
+        }
+    }
+    (None, l.to_string())
+}
+
+impl EmotionEditor {
+    /// Loads the lines of a `.script.json` (segments) or a tagged `.txt` script.
+    fn load(path: &str) -> EmotionEditor {
+        let mut ed = EmotionEditor { path: path.to_string(), ..EmotionEditor::default() };
+        let p = Path::new(path.trim());
+        let Ok(text) = std::fs::read_to_string(p) else {
+            ed.error = "The script could not be read.".into();
+            return ed;
+        };
+        if path.trim().to_lowercase().ends_with(".json") {
+            match serde_json::from_str::<Value>(&text) {
+                Ok(v) => {
+                    for seg in v.get("segments").and_then(Value::as_array).into_iter().flatten() {
+                        let t = seg.get("text").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        let emotion = emotion_name(seg.get("emotion").and_then(Value::as_str).unwrap_or("Neutral"));
+                        let intensity =
+                            seg.get("intensity").or_else(|| seg.get("energy")).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.6).clamp(0.0, 1.0);
+                        ed.lines.push(EmoLine { text: t, emotion, intensity });
+                    }
+                }
+                Err(_) => ed.error = "The script is not valid JSON.".into(),
+            }
+        } else {
+            for l in text.lines().filter(|l| !l.trim().is_empty()) {
+                let (tag, t) = parse_tagged(l);
+                let (emotion, intensity) = match tag {
+                    Some((n, i)) => (emotion_name(&n), i.unwrap_or(0.6)),
+                    None => ("Neutral".to_string(), 0.6),
+                };
+                ed.lines.push(EmoLine { text: t, emotion, intensity });
+            }
+        }
+        ed
+    }
+
+    /// Writes the emotions back into the script file (only the emotion and intensity change).
+    fn save(&mut self) {
+        let p = Path::new(self.path.trim());
+        let result = if self.path.trim().to_lowercase().ends_with(".json") {
+            std::fs::read_to_string(p).map_err(|e| e.to_string()).and_then(|text| {
+                let mut v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                let mut k = 0usize;
+                if let Some(segs) = v.get_mut("segments").and_then(Value::as_array_mut) {
+                    for seg in segs.iter_mut() {
+                        if seg.get("text").and_then(Value::as_str).unwrap_or_default().trim().is_empty() {
+                            continue;
+                        }
+                        if let (Some(line), Some(obj)) = (self.lines.get(k), seg.as_object_mut()) {
+                            obj.insert("emotion".into(), json!(line.emotion));
+                            obj.insert("intensity".into(), json!((line.intensity * 100.0).round() / 100.0));
+                        }
+                        k += 1;
+                    }
+                }
+                serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
+            })
+        } else {
+            Ok(self.lines.iter().map(|l| format!("[{} {:.1}] {}", l.emotion, l.intensity, l.text)).collect::<Vec<_>>().join("\n") + "\n")
+        };
+        match result.and_then(|out| std::fs::write(p, out).map_err(|e| e.to_string())) {
+            Ok(()) => self.error.clear(),
+            Err(e) => self.error = format!("Could not save the emotions: {e}"),
+        }
+    }
+}
 
 const CLIP_TYPES: [(&str, &str); 2] = [
     ("edited", "Edited short clips: the best moments cut together (teaser, slow motion, punch-ins)"),
@@ -926,6 +1190,10 @@ fn default_output(d: &Draft) -> String {
         Kind::Script => movies_dir().join("Scripts").join(slug(if d.topic.trim().is_empty() { "script" } else { &d.topic })).to_string_lossy().to_string(),
         Kind::Voice => voices_dir().join(slug(&d.voice_name)).to_string_lossy().to_string(),
         Kind::Topic => String::new(), // the engine names the folder after the topic (Movies/EI/Topics/…)
+        Kind::Speak => {
+            let stem = if d.script.trim().is_empty() { "spoken".to_string() } else { file_stem(&d.script).trim_end_matches(".script").to_string() };
+            free_path(&movies_dir().join("Sound"), &stem, ".wav")
+        }
         Kind::Tv => d
             .clips
             .first()
@@ -1359,6 +1627,7 @@ fn run_draft(d: &mut Draft) -> Result<u64, String> {
         Kind::Script => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Voice => format!("{}: {}", d.kind.title(), d.voice_name.trim()),
         Kind::Topic => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
+        Kind::Speak => format!("{}: {}", d.kind.title(), file_stem(&d.out)),
         Kind::Tv => match d.clips.len() {
             1 => format!("{}: {}", d.kind.title(), d.clips.first().map(|c| file_stem(c)).unwrap_or_default()),
             n => format!("{}: {n} clips", d.kind.title()),
@@ -1458,6 +1727,7 @@ enum Pick {
     Out,
     StyleSources,
     TvFolder,
+    MusicFolder,
 }
 
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
@@ -1467,6 +1737,93 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     import_finished(app);
     if jobs().lock().unwrap_or_else(PoisonError::into_inner).iter().any(|j| j.status == Status::Running) {
         ctx.request_repaint_after(Duration::from_millis(300));
+    }
+}
+
+/// The optional sound design rows. Returns true when the music folder should be chosen.
+fn sound_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> bool {
+    let mut choose = false;
+    ui.label("Sound design");
+    let label = if d.kind == Kind::Music {
+        "Add sound effects synced to the song (a riser into the drop, an impact on it, whooshes on fast cuts)"
+    } else {
+        "Score the emotions: music that changes with the mood, hits, risers, whooshes, silence before reveals"
+    };
+    let r = ui.checkbox(&mut d.sound, label);
+    elems.push((format!("{p}.sound"), r.rect, d.sound.to_string()));
+    ui.end_row();
+    if !d.sound || d.kind == Kind::Music {
+        return false;
+    }
+    ui.label("Music from");
+    combo_row(ui, &mut d.music_source, &MUSIC_SOURCES, &format!("{p}.musicSource"), elems);
+    ui.end_row();
+    if d.music_source == "folder" {
+        ui.label("Music folder");
+        choose = path_row(ui, &mut d.music_folder, &format!("{p}.musicFolder"), "your songs and scores", elems);
+        ui.end_row();
+    }
+    if d.music_source == "internet" {
+        ui.label("Licence");
+        combo_row(ui, &mut d.licence, &LICENCES, &format!("{p}.licence"), elems);
+        ui.end_row();
+    }
+    ui.label("Music level");
+    let r = ui.add(egui::Slider::new(&mut d.music_level, -12.0..=4.0).suffix(" dB").step_by(1.0));
+    elems.push((format!("{p}.musicLevel"), r.rect, d.music_level.to_string()));
+    ui.end_row();
+    ui.label("");
+    let r = ui.checkbox(&mut d.sound_effects, "Sound effects (impacts, risers, whooshes, shimmer, heartbeat)");
+    elems.push((format!("{p}.soundEffects"), r.rect, d.sound_effects.to_string()));
+    ui.end_row();
+    choose
+}
+
+/// Emotions per line of the script (Speak, Voiceover): chosen by Claude when the script was
+/// written; change any of them here (saved into the script file at once).
+fn emotion_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
+    let path = d.script.trim().to_string();
+    let lower = path.to_lowercase();
+    let usable = (lower.ends_with(".script.json") || lower.ends_with(".txt")) && Path::new(&path).is_file();
+    if !usable {
+        return;
+    }
+    if d.emo.path != path {
+        d.emo = EmotionEditor::load(&path);
+    }
+    ui.label("Emotions");
+    let mut changed = false;
+    ui.vertical(|ui| {
+        let id = format!("{p}.emotions");
+        egui::CollapsingHeader::new(format!("{} lines: change the emotion of any line", d.emo.lines.len())).id_salt(&id).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(260.0).id_salt(format!("{id}.scroll")).show(ui, |ui| {
+                egui::Grid::new(format!("{id}.grid")).num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                    for (k, line) in d.emo.lines.iter_mut().enumerate() {
+                        let short: String = line.text.chars().take(46).collect();
+                        let more = if line.text.chars().count() > 46 { "…" } else { "" };
+                        ui.label(format!("{short}{more}")).on_hover_text(&line.text);
+                        let before = line.emotion.clone();
+                        let r = egui::ComboBox::from_id_salt(format!("{id}.{k}")).selected_text(line.emotion.clone()).width(120.0).show_ui(ui, |ui| {
+                            for n in EMOTION_NAMES {
+                                ui.selectable_value(&mut line.emotion, n.to_string(), n);
+                            }
+                        });
+                        elems.push((format!("{id}.{k}"), r.response.rect, line.emotion.clone()));
+                        let r2 = ui.add(egui::DragValue::new(&mut line.intensity).range(0.0..=1.0).speed(0.01).max_decimals(2));
+                        elems.push((format!("{id}.{k}.intensity"), r2.rect, line.intensity.to_string()));
+                        changed |= line.emotion != before || r2.changed();
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        if !d.emo.error.is_empty() {
+            ui.colored_label(egui::Color32::from_rgb(220, 90, 80), &d.emo.error);
+        }
+    });
+    ui.end_row();
+    if changed {
+        d.emo.save();
     }
 }
 
@@ -1592,9 +1949,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         });
                         ui.end_row();
                     }
-                    if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover | Kind::Reference)
-                        || (d.kind == Kind::Clips && d.clip_type != "sections")
-                        || (d.kind == Kind::Topic && d.make_video)
+                    let scored = d.sound && d.kind != Kind::Music; // the sound design brings its own music
+                    if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Reference)
+                        || (d.kind == Kind::Voiceover && !scored)
+                        || (d.kind == Kind::Clips && d.clip_type != "sections" && !scored)
+                        || (d.kind == Kind::Topic && d.make_video && !scored)
                     {
                         ui.label(match d.kind {
                             Kind::Music => "Music",
@@ -2001,6 +2360,44 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             radio_row(ui, &mut d.source, &VOICE_SOURCES, &format!("{p}.source"), &mut elems);
                             ui.end_row();
                         }
+                        Kind::Speak => {
+                            ui.label("Script");
+                            if path_row(ui, &mut d.script, &format!("{p}.script"), "a .script.json or .txt (from Write Voiceover Script)", &mut elems) {
+                                pick = Some(Pick::Script);
+                            }
+                            ui.end_row();
+                            if d.script.trim().is_empty() {
+                                ui.label("Or the text");
+                                let r = ui.add(
+                                    egui::TextEdit::multiline(&mut d.notes)
+                                        .hint_text("[Awe 0.8] Twelve years. [Triumph 0.9] It's finally here!")
+                                        .desired_rows(4)
+                                        .desired_width(330.0),
+                                );
+                                elems.push((format!("{p}.text"), r.rect, String::new()));
+                                ui.end_row();
+                            }
+                            ui.label("Voice");
+                            let mut voices: Vec<(String, String)> = saved_voices().into_iter().map(|v| (v.clone(), format!("{v} (your clone)"))).collect();
+                            for (k, l) in MAC_VOICES {
+                                voices.push((k.to_string(), l.to_string()));
+                            }
+                            let shown = voices.iter().find(|v| v.0 == d.voice).map(|v| v.1.clone()).unwrap_or_else(|| "Choose a voice…".into());
+                            let r = egui::ComboBox::from_id_salt(format!("{p}.voice")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+                                for (k, l) in &voices {
+                                    let o = ui.selectable_value(&mut d.voice, k.clone(), l);
+                                    elems.push((format!("{p}.voice.{k}"), o.rect, l.clone()));
+                                }
+                            });
+                            elems.push((format!("{p}.voice"), r.response.rect, shown));
+                            ui.end_row();
+                            if !d.voice.starts_with("mac") && !d.voice.is_empty() {
+                                ui.label("Takes per line");
+                                let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
+                                elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
+                                ui.end_row();
+                            }
+                        }
                         Kind::Talk => {
                             ui.label("Format");
                             radio_row(ui, &mut d.preset, &PRESETS, &format!("{p}.preset"), &mut elems);
@@ -2010,6 +2407,12 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             elems.push((format!("{p}.captions"), r.rect, d.captions.to_string()));
                             ui.end_row();
                         }
+                    }
+                    if matches!(d.kind, Kind::Speak | Kind::Voiceover) {
+                        emotion_rows(ui, &mut d, &p, &mut elems);
+                    }
+                    if d.kind.has_sound_design() && !(d.kind == Kind::Topic && !d.make_video) && sound_rows(ui, &mut d, &p, &mut elems) {
+                        pick = Some(Pick::MusicFolder);
                     }
                     if d.kind != Kind::Voice {
                         let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv);
@@ -2090,6 +2493,12 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 let filter = if d.kind == Kind::Voiceover { "Audio" } else { "Video" };
                 if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f(filter, &exts)) {
                     d.input = f;
+                }
+            }
+            Pick::MusicFolder => {
+                if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
+                    let _ = save_setting("music_folder", &dir);
+                    d.music_folder = dir;
                 }
             }
             Pick::TvFolder => {
@@ -2790,6 +3199,9 @@ fn poll_recorder(d: &mut Draft) {
 
 fn description(kind: Kind) -> &'static str {
     match kind {
+        Kind::Speak => {
+            "Speaks a script in your cloned voice (or a macOS voice) and saves the audio, so you can hear it without making a video. Every line is spoken with its emotion (set them below). With sound design, a second file also has music that follows the emotions, hits, risers and pauses."
+        }
         Kind::Split => "Cuts a long video into clips of equal length, saved in a folder. The original is not changed.",
         Kind::Music => {
             "Edits your clips like an editor would: long slow-motion shots in calm parts, quick cuts and punch-ins on the drop, the best moments of each clip, the trip in order, one colour grade. Any video can be the music source."
@@ -2990,7 +3402,7 @@ fn import_finished(app: &mut FilmcraftApp) {
         };
         let one = |k: &str| result.get(k).and_then(Value::as_str).map(str::to_string);
         let paths: Vec<String> = match kind {
-            Kind::Split | Kind::Clips | Kind::Audio => strs("outputs"),
+            Kind::Split | Kind::Clips | Kind::Audio | Kind::Speak => strs("outputs"),
             _ => match one("otio") {
                 Some(o) => std::iter::once(o).chain(one("srt")).collect(),
                 None => strs("outputs"),
@@ -3218,6 +3630,112 @@ mod tests {
         assert!(Draft::from_params(Kind::Audio, &json!({})).engine_args().is_err());
         assert!(Draft::from_params(Kind::Audio, &json!({"clips": [video.to_string_lossy()], "start": "soon"})).engine_args().is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sound_design_and_speak_arguments() {
+        let dir = std::env::temp_dir().join(format!("ei-ai-sound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("gta.script.json");
+        std::fs::write(
+            &script,
+            r#"{"title": "T", "segments": [{"text": "Twelve years.", "emotion": "awe", "intensity": 0.8}, {"text": " "}, {"text": "It's here!", "emotion": "excited"}]}"#,
+        )
+        .unwrap();
+        let sp = script.to_string_lossy().to_string();
+        let mut d = Draft::from_params(Kind::Speak, &json!({"script": sp, "voice": "test1", "soundDesign": true, "licence": "personal"}));
+        let a = d.engine_args().unwrap();
+        assert_eq!(a.first().map(String::as_str), Some("speak"));
+        for pair in [["--voice", "test1"], ["--music-source", "internet"], ["--licence", "personal"], ["--music-level", "-2"], ["--takes", "2"]] {
+            assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
+        }
+        assert!(a.contains(&"--sound-design".to_string()) && d.out.ends_with(".wav"), "{a:?} {}", d.out);
+        // typed text instead of a file; a macOS voice has no takes
+        let mut t = Draft::from_params(Kind::Speak, &json!({"notes": "[Awe 0.8] Look up.", "voice": "mac:Rishi"}));
+        let a = t.engine_args().unwrap();
+        assert!(
+            a.windows(2).any(|w| w == ["--script", "[Awe 0.8] Look up."]) && !a.contains(&"--takes".to_string()) && !a.contains(&"--sound-design".to_string())
+        );
+        assert!(Draft::from_params(Kind::Speak, &json!({"voice": "test1"})).engine_args().is_err());
+        assert!(Draft::from_params(Kind::Speak, &json!({"script": sp})).engine_args().is_err());
+        // a music folder must exist; a music edit only gets effects; no music needs effects
+        assert!(Draft::from_params(Kind::Speak, &json!({"script": sp, "voice": "v", "soundDesign": true, "musicSource": "folder"})).engine_args().is_err());
+        let mut f = Draft::from_params(
+            Kind::Speak,
+            &json!({"script": sp, "voice": "v", "soundDesign": true, "musicSource": "folder", "musicFolder": dir.to_string_lossy()}),
+        );
+        assert!(f.engine_args().unwrap().windows(2).any(|w| w[0] == "--music-folder"));
+        assert!(
+            Draft::from_params(Kind::Speak, &json!({"script": sp, "voice": "v", "soundDesign": true, "musicSource": "none", "soundEffects": false}))
+                .engine_args()
+                .is_err()
+        );
+        let song = dir.join("song.mp3");
+        std::fs::write(&song, b"x").unwrap();
+        let clip = dir.join("a.mp4");
+        std::fs::write(&clip, b"x").unwrap();
+        let mut m = Draft::from_params(
+            Kind::Music,
+            &json!({"music": song.to_string_lossy(), "clips": [clip.to_string_lossy()], "soundDesign": true, "musicSource": "ai"}),
+        );
+        let a = m.engine_args().unwrap();
+        assert!(a.windows(2).any(|w| w == ["--music-source", "none"]), "{a:?}");
+        // clips: the score replaces the single music file
+        let mut c = Draft::from_params(Kind::Clips, &json!({"input": clip.to_string_lossy(), "music": song.to_string_lossy(), "soundDesign": true}));
+        let a = c.engine_args().unwrap();
+        assert!(a.contains(&"--sound-design".to_string()) && !a.contains(&"--music".to_string()), "{a:?}");
+        let mut off = Draft::from_params(Kind::Clips, &json!({"input": clip.to_string_lossy()}));
+        assert!(!off.engine_args().unwrap().contains(&"--sound-design".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emotion_editor_reads_and_writes_scripts() {
+        let dir = std::env::temp_dir().join(format!("ei-ai-emo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let js = dir.join("a.script.json");
+        std::fs::write(
+            &js,
+            r#"{"segments": [{"text": "One.", "emotion": "hook", "visual": "v"}, {"text": ""}, {"text": "Two.", "emotion": "Grief", "intensity": 0.9}]}"#,
+        )
+        .unwrap();
+        let mut ed = EmotionEditor::load(&js.to_string_lossy());
+        assert_eq!(ed.lines.iter().map(|l| l.emotion.as_str()).collect::<Vec<_>>(), ["Surprise", "Grief"]);
+        assert!((ed.lines[1].intensity - 0.9).abs() < 1e-9);
+        ed.lines[0].emotion = "Mystery".into();
+        ed.lines[0].intensity = 0.7;
+        ed.save();
+        assert!(ed.error.is_empty(), "{}", ed.error);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&js).unwrap()).unwrap();
+        assert_eq!(v["segments"][0]["emotion"], "Mystery");
+        assert_eq!(v["segments"][0]["intensity"], 0.7);
+        assert_eq!(v["segments"][0]["visual"], "v"); // everything else is kept
+        assert_eq!(v["segments"][2]["emotion"], "Grief");
+        let tx = dir.join("b.txt");
+        std::fs::write(&tx, "[Awe 0.8] Look up.\n\nPlain line.\n[excited] Go!\n").unwrap();
+        let mut ed = EmotionEditor::load(&tx.to_string_lossy());
+        assert_eq!(
+            ed.lines.iter().map(|l| (l.emotion.as_str(), l.text.as_str())).collect::<Vec<_>>(),
+            [("Awe", "Look up."), ("Neutral", "Plain line."), ("Excitement", "Go!")]
+        );
+        ed.lines[1].emotion = "Hope".into();
+        ed.save();
+        assert_eq!(std::fs::read_to_string(&tx).unwrap(), "[Awe 0.8] Look up.\n[Hope 0.6] Plain line.\n[Excitement 0.6] Go!\n");
+        assert_eq!(parse_tagged("[Rage 7] x").0, Some(("Rage".to_string(), Some(1.0))));
+        assert_eq!(parse_tagged("no [tag] here").0, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emotion_names_match_the_engine() {
+        // the dialog's list must be the engine's (ai-engine/emotions.py)
+        let py = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ai-engine/emotions.py");
+        let Ok(src) = std::fs::read_to_string(&py) else { return };
+        for n in EMOTION_NAMES {
+            assert!(src.contains(&format!("\"{n}\": (")), "{n} is not in emotions.py");
+        }
+        let engine = src.matches("\": (\"").count(); // entries like "Joy": ("joy", …)
+        assert_eq!(engine, EMOTION_NAMES.len(), "emotions.py has {engine} emotions");
     }
 
     #[test]

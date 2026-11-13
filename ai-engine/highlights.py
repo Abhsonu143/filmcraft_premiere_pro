@@ -561,8 +561,44 @@ def build_audio(src: str, shots: list[dict], fps: float, dst: Path, music: dict 
         ac.run(cmd + ac.filter_script_args(str(g)) + ["-map", "[ao]", "-c:a", "pcm_s16le", str(dst)])
 
 
+ROLE_EMOTION = {"hook": ("Thrill", 0.85), "build": ("Tension", 0.65), "climax": ("Triumph", 0.95), "climax-after": ("Triumph", 0.8),
+                "action": ("Excitement", 0.7), "line": ("Suspense", 0.55), "section": ("Excitement", 0.6)}
+
+
+def clip_score_lines(clip: dict, fps: float, words_out: list[dict], talk: bool) -> list[dict]:
+    """The emotional arc of a clip for its sound design. Action: from the edit (teaser = Thrill, the
+    build = Tension, the slow-motion climax = Triumph, the payoff = Pride). Talk: one line per
+    sentence of what is said (emotions chosen by Claude or by word cues)."""
+    import score
+
+    if talk and words_out:
+        lines, cur = [], []
+        for w in words_out:
+            cur.append(w)
+            if str(w["word"]).strip()[-1:] in ".?!" or w["end"] - cur[0]["start"] > 8:
+                lines.append({"start": cur[0]["start"], "end": cur[-1]["end"], "text": " ".join(x["word"].strip() for x in cur)})
+                cur = []
+        if cur:
+            lines.append({"start": cur[0]["start"], "end": cur[-1]["end"], "text": " ".join(x["word"].strip() for x in cur)})
+        score.tag_emotions(lines, "claude")
+        return lines
+    lines, t = [], 0.0
+    shots = clip["shots"]
+    for k, s_ in enumerate(shots):
+        d = s_["frames"] / fps
+        role = str(s_.get("role", "action")).split()[0]
+        emo, inten = ROLE_EMOTION.get(role, ("Excitement", 0.7))
+        if "payoff" in str(s_.get("role", "")) and k == len(shots) - 1:
+            emo, inten = "Pride", 0.75
+        if role == "build":  # the build grows towards the climax
+            inten = min(0.85, 0.5 + 0.35 * k / max(1, len(shots) - 1))
+        lines.append({"start": round(t, 3), "end": round(t + d, 3), "text": role, "emotion": emo, "intensity": inten})
+        t += d
+    return lines
+
+
 def render_edit(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, ass_text: str | None, fade: float,
-                music: dict | None = None, workers: int = 2, audio=None) -> None:
+                music: dict | None = None, workers: int = 2, audio=None, sound: dict | None = None) -> None:
     """Shots (effects, framing) -> picture via render.py; sound per shot (or `audio(dst_wav)`);
     captions burned in last."""
     import render
@@ -582,6 +618,20 @@ def render_edit(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, ass
             build_audio(src, shots, fps, audio_wav, music, fade)
         else:
             audio_fn(audio_wav)
+        if sound and clip.get("score_lines"):  # the clip's own sound stays in front; the score sits under it
+            import score
+
+            scored = Path(tmp) / "scored.wav"
+            cuts, t_ = [], 0.0
+            for s_ in shots[:-1]:
+                t_ += s_["frames"] / fps
+                cuts.append(round(t_, 3))
+            sp = score.render(str(audio_wav), clip["score_lines"], total / fps, scored, duck_db=6.0, cuts=cuts,
+                              plan_path=dst.with_suffix(".score.json"), **{**sound, "music_db": sound.get("music_db", -2.0) - 3.0})
+            credits = score.credits(sp)
+            if credits:
+                dst.with_suffix(".credits.txt").write_text("\n".join(credits) + "\n", encoding="utf-8")
+            audio_wav = scored
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(audio_wav)]
         if ass_text:
             ass = Path(tmp) / "caps.ass"
@@ -690,7 +740,8 @@ def safe_name(t: str) -> str:
 def make_clips(src: str, out_dir: str, count: int = 5, mn: float = 10, mx: float = 60, target: float = 48, aspect: str = "vertical",
                captions: str = "auto", title: str = "off", hook: bool = True, model: str | None = None, language: str | None = None,
                content: str = "auto", framing: str = "auto", whisper_model: str = ac.DEFAULT_WHISPER, plan_only: bool = False,
-               caption_style: str = "pop", music: str | None = None, music_volume: float = 0.35, pace: str = "medium", workers: int = 2) -> dict:
+               caption_style: str = "pop", music: str | None = None, music_volume: float = 0.35, pace: str = "medium", workers: int = 2,
+               sound: dict | None = None) -> dict:
     import captions as cap
     import clip_edit as ce
 
@@ -787,7 +838,9 @@ def make_clips(src: str, out_dir: str, count: int = 5, mn: float = 10, mx: float
             ass = cap.build_ass(wout if caps_on else [], show_title, W, H, c["duration"], caption_style, title) if ((caps_on and wout) or show_title) else None
             t1 = time.time()
             m = {"path": mus["path"], "volume": music_volume, "start": c.get("music_start", 0.0)} if mus else None
-            render_edit(src, c, W, H, fps, dst, ass, fade, m, workers)
+            if sound:
+                c["score_lines"] = clip_score_lines(c, fps, wout, mode == "talk")
+            render_edit(src, c, W, H, fps, dst, ass, fade, m, workers, sound=sound)
             if wout:
                 dst.with_suffix(".srt").write_text(ac.to_srt(ac.group_words(wout, max_words=7, max_chars=40)), encoding="utf-8")
             log(f"progress {k}/{len(clips)} clips: {dst.name} ({c['duration']:.0f}s, {len(c['shots'])} shots, "
@@ -821,21 +874,27 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--llm", default="default", help="language model key (see llm.py), 'default' or 'none'")
     p.add_argument("--language")
     p.add_argument("--plan-only", action="store_true")
+    import score
+
+    score.add_sound_args(p)
     p.add_argument("--sections", action="store_true",
                    help="continuous sections instead of edited clips: each output is one uninterrupted part of the video (e.g. --min 15 --max 180)")
 
 
 def run_args(a) -> dict:
+    import score
+
     if getattr(a, "sections", False):
         import sections
 
         return sections.make_sections(a.input, a.out_dir, a.count, a.min, a.max, a.target, a.aspect, captions=a.captions,
                                       title="off" if a.no_title else a.title, model=a.llm, language=a.language, content=a.content,
-                                      framing=a.framing, plan_only=a.plan_only, caption_style=a.caption_style, workers=getattr(a, "workers", 2))
+                                      framing=a.framing, plan_only=a.plan_only, caption_style=a.caption_style, workers=getattr(a, "workers", 2),
+                                      sound=score.options(a))
     return make_clips(a.input, a.out_dir, a.count, a.min, a.max, a.target, a.aspect, captions=a.captions,
                       title="off" if a.no_title else a.title, hook=not a.no_hook, model=a.llm, language=a.language, content=a.content,
                       framing=a.framing, plan_only=a.plan_only, caption_style=a.caption_style, music=a.music, music_volume=a.music_volume,
-                      pace=a.pace, workers=getattr(a, "workers", 2))
+                      pace=a.pace, workers=getattr(a, "workers", 2), sound=score.options(a))
 
 
 def main(argv: list[str] | None = None) -> int:

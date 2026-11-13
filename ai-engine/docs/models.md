@@ -18,6 +18,8 @@ are stored in the shared Hugging Face cache, **`~/.cache/huggingface/hub/`** (on
 | S3Tokenizer V2, `mlx-community/S3TokenizerV2` | 0.49 GB | Part of Chatterbox: turns the reference voice into speech tokens | Apache-2.0 | Used |
 | ECAPA speaker verification, `speechbrain/spkrec-ecapa-voxceleb` (SpeechBrain) | 0.09 GB | Checks a cloned line sounds like you; drops other voices from enrolment recordings | Apache-2.0 | Used |
 | Qwen2.5-1.5B Instruct, `mlx-community/Qwen2.5-1.5B-Instruct-4bit` | 0.88 GB | Earlier default language model, before Qwen3-4B | Apache-2.0 | Not used by default (still selectable as "fastest") |
+| CLAP, `laion/clap-htsat-unfused` (LAION) | 0.6 GB | Sound design: listens to music to tell its mood (sad, epic, nostalgic …), so a cue fits the emotion even when its title says otherwise | Apache-2.0 | Used when sound design picks music |
+| MusicGen small, `facebook/musicgen-small` (Meta) | 1.2 GB | Sound design, "AI-composed score": a cue per mood composed on this Mac | Code MIT, weights CC BY-NC 4.0 (personal use only) | Only when chosen |
 | OmniVoice, `mlx-community/OmniVoice-bf16` (k2-fsa) | 1.64 GB | Voice-cloning benchmark only. It lost to Chatterbox: garbled Hindi, 5.6 GB of memory | CC-BY-NC | Not used; safe to delete |
 
 Total: **10.8 GB**.

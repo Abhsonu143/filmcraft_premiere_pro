@@ -453,7 +453,7 @@ def description_txt(data: dict, items: list[dict], script: dict) -> str:
 def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, language: str = "en", aspect: str = "horizontal", voice: str | None = None,
          script_only: bool = False, style: str | None = None, writer: str = "claude", model: str | None = None, tone: str = "", niche: str = "",
          sources: list[str] | None = None, footage: list[str] | None = None, music: str | None = None, captions: bool = True,
-         caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False) -> dict:
+         caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False, sound: dict | None = None) -> dict:
     import script_writer as sw
 
     ac.require_tools()
@@ -511,10 +511,14 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         cards = {str(Path(i["file"]).resolve()) for i in items if i["kind"] == "card"}
         nr.make(sp["outputs"][0], clips, str(video_out), narration=sp["narration"], aspect=aspect, pace=pace, captions=captions,
                 caption_style=caption_style or ("pop" if aspect == "vertical" else "clean"), music=music, describe="none", hints=hints, stills=stills, cards=cards,
-                ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30)
+                ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound)
         outputs.insert(0, str(video_out))
     (folder / "sources.md").write_text(sources_md(data, items, script), encoding="utf-8")
-    (folder / "description.txt").write_text(description_txt(data, items, script), encoding="utf-8")
+    desc = description_txt(data, items, script)
+    music_credits = video_out.with_suffix(".credits.txt") if video_out else None
+    if music_credits and music_credits.is_file():  # the score's free music must be credited too
+        desc = desc.rstrip() + "\n" + music_credits.read_text(encoding="utf-8")
+    (folder / "description.txt").write_text(desc, encoding="utf-8")
     outputs += [str(folder / "sources.md"), str(folder / "description.txt")]
     log(f"done in {time.time() - t0:.0f}s: {folder}")
     return {"outputs": outputs, "out_dir": str(folder), "script": str(script_path), "video": str(video_out) if video_out else None,
@@ -542,6 +546,9 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--takes", type=int, default=2)
     p.add_argument("--pace", default="medium", choices=["slow", "medium", "fast"])
     p.add_argument("--fresh", action="store_true", help="research again even if this folder has research for the topic")
+    import score
+
+    score.add_sound_args(p)
 
 
 def run_args(a) -> dict:
@@ -552,7 +559,8 @@ def run_args(a) -> dict:
         footage = vc.collect_clips(a.footage)
     return make(a.topic, a.out_dir, seconds=a.seconds, language=a.language, aspect=a.aspect, voice=a.voice, script_only=a.script_only, style=a.style,
                 writer=a.writer, model=a.model, tone=a.tone, niche=a.niche, sources=a.sources, footage=footage, music=a.music,
-                captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, fresh=a.fresh)
+                captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, fresh=a.fresh,
+                sound=__import__("score").options(a))
 
 
 def main(argv: list[str] | None = None) -> int:

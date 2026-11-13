@@ -1,5 +1,21 @@
 # Progress
 
+## 2026-11-13 (evening): sound design: emotions you can hear (optional)
+
+- New: `emotions.py` (the 42 emotions: mood family, voice delivery, effects), `sfx.py` (9 effects made in code),
+  `music_library.py` (music by mood from the internet, your folder or MusicGen; mood checked by listening with CLAP),
+  `score.py` (acts, transitions, effects, ducking, mix; editable `.score.json`; `ei_engine.py score`). See
+  `docs/sound-design.md`.
+- Wired in as an option: `speak` (also writes `<name> - scored.wav`), `voiceover`, `topic` (credits in the
+  description), `clips` (edited clips and sections; emotion arc from the edit), `music` (effects synced to the
+  song's sections and drop).
+- Script writer: 42 emotions with intensity and an emotional arc; old tags still work. Voice: per-emotion
+  expressiveness and pacing, pauses before reveals, one emotion per passage.
+- App: AI ▸ Speak Script… (new), and a Sound design section and a per-line Emotions editor in the dialogs.
+- Lessons from the samples: a 50 s video needs 2–4 music cues, not one per line; the first mix had the music 25 dB
+  under the voice (inaudible), now about 9 dB in pauses; titles of free tracks are unreliable ("Nostalgic Dreams"
+  is fast and minor), so tracks are now chosen by listening.
+
 ## 2026-11-13: continuous sections (AI ▸ Make Short Clips from Long Video ▸ Clip type)
 
 - `sections.py`: "Continuous sections" is a second clip type in the same dialog (`clips --sections`). Each

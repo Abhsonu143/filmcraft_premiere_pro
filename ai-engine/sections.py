@@ -360,7 +360,7 @@ def find_sections(src: str, info, words: list[dict], count: int, mn: float, mx: 
 def make_sections(src: str, out_dir: str, count: int = 3, mn: float = 15, mx: float = 180, target: float = 60, aspect: str = "same",
                   captions: str = "off", title: str = "off", model: str | None = None, language: str | None = None,
                   content: str = "auto", framing: str = "auto", whisper_model: str = ac.DEFAULT_WHISPER, plan_only: bool = False,
-                  caption_style: str = "clean", workers: int = 2) -> dict:
+                  caption_style: str = "clean", workers: int = 2, sound: dict | None = None) -> dict:
     import json
     import time
 
@@ -434,7 +434,9 @@ def make_sections(src: str, out_dir: str, count: int = 3, mn: float = 15, mx: fl
             show_title = c.get("title") if title != "off" else None
             ass = cap.build_ass(wout if caps_on else [], show_title, W, H, c["duration"], caption_style, title) if ((caps_on and wout) or show_title) else None
             t1 = time.time()
-            render_section(src, c, W, H, fps, dst, ass, info.has_audio, workers)
+            if sound:
+                c["score_lines"] = section_score_lines(c, fps, wout, an, mode == "talk")
+            render_section(src, c, W, H, fps, dst, ass, info.has_audio, workers, sound=sound)
             if wout:
                 dst.with_suffix(".srt").write_text(ac.to_srt(ac.group_words(wout, max_words=7, max_chars=40)), encoding="utf-8")
             log(f"progress {k}/{len(clips)} sections: {dst.name} ({c['duration']:.0f}s, captions {'on' if caps_on and wout else 'off'}) "
@@ -444,7 +446,41 @@ def make_sections(src: str, out_dir: str, count: int = 3, mn: float = 15, mx: fl
             "clips": [{"title": c.get("title"), "duration": c["duration"], "start": c["start"], "end": c["end"]} for c in clips]}
 
 
-def render_section(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, ass_text: str | None, has_audio: bool, workers: int = 2) -> None:
+def section_score_lines(clip: dict, fps: float, words_out: list[dict], an: dict, talk: bool) -> list[dict]:
+    """The emotional arc of a continuous section: what is said (talk), or how the action rises and
+    falls (8 s steps: building = Tension, the most intense part = Thrill/Triumph, calm = Mystery)."""
+    import highlights as hl
+
+    if talk:
+        return hl.clip_score_lines(clip, fps, words_out, True)
+    sc = an["score"]
+    a = float(clip["start"])
+    total = sum(s["frames"] for s in clip["shots"]) / fps
+    steps = max(1, int(round(total / 8.0)))
+    vals = []
+    for k in range(steps):
+        i0, i1 = int((a + k * total / steps) * HZ), int((a + (k + 1) * total / steps) * HZ)
+        seg = sc[max(0, i0) : max(i0 + 1, i1)]
+        vals.append(float(seg.mean()) if len(seg) else 0.0)
+    top = int(np.argmax(vals))
+    hi, lo = max(vals), min(vals)
+    lines = []
+    for k, v in enumerate(vals):
+        x = (v - lo) / (hi - lo + 1e-9)
+        if k == top:
+            emo, inten = ("Triumph" if k >= steps - 2 else "Thrill"), 0.9
+        elif x > 0.6:
+            emo, inten = "Excitement", 0.6 + 0.3 * x
+        elif k < top and x > 0.25:
+            emo, inten = "Tension", 0.5 + 0.3 * x
+        else:
+            emo, inten = "Mystery", 0.45
+        lines.append({"start": round(k * total / steps, 3), "end": round((k + 1) * total / steps, 3), "text": "", "emotion": emo, "intensity": inten})
+    return lines
+
+
+def render_section(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, ass_text: str | None, has_audio: bool, workers: int = 2,
+                   sound: dict | None = None) -> None:
     import highlights as hl
 
     shots = [dict(s) for s in clip["shots"]]
@@ -457,4 +493,4 @@ def render_section(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, 
     def audio(dst_wav: Path) -> None:
         section_audio(src, float(shots[0]["in"]), float(shots[0]["in"]) + total / fps, dst_wav, clip.get("fade_in", 0.0), clip.get("fade_out", 0.0), has_audio)
 
-    hl.render_edit(src, {**clip, "shots": shots}, W, H, fps, dst, ass_text, 0.0, None, workers, audio=audio)
+    hl.render_edit(src, {**clip, "shots": shots}, W, H, fps, dst, ass_text, 0.0, None, workers, audio=audio, sound=sound)

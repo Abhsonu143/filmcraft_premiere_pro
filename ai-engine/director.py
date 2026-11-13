@@ -622,6 +622,46 @@ def finish(shots: list[dict], slots: list[dict], clips: list[dict], fps: float) 
     return out
 
 
+SECTION_EMOTION = {"calm": ("Anticipation", 0.5), "mid": ("Excitement", 0.65), "high": ("Euphoria", 0.85)}
+
+
+def song_lines(sections: list[dict]) -> list[dict]:
+    """The song's sections as emotional lines: calm = Anticipation, mid = Excitement, high =
+    Euphoria, the drop = Thrill at its peak (a riser leads into it and an impact lands on it)."""
+    out = []
+    for s in sections:
+        emo, inten = ("Thrill", 0.95) if s.get("drop") else SECTION_EMOTION.get(s.get("level", "mid"), ("Excitement", 0.65))
+        out.append({"start": float(s["start"]), "end": float(s["end"]), "text": s.get("level", ""), "emotion": emo, "intensity": inten})
+    return out
+
+
+def song_effects(video: Path, plan: dict, opts: dict) -> None:
+    """Sound design for a music edit: the song already is the music, so only effects are added:
+    a riser into the drop and an impact on it, impacts on big section changes, whooshes on the
+    cuts of energetic parts."""
+    import tempfile
+
+    import score
+
+    fps = float(plan["fps"])
+    total = sum(s["frames"] for s in plan["shots"]) / fps
+    cuts, t = [], 0.0
+    for s in plan["shots"][:-1]:
+        t += s["frames"] / fps
+        cuts.append(round(t, 3))
+    with tempfile.TemporaryDirectory(prefix="ei-songfx-") as tmp:
+        song = Path(tmp) / "song.wav"
+        ac.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-vn", "-ac", "2", "-ar", "48000", str(song)])
+        mixed = Path(tmp) / "mixed.wav"
+        sp = score.render(str(song), song_lines(plan.get("sections") or []), total, mixed, duck_db=0.0, cuts=cuts,
+                          plan_path=video.with_suffix(".score.json"), **{**opts, "music": False})
+        out = Path(tmp) / "out.mp4"
+        ac.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(mixed), "-map", "0:v", "-map", "1:a",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)])
+        out.replace(video)
+    log(f"sound design: {len(sp['events'])} effects on the song")
+
+
 def plan_music(args) -> dict:
     ac.require_tools()
     audio = str(Path(args.music).resolve())
@@ -753,6 +793,9 @@ def add_music_args(pm: argparse.ArgumentParser, workers: bool = True) -> None:
     pm.add_argument("--pace", default="medium", choices=sorted(PACE))
     pm.add_argument("--music-start", default="auto")
     add_common(pm, workers)
+    import score
+
+    score.add_sound_args(pm)
 
 
 def add_reference_args(pr: argparse.ArgumentParser, workers: bool = True) -> None:
@@ -793,6 +836,11 @@ def run(args) -> dict:
     res = {"plan": str(plan_path), "out_dir": str(out.parent)}
     if not args.plan_only:
         video = rd.render(plan_path, str(out), args.workers)
+        import score
+
+        opts = score.options(args) if args.cmd == "music" else None
+        if opts:
+            song_effects(video, plan, opts)
         issues = rd.quality_check(str(video), sum(s["frames"] for s in plan["shots"]), plan["fps"])
         for i in issues:
             log(f"quality check: {i}")

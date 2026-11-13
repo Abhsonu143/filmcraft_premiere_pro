@@ -21,3 +21,7 @@ mlx-audio>=0.6.5
 speechbrain>=1.1
 # TV screen tracking and compositing for TV Light Sync (Apache-2.0).
 opencv-python-headless>=4.9
+# Sound design: music mood by listening (CLAP, LAION, Apache-2.0) and the optional AI score (MusicGen small, Meta,
+# weights CC BY-NC 4.0: personal use); both through Hugging Face transformers (Apache-2.0).
+transformers>=4.45
+soundfile>=0.12

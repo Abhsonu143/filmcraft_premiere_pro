@@ -17,6 +17,8 @@ Subcommands (all paths absolute or relative to the current folder):
     script-write --topic T --out O [--language en|hi|hinglish] [--seconds 60] [--style N] [--backend claude|local]
     voice-prompts / voice-mics / voice-record --out F / voice-enroll --name N [--files F...] [--takes T.json] / voice-list
     speak     --voice N --script S --out O.wav   a script in your cloned voice (+ .narration.json); N = mac:<voice> for macOS voices
+              [--sound-design --music-source internet|folder|ai|none]   also "<O> - scored.wav": music per emotion, hits, risers
+    score     VOICE.wav --narration N.json --out O.wav   the sound design alone (or --narration X.score.json to mix an edited plan)
     tv-scan FOLDER / tv-frame REC --out P.png / tv-calibrate REC --quad … --ref-t T
     tv-make   CLIP --recordings FOLDER --out O.mp4 [--orientation horizontal|vertical]   clip on the TV, backlight matched
     topic     TOPIC_OR_LINK [--seconds 60] [--voice N | --script-only] [--sources free youtube cards]   researched video
@@ -122,6 +124,9 @@ def run(argv: list[str]) -> dict:
     tv_light.add_args(sub)
     topic_video.add_args(sub.add_parser("topic", help="topic or link -> research -> script -> voice -> edited video"))
     voice.add_args(sub)
+    import score
+
+    score.add_args(sub.add_parser("score", help="emotional sound design under a voice: music per mood, hits, risers, pauses"))
     pl = sub.add_parser("llm", help="list language models / set the default")
     pl.add_argument("--set-default")
     p = sub.add_parser("talk")
@@ -151,6 +156,8 @@ def run(argv: list[str]) -> dict:
         return script_writer.run_args(a)
     if a.cmd.startswith("voice-") or a.cmd == "speak":
         return voice.run_args(a)
+    if a.cmd == "score":
+        return score.run_args(a)
     if a.cmd == "voiceover":
         if getattr(a, "preset", None) == "short" and a.aspect == "horizontal":
             a.aspect = "vertical"
