@@ -801,17 +801,18 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
             if round_ >= len(rounds):
                 break
             stage_name, pending, n_takes = rounds[round_]
+            per = n_takes if isinstance(n_takes, dict) else {ci: n_takes for ci in pending}
             jobs, cached = [], []
             for ci in pending:
                 c = chunks[ci]
                 params = engine_params({"energy": c["energy"], "pace": c["pace"], "emotion": c.get("emotion"), "intensity": c.get("intensity", 0.6)}, eng)
-                for t in range(n_takes):
+                for t in range(per.get(ci, 1)):
                     seed = 1000 * round_ + 17 * ci + t
                     key = hashlib.sha1(json.dumps([eng, c["text"], c["lang"], params, seed, anchor_keys[c["lang"]]], ensure_ascii=False).encode()).hexdigest()[:20]
                     j = {"chunk": ci, "text": c["text"], "lang": c["lang"], "ref": anchors[c["lang"]][0], "params": params, "seed": seed,
                          "out": str(work / f"{key}.wav"), "meta": str(work / f"{key}.json")}
                     (cached if Path(j["out"]).is_file() and Path(j["meta"]).is_file() else jobs).append(j)
-            log(f"speaking {len(pending)} passage(s) ({sum(len(chunks[ci]['lines']) for ci in pending)} lines) × {n_takes} take(s) with {ENGINES[eng]['label']}"
+            log(f"speaking {len(pending)} passage(s) ({sum(len(chunks[ci]['lines']) for ci in pending)} lines), {sum(per.get(ci, 1) for ci in pending)} take(s) with {ENGINES[eng]['label']}"
                 + (f", {len(cached)} take(s) kept from before" if cached else "") + (f" ({stage_name})" if round_ else ""))
             with ac.stage(stage_name if stage_name != "retry" else "better takes"):
                 res = ac.run_isolated(_speak_worker, jobs, eng, ENGINES[eng]["repo"]) if jobs else []
@@ -846,7 +847,8 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
             weak = [ci for ci in range(len(chunks)) if ci in best and ci not in bad and len(cands.get(ci, [])) < takes
                     and (best[ci]["cer"] > 0.12 or (med is not None and best[ci]["sim"] is not None and best[ci]["sim"] < med - 0.05))]
             if round_ == 0 and (bad or weak) and takes >= 1:
-                rounds.append(("better takes", sorted(set(bad) | set(weak)), max(1, takes - 1) if not bad else max(2, takes - 1)))
+                # a weak passage gets one more take (best of two); a wrong one two fresh takes
+                rounds.append(("better takes", sorted(set(bad) | set(weak)), {**{ci: max(1, takes - 1) for ci in weak}, **{ci: max(2, takes - 1) for ci in bad}}))
                 log(f"{len(chunks) - len(bad) - len(weak)} of {len(chunks)} passage(s) are good at the first take; "
                     f"{len(weak)} get another take, {len(bad)} are spoken again")
             elif round_ == 1 and bad:
