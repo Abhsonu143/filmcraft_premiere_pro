@@ -22,8 +22,8 @@
 //!   effects?, order?, import?}`
 //! - `ai.talk {input, out?, preset?=long|short|travel, captions?, music?, import?}`
 //! - `ai.voiceover {input, clips: [..], out?, script?, music?, captions?, preset?, import?}`
-//! - `ai.clips {input, outDir?, count?=5, min?=10, target?=48, max?=60, aspect?=vertical|square|horizontal|same,
-//!   content?=auto|talk|gameplay, framing?=auto|center|blur|bars, captionMode?=auto|on|off, captionStyle?=pop|clean|boxed,
+//! - `ai.clips {input, outDir?, clipType?=edited|sections, count?=5, min?=10, target?=48, max?=60,
+//!   aspect?=vertical|square|horizontal|same, content?=auto|talk|gameplay, framing?=auto|center|blur|bars, captionMode?=auto|on|off, captionStyle?=pop|clean|boxed,
 //!   titleMode?=off|intro|always, pace?=fast|medium|slow, music?, llm?=default|<model>|none, hook?, import?}`
 //! - `ai.audio {clips: [files or folders], outDir?, format?=mp3|m4a|wav|aiff|flac|alac|opus|ogg,
 //!   audioQuality?=original|best|high|medium|small, start?, end?, mono?, normalize?, import?}`
@@ -210,6 +210,8 @@ struct Draft {
     tv_folder: String,
     relight: f64,
     tv_bezel: bool,
+    // short clips: "edited" (best moments cut together) or "sections" (one continuous part each)
+    clip_type: &'static str,
     tv: TvState,
 }
 
@@ -360,6 +362,7 @@ impl Draft {
             tv_folder: setting_str("tv_recordings").unwrap_or_default(),
             relight: 1.0,
             tv_bezel: false,
+            clip_type: "edited",
             tv: TvState::default(),
         }
     }
@@ -464,6 +467,12 @@ impl Draft {
         }
         d.relight = num("relight", d.relight);
         d.tv_bezel = flag("bezel", d.tv_bezel);
+        d.clip_type = pick("clipType", &CLIP_TYPES.map(|a| a.0), d.clip_type);
+        if d.clip_type == "sections" {
+            d.min_len = num("min", SECTION_LENGTHS.0);
+            d.target_len = num("target", SECTION_LENGTHS.1);
+            d.max_len = num("max", SECTION_LENGTHS.2);
+        }
         if let Some(a) = p.get("takesFile").and_then(Value::as_str) {
             d.script = a.to_string();
         }
@@ -548,11 +557,13 @@ impl Draft {
             }
             Kind::Clips => {
                 let (n, lo, t, hi) = (self.count, self.min_len, self.target_len, self.max_len);
+                let sections = self.clip_type == "sections";
                 if !(1.0..=50.0).contains(&n) || n.fract() != 0.0 {
                     return Err("Number of clips must be a whole number from 1 to 50.".into());
                 }
-                if !(3.0 <= lo && lo <= t && t <= hi && hi <= 600.0) {
-                    return Err("Lengths must satisfy 3 ≤ shortest ≤ typical ≤ longest ≤ 600 seconds.".into());
+                let shortest = if sections { 5.0 } else { 3.0 };
+                if !(shortest <= lo && lo <= t && t <= hi && hi <= 600.0) {
+                    return Err(format!("Lengths must satisfy {shortest} ≤ shortest ≤ typical ≤ longest ≤ 600 seconds."));
                 }
                 a.push(self.input.trim().into());
                 push(&mut a, "--out-dir", self.out.trim());
@@ -566,13 +577,17 @@ impl Draft {
                 push(&mut a, "--captions", self.caption_mode);
                 push(&mut a, "--caption-style", self.caption_style);
                 push(&mut a, "--title", self.title_mode);
-                push(&mut a, "--pace", self.pace);
-                if !self.music.trim().is_empty() {
-                    push(&mut a, "--music", self.music.trim());
-                }
                 push(&mut a, "--llm", self.llm);
-                if !self.hook {
-                    a.push("--no-hook".into());
+                if sections {
+                    a.push("--sections".into());
+                } else {
+                    push(&mut a, "--pace", self.pace);
+                    if !self.music.trim().is_empty() {
+                        push(&mut a, "--music", self.music.trim());
+                    }
+                    if !self.hook {
+                        a.push("--no-hook".into());
+                    }
                 }
             }
             Kind::Audio => {
@@ -801,6 +816,14 @@ const EFFECTS: [(&str, &str); 3] =
     [("full", "Full: speed ramps, punch-ins, flashes, transitions"), ("subtle", "Subtle: slow motion, push-ins, dissolves"), ("none", "Clean cuts only")];
 const ORDERS: [(&str, &str); 2] = [("time", "Follow the trip (shooting order)"), ("free", "Best shots first")];
 
+const CLIP_TYPES: [(&str, &str); 2] = [
+    ("edited", "Edited short clips: the best moments cut together (teaser, slow motion, punch-ins)"),
+    ("sections", "Continuous sections: one uninterrupted part of the video each, cut where it starts and ends naturally"),
+];
+/// Shortest, usual and longest length of a continuous section (seconds).
+const SECTION_LENGTHS: (f64, f64, f64) = (15.0, 60.0, 180.0);
+/// The same for edited clips.
+const EDITED_LENGTHS: (f64, f64, f64) = (10.0, 48.0, 60.0);
 const CLIP_ASPECTS: [(&str, &str); 4] =
     [("vertical", "Vertical 9:16"), ("square", "Square 1:1"), ("horizontal", "Horizontal 16:9"), ("same", "Same as the video")];
 const CONTENTS: [(&str, &str); 3] = [
@@ -897,6 +920,7 @@ fn default_output(d: &Draft) -> String {
         Kind::Reference => free_path(&parent_dir(&d.input), &format!("{} - EI edit", file_stem(&d.input)), ".mp4"),
         Kind::Talk => free_path(&parent_dir(&d.input), &format!("{} - EI cut", file_stem(&d.input)), ".mp4"),
         Kind::Voiceover => free_path(&parent_dir(&d.input), &format!("{} - EI edit", file_stem(&d.input)), ".mp4"),
+        Kind::Clips if d.clip_type == "sections" => free_path(&parent_dir(&d.input), &format!("{} - EI sections", file_stem(&d.input)), ""),
         Kind::Clips => free_path(&parent_dir(&d.input), &format!("{} - EI clips", file_stem(&d.input)), ""),
         Kind::Audio => d.clips.first().map(|c| parent_dir(c).to_string_lossy().to_string()).unwrap_or_else(|| movies_dir().to_string_lossy().to_string()),
         Kind::Script => movies_dir().join("Scripts").join(slug(if d.topic.trim().is_empty() { "script" } else { &d.topic })).to_string_lossy().to_string(),
@@ -1568,7 +1592,10 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         });
                         ui.end_row();
                     }
-                    if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover | Kind::Reference | Kind::Clips) || (d.kind == Kind::Topic && d.make_video) {
+                    if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Voiceover | Kind::Reference)
+                        || (d.kind == Kind::Clips && d.clip_type != "sections")
+                        || (d.kind == Kind::Topic && d.make_video)
+                    {
                         ui.label(match d.kind {
                             Kind::Music => "Music",
                             Kind::Reference => "Other soundtrack (optional)",
@@ -1622,6 +1649,17 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             style_rows(ui, &mut d, &p, true, &mut elems);
                         }
                         Kind::Clips => {
+                            ui.label("Clip type");
+                            let before = d.clip_type;
+                            radio_row(ui, &mut d.clip_type, &CLIP_TYPES, &format!("{p}.clipType"), &mut elems);
+                            if d.clip_type != before {
+                                // switch the lengths too, unless they were changed by hand
+                                let (from, to) = if d.clip_type == "sections" { (EDITED_LENGTHS, SECTION_LENGTHS) } else { (SECTION_LENGTHS, EDITED_LENGTHS) };
+                                if (d.min_len, d.target_len, d.max_len) == from {
+                                    (d.min_len, d.target_len, d.max_len) = to;
+                                }
+                            }
+                            ui.end_row();
                             ui.label("Number of clips");
                             let r = ui.add(egui::DragValue::new(&mut d.count).range(1.0..=50.0).speed(0.1).max_decimals(0));
                             elems.push((format!("{p}.count"), r.rect, d.count.to_string()));
@@ -1646,9 +1684,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             ui.label("Framing");
                             combo_row(ui, &mut d.framing, &FRAMINGS, &format!("{p}.framing"), &mut elems);
                             ui.end_row();
-                            ui.label("Pace");
-                            radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
-                            ui.end_row();
+                            if d.clip_type != "sections" {
+                                ui.label("Pace");
+                                radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
+                                ui.end_row();
+                            }
                             ui.label("Captions");
                             combo_row(ui, &mut d.caption_mode, &CAPTION_MODES, &format!("{p}.captions"), &mut elems);
                             ui.end_row();
@@ -1661,12 +1701,14 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             ui.label("Language model");
                             combo_row(ui, &mut d.llm, &LLMS, &format!("{p}.llm"), &mut elems);
                             ui.end_row();
-                            ui.label("");
-                            ui.vertical(|ui| {
-                                let r = ui.checkbox(&mut d.hook, "Open each clip with a teaser of its best moment");
-                                elems.push((format!("{p}.hook"), r.rect, d.hook.to_string()));
-                            });
-                            ui.end_row();
+                            if d.clip_type != "sections" {
+                                ui.label("");
+                                ui.vertical(|ui| {
+                                    let r = ui.checkbox(&mut d.hook, "Open each clip with a teaser of its best moment");
+                                    elems.push((format!("{p}.hook"), r.rect, d.hook.to_string()));
+                                });
+                                ui.end_row();
+                            }
                         }
                         Kind::Audio => {
                             ui.label("Format");
@@ -2772,7 +2814,7 @@ fn description(kind: Kind) -> &'static str {
             "Clones your voice on this Mac (Chatterbox Multilingual, Hindi + English). Read the sentences EI shows (they cover every sound and the deliveries a video needs), or use recordings you already have. Use only your own voice, or a voice you have permission to use."
         }
         Kind::Clips => {
-            "Edits each clip from a whole scene of a long video: only its best beats, cut on the action, a teaser first, slow motion on the climax, punch-ins on the big hits. Reframed to truly fill the shape (following the action and faces). Talk clips are built from sentences and topics. Optional captions, title card and music (cuts move onto its beats)."
+            "Edits each clip from a whole scene of a long video: only its best beats, cut on the action, a teaser first, slow motion on the climax, punch-ins on the big hits. Reframed to truly fill the shape (following the action and faces). Talk clips are built from sentences and topics. Optional captions, title card and music (cuts move onto its beats).\n\nContinuous sections: each output is one uninterrupted part of the video (15 s – 3 min). EI chooses where it starts and ends: on a cut of the video, between sentences, before the action builds and after it settles, never mid-sentence or on black."
         }
         Kind::Audio => "Saves the sound of videos as audio files in the format you choose. The videos are not changed.",
     }
@@ -3159,6 +3201,16 @@ mod tests {
             p["input"] = json!(video.to_string_lossy());
             assert!(Draft::from_params(Kind::Clips, &p).engine_args().is_err(), "{bad}");
         }
+        // continuous sections: their own lengths and folder, no edited-clip options
+        let mut sec = Draft::from_params(Kind::Clips, &json!({"input": video.to_string_lossy(), "clipType": "sections", "count": 2, "aspect": "same"}));
+        let a = sec.engine_args().unwrap();
+        for pair in [["--min", "15"], ["--target", "60"], ["--max", "180"], ["--aspect", "same"], ["--count", "2"]] {
+            assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
+        }
+        assert!(a.contains(&"--sections".to_string()) && !a.contains(&"--pace".to_string()) && !a.contains(&"--no-hook".to_string()), "{a:?}");
+        assert!(sec.out.ends_with("long - EI sections"), "{}", sec.out);
+        let p = json!({"input": video.to_string_lossy(), "clipType": "sections", "min": 4, "target": 30, "max": 90});
+        assert!(Draft::from_params(Kind::Clips, &p).engine_args().is_err());
         let mut au =
             Draft::from_params(Kind::Audio, &json!({"clips": [video.to_string_lossy()], "format": "flac", "start": 5, "end": "20.5", "normalize": true}));
         let a = au.engine_args().unwrap();

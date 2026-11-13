@@ -1,5 +1,24 @@
 # Progress
 
+## 2026-11-13: continuous sections (AI ▸ Make Short Clips from Long Video ▸ Clip type)
+
+- `sections.py`: "Continuous sections" is a second clip type in the same dialog (`clips --sections`). Each
+  output is one uninterrupted part of the long video (default 15 s – 3 min, mostly about 60 s), in any shape
+  (vertical, square, horizontal, or the video's own). It reuses the cached transcript and action analysis, so a
+  video already used for short clips is planned in under a minute.
+- Where a section starts: a picture cut, a fade in from black, the first word of a sentence after a pause
+  (a new topic is better), or the calm before the action builds. Where it ends: a cut, a fade to black, a
+  sentence end with a pause after it, or the moment the action has settled. Never inside a sentence, never
+  on black, never on a held picture (loading card, freeze before a wipe). It also never stops in the middle
+  of ongoing action: if what happens just outside an edge is still above the video's usual level, the
+  section grows (up to the longest length) instead.
+- The length follows the content: any length within ±35 % of the usual one costs nothing, and a longer
+  section is worth it while the action keeps going.
+- Edges on a picture cut are moved onto the exact frame of the cut (the analysis runs at 5 fps); other
+  edges get short fades. Rendering splits the picture only at the video's own cuts and every 20 s, back to
+  back, with one crop path for the whole section and one uninterrupted sound.
+- Samples of each version are kept in `~/Movies/EI/Sections/` (`v1 …`, `v2 …`).
+
 ## 2026-11-12 (night): Kapwing-style clip maker, audio extraction, model choice
 
 - `highlights.py` (AI ▸ Make Short Clips from Long Video): transcript, then topic sections (lexical cohesion and

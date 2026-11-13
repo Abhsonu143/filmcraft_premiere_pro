@@ -176,6 +176,8 @@ fn ai_menu_and_dialogs() {
             "clips",
             &[
                 "input",
+                "clipType.edited",
+                "clipType.sections",
                 "count",
                 "min",
                 "target",

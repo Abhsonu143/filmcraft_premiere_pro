@@ -562,10 +562,12 @@ def build_audio(src: str, shots: list[dict], fps: float, dst: Path, music: dict 
 
 
 def render_edit(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, ass_text: str | None, fade: float,
-                music: dict | None = None, workers: int = 2) -> None:
-    """Shots (effects, framing) -> picture via render.py; sound per shot; captions burned in last."""
+                music: dict | None = None, workers: int = 2, audio=None) -> None:
+    """Shots (effects, framing) -> picture via render.py; sound per shot (or `audio(dst_wav)`);
+    captions burned in last."""
     import render
 
+    audio_fn = audio
     shots = clip["shots"]
     total = sum(s["frames"] for s in shots)
     with tempfile.TemporaryDirectory(prefix="ei-clip-") as tmp:
@@ -575,9 +577,12 @@ def render_edit(src: str, clip: dict, W: int, H: int, fps: float, dst: Path, ass
         plan_path.write_text(json.dumps(plan))
         video = Path(tmp) / "video.mp4"
         render.render(plan_path, str(video), workers=workers)
-        audio = Path(tmp) / "audio.wav"
-        build_audio(src, shots, fps, audio, music, fade)
-        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(audio)]
+        audio_wav = Path(tmp) / "audio.wav"
+        if audio_fn is None:
+            build_audio(src, shots, fps, audio_wav, music, fade)
+        else:
+            audio_fn(audio_wav)
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(audio_wav)]
         if ass_text:
             ass = Path(tmp) / "caps.ass"
             ass.write_text(ass_text, encoding="utf-8")
@@ -625,6 +630,58 @@ def action_clips(src: str, duration: float, words: list[dict], count: int, targe
 # ---------------------------------------------------------------------------------------------
 
 
+def output_size(aspect: str, dw: int, dh: int) -> tuple[int, int]:
+    """Output frame size: a social shape, or the video's own shape ("same", at most 1920 wide/high)."""
+    if aspect == "same":
+        sc = min(1.0, 1920 / max(dw, dh, 1))
+        return max(2, int(dw * sc) // 2 * 2), max(2, int(dh * sc) // 2 * 2)
+    if aspect not in ASPECTS:
+        raise AutocutError(f"unknown shape {aspect!r} ({', '.join([*ASPECTS, 'same'])})")
+    return ASPECTS[aspect]
+
+
+def name_clips(src: str, clips: list[dict], mode: str, model: str | None) -> None:
+    """A title for each clip (language model; from the transcript in talk, from what is on screen
+    in gameplay), no two the same."""
+    if not clips:
+        return
+    if mode == "talk":
+        prompts = [f"Clip transcript:\n{c['text']}" for c in clips]
+    else:
+        tags = visual_tags(src, clips)
+        for c, t in zip(clips, tags):
+            c["tags"] = t
+        prompts = [
+            "This is a highlight clip from a gameplay video for YouTube Shorts. "
+            f"On screen: {', '.join(c.get('tags') or ['gameplay action'])}. "
+            f"Dialogue heard (partial, may be garbled): {c['text'][:600] or '(none)'}\n"
+            "Describe the moment (a fight, a duel, a chase, a story twist) in an exciting way. "
+            "Do not quote the dialogue word for word."
+            for c in clips
+        ]
+    titles = [tidy_title(t) for t in llm_titles(prompts, model)]
+    seen: set[str] = set()
+    dup = []
+    for k, t in enumerate(titles):
+        if t and t.lower() in seen:
+            dup.append(k)
+        elif t:
+            seen.add(t.lower())
+    if dup:  # ask again for clips whose title repeats another one
+        avoid = "; ".join(sorted(seen))
+        again = llm_titles([prompts[k] + f"\nThe title must be different from these: {avoid}" for k in dup], model)
+        for k, t in zip(dup, again):
+            t = tidy_title(t)
+            titles[k] = t if t and t.lower() not in seen else None
+            if titles[k]:
+                seen.add(titles[k].lower())
+    for c, t in zip(clips, titles):
+        if t:
+            c["title"] = t
+        elif mode != "talk" and not c.get("title"):
+            c["title"] = " ".join(w.capitalize() for w in (c.get("tags") or ["Highlight"])[0].replace("a ", "", 1).split()) or None
+
+
 def safe_name(t: str) -> str:
     t = re.sub(r"[^\w\s\-'&]", "", t).strip()
     return re.sub(r"\s+", " ", t)[:60] or "clip"
@@ -658,11 +715,7 @@ def make_clips(src: str, out_dir: str, count: int = 5, mn: float = 10, mx: float
     if info.duration < mn:
         raise AutocutError(f"the video ({info.duration:.0f}s) is shorter than the minimum clip length")
     dw, dh = info.display_size
-    if aspect == "same":
-        sc = min(1.0, 1920 / max(dw, dh, 1))
-        W, H = max(2, int(dw * sc) // 2 * 2), max(2, int(dh * sc) // 2 * 2)
-    else:
-        W, H = ASPECTS[aspect]
+    W, H = output_size(aspect, dw, dh)
     fps = 30.0
     t0 = time.time()
     words: list[dict] = []
@@ -692,42 +745,7 @@ def make_clips(src: str, out_dir: str, count: int = 5, mn: float = 10, mx: float
     else:
         clips = action_clips(src, info.duration, words, count, target, mn, mx, hook=hook, src_fps=info.fps or 30.0, pace=pace)
         fade = 0.03
-    if clips:
-        if mode == "talk":
-            prompts = [f"Clip transcript:\n{c['text']}" for c in clips]
-        else:
-            tags = visual_tags(src, clips)
-            for c, t in zip(clips, tags):
-                c["tags"] = t
-            prompts = [
-                "This is a highlight clip from a gameplay video for YouTube Shorts. "
-                f"On screen: {', '.join(c.get('tags') or ['gameplay action'])}. "
-                f"Dialogue heard (partial, may be garbled): {c['text'][:600] or '(none)'}\n"
-                "Describe the moment (a fight, a duel, a chase, a story twist) in an exciting way. "
-                "Do not quote the dialogue word for word."
-                for c in clips
-            ]
-        titles = [tidy_title(t) for t in llm_titles(prompts, model)]
-        seen: set[str] = set()
-        dup = []
-        for k, t in enumerate(titles):
-            if t and t.lower() in seen:
-                dup.append(k)
-            elif t:
-                seen.add(t.lower())
-        if dup:  # ask again for clips whose title repeats another one
-            avoid = "; ".join(sorted(seen))
-            again = llm_titles([prompts[k] + f"\nThe title must be different from these: {avoid}" for k in dup], model)
-            for k, t in zip(dup, again):
-                t = tidy_title(t)
-                titles[k] = t if t and t.lower() not in seen else None
-                if titles[k]:
-                    seen.add(titles[k].lower())
-        for c, t in zip(clips, titles):
-            if t:
-                c["title"] = t
-            elif mode != "talk" and not c.get("title"):
-                c["title"] = " ".join(w.capitalize() for w in (c.get("tags") or ["Highlight"])[0].replace("a ", "", 1).split()) or None
+    name_clips(src, clips, mode, model)
     if len(clips) < count:
         log(f"only {len(clips)} clip(s) of {mn:g}–{mx:g}s fit without reusing material")
     mus = None
@@ -803,9 +821,17 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--llm", default="default", help="language model key (see llm.py), 'default' or 'none'")
     p.add_argument("--language")
     p.add_argument("--plan-only", action="store_true")
+    p.add_argument("--sections", action="store_true",
+                   help="continuous sections instead of edited clips: each output is one uninterrupted part of the video (e.g. --min 15 --max 180)")
 
 
 def run_args(a) -> dict:
+    if getattr(a, "sections", False):
+        import sections
+
+        return sections.make_sections(a.input, a.out_dir, a.count, a.min, a.max, a.target, a.aspect, captions=a.captions,
+                                      title="off" if a.no_title else a.title, model=a.llm, language=a.language, content=a.content,
+                                      framing=a.framing, plan_only=a.plan_only, caption_style=a.caption_style, workers=getattr(a, "workers", 2))
     return make_clips(a.input, a.out_dir, a.count, a.min, a.max, a.target, a.aspect, captions=a.captions,
                       title="off" if a.no_title else a.title, hook=not a.no_hook, model=a.llm, language=a.language, content=a.content,
                       framing=a.framing, plan_only=a.plan_only, caption_style=a.caption_style, music=a.music, music_volume=a.music_volume,
