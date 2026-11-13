@@ -21,3 +21,14 @@ in the script writer, Video from Topic and the voiceover edit, offline.
   - **Voiceover edit:** writes a 3–7-word on-screen hook from them.
 - **Command line:** `ei_engine.py hooks-sync --niches gaming travel --geo IN US`;
   `ei_engine.py hooks-list --topic "…" --niche travel`.
+
+## Video from Topic: your own hook, or a hook searched for the topic
+
+- **Hook (optional):** type your own first line. It is spoken word for word as the first segment, and the script
+  continues from it and pays it off. It is also the on-screen hook (when 10 words or fewer), and no cold open plays
+  before it. `topic … --hook-line "…"`.
+- **Search online for a hook for this topic** (tick box): before the script is written, EI looks at the topic's
+  most-viewed YouTube videos, and Claude (with web search) finds how successful videos and posts on this topic open
+  now. It writes up to 8 topic-specific hooks, strongest first, true to the researched facts. They lead the hook
+  suggestions for the script and are kept in the library. `topic … --find-hook`. Your own line wins when both are
+  given.

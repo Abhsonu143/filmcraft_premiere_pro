@@ -456,7 +456,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
          script_only: bool = False, style: str | None = None, writer: str = "claude", model: str | None = None, tone: str = "", niche: str = "",
          sources: list[str] | None = None, footage: list[str] | None = None, music: str | None = None, captions: bool = True,
          caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False, sound: dict | None = None,
-         resolution: str = "1080p") -> dict:
+         resolution: str = "1080p", hook_line: str | None = None, find_hook: bool = False) -> dict:
     import script_writer as sw
 
     ac.require_tools()
@@ -488,8 +488,16 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         rj.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     # 2. script (sized to the voice's pace when there is one)
     clone = voice if (voice and not voice.startswith("mac") and not script_only) else None
+    found = []
+    if hook_line and hook_line.strip():
+        log(f"hook: your line “{hook_line.strip()[:80]}”")
+    elif find_hook:  # hooks for exactly this topic, looked up online now
+        import hooks as hk
+
+        found = hk.find_for_topic(data.get("title_idea") or topic, niche, language, facts=facts_notes(data)[:3000], model=model if writer == "claude" else None)
     res = sw.write_script(data.get("title_idea") or topic, str(folder / name), niche=niche, seconds=seconds, language=language, tone=tone,
-                          notes=facts_notes(data), style=style, backend=writer, model=model if writer == "claude" else None, pace_voice=clone)
+                          notes=facts_notes(data), style=style, backend=writer, model=model if writer == "claude" else None, pace_voice=clone,
+                          hook_line=hook_line, found_hooks=found)
     script_path = Path(res["script"])
     script = json.loads(script_path.read_text(encoding="utf-8"))
     outputs = [str(script_path), str(script_path.with_name(script_path.name.replace(".script.json", ".txt")))]
@@ -514,7 +522,9 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         cards = {str(Path(i["file"]).resolve()) for i in items if i["kind"] == "card"}
         nr.make(sp["outputs"][0], clips, str(video_out), narration=sp["narration"], aspect=aspect, pace=pace, captions=captions,
                 caption_style=caption_style or ("pop" if aspect == "vertical" else "clean"), music=music, describe="none", hints=hints, stills=stills, cards=cards,
-                ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound, resolution=resolution, niche=niche)
+                ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound, resolution=resolution, niche=niche,
+                # your own hook opens the video: no cold open before it, and it is the on-screen hook too
+                hook="text" if hook_line and hook_line.strip() else "auto", screen_text=hook_line)
         outputs.insert(0, str(video_out))
     (folder / "sources.md").write_text(sources_md(data, items, script), encoding="utf-8")
     desc = description_txt(data, items, script)
@@ -550,6 +560,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--takes", type=int, default=2)
     p.add_argument("--pace", default="medium", choices=["slow", "medium", "fast"])
     p.add_argument("--fresh", action="store_true", help="research again even if this folder has research for the topic")
+    p.add_argument("--hook-line", help="your own first line, spoken word for word (the rest of the script follows from it)")
+    p.add_argument("--find-hook", action="store_true", help="look online for hooks that work for this exact topic first")
     import score
 
     score.add_sound_args(p)
@@ -564,7 +576,7 @@ def run_args(a) -> dict:
     return make(a.topic, a.out_dir, seconds=a.seconds, language=a.language, aspect=a.aspect, voice=a.voice, script_only=a.script_only, style=a.style,
                 writer=a.writer, model=a.model, tone=a.tone, niche=a.niche, sources=a.sources, footage=footage, music=a.music,
                 captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, fresh=a.fresh,
-                sound=__import__("score").options(a), resolution=a.resolution)
+                sound=__import__("score").options(a), resolution=a.resolution, hook_line=a.hook_line, find_hook=a.find_hook)
 
 
 def main(argv: list[str] | None = None) -> int:

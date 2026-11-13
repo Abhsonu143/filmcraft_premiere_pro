@@ -446,9 +446,24 @@ def clean_segment(s: dict) -> dict | None:
     }
 
 
+def with_hook_line(segs: list[dict], hook_line: str) -> list[dict]:
+    """The creator's hook as the first segment, exactly as typed (the model's own opening is replaced
+    when it was a hook, else the line goes in front of it)."""
+    first = segs[0]
+    if re.sub(r"\W+", " ", first["text"]).strip().lower() == re.sub(r"\W+", " ", hook_line).strip().lower():
+        return [{**first, "text": hook_line}] + segs[1:]
+    hook = {**first, "section": "hook", "text": hook_line, "emotion": first.get("emotion") if first.get("section") == "hook" else "Surprise",
+            "intensity": max(0.75, float(first.get("intensity", 0.6))), "emphasis": []}
+    return [hook] + (segs[1:] if first.get("section") == "hook" else segs)
+
+
 def write_script(topic: str, out: str, *, niche: str = "", seconds: float = 60, language: str = "en", tone: str = "", audience: str = "",
                  notes: str = "", style: str | None = None, footage: list[str] | None = None, backend: str = "claude",
-                 model: str | None = None, voice: str | None = None, speak_takes: int = 2, pace_voice: str | None = None) -> dict:
+                 model: str | None = None, voice: str | None = None, speak_takes: int = 2, pace_voice: str | None = None,
+                 hook_line: str | None = None, found_hooks: list[dict] | None = None) -> dict:
+    """`hook_line`: the creator's own first line, used word for word. `found_hooks`: hooks found
+    online for this exact topic (hooks.find_for_topic), which lead the hook suggestions."""
+    hook_line = re.sub(r"\s+", " ", hook_line or "").strip() or None
     if language not in LANGUAGES:
         raise AutocutError(f"language must be one of {', '.join(LANGUAGES)}")
     if not (5 <= seconds <= 1800):
@@ -458,10 +473,13 @@ def write_script(topic: str, out: str, *, niche: str = "", seconds: float = 60, 
     try:  # the best-fitting hooks of the local hook library (no internet needed)
         import hooks as hk
 
-        hooks_txt = hk.prompt_block(hk.suggest(topic, niche, language))
+        hooks_txt = hk.topic_block(found_hooks or []) + hk.prompt_block(hk.suggest(topic, niche, language))
     except (OSError, ValueError, KeyError) as e:
         log(f"hook library unavailable ({type(e).__name__})")
         hooks_txt = ""
+    if hook_line:  # the creator's own hook decides; the library is not needed
+        hooks_txt = (f"\n## The hook (given by the creator: the first segment's text must be exactly this, word for word)\n{hook_line}\n"
+                     "Continue naturally from it, and pay it off later in the script.\n")
     prompt = build_prompt(topic, niche=niche, seconds=seconds, language=language, tone=tone, audience=audience, notes=notes, style=prof, footage=footage,
                           wpm=wpm, hooks=hooks_txt)
     t0 = time.time()
@@ -475,6 +493,8 @@ def write_script(topic: str, out: str, *, niche: str = "", seconds: float = 60, 
     segs = [c for c in (clean_segment(s) for s in data.get("segments", []) if isinstance(s, dict)) if c]
     if not segs:
         raise AutocutError("the script has no segments")
+    if hook_line:
+        segs = with_hook_line(segs, hook_line)
     script = {"version": 1, "title": str(data.get("title", topic)).strip(), "topic": topic, "language": language, "niche": niche,
               "style": (prof or {}).get("name"), "target_seconds": seconds, "hook": str(data.get("hook", segs[0]["text"])),
               "segments": segs, "written_by": backend, "words": sum(len(words_of(s["text"])) for s in segs)}

@@ -510,7 +510,7 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
          ambience_db: float = -24.0, describe: str = "local", model: str | None = None, story_order: bool = True, look: str = "natural",
          whisper_model: str = ac.DEFAULT_WHISPER, workers: int = 2, plan_only: bool = False, hints: dict[str, list[int]] | None = None,
          stills: set[str] | None = None, cards: set[str] | None = None, sound: dict | None = None, resolution: str = "1080p",
-         hook: str = "auto", niche: str = "") -> dict:
+         hook: str = "auto", niche: str = "", screen_text: str | None = None) -> dict:
     """`sound`: optional emotional sound design (score.options): music per mood, hits, risers, pauses."""
     import render
 
@@ -563,7 +563,10 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
             log(f"hook: opens on “{lines[0]['text'][:60]}” ({lines[0].get('emotion')}), then the start")
         elif hook == "teaser":
             log("hook: no line is strong enough for a cold open; starting with the first line")
-    if hook in ("auto", "text", "both"):
+    if hook in ("auto", "text", "both") and screen_text and len(screen_text.split()) <= 10:
+        hook_text = screen_text.strip()
+        log(f"hook text on screen: “{hook_text}” (yours)")
+    elif hook in ("auto", "text", "both"):
         hook_text = nc.screen_hook(lines, niche, "hi" if any(re.search(r"[ऀ-ॿ]", str(x.get("text", ""))) for x in lines) else "en",
                                    "claude", model)
         log(f"hook text on screen: “{hook_text}”")

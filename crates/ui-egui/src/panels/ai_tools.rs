@@ -238,6 +238,9 @@ struct Draft {
     hook_niches: String,
     hook_geos: String,
     hook_claude: bool,
+    // video from topic: your own first line, or hooks looked up online for the topic
+    hook_line: String,
+    find_hook: bool,
     // optional emotional sound design (music per mood, hits, risers, pauses)
     sound: bool,
     music_source: &'static str,
@@ -403,6 +406,8 @@ impl Draft {
                 .unwrap_or_else(|| "gaming, tech, travel, finance, fitness, food, motivation, movies, news, education".into()),
             hook_geos: setting_str("hook_geos").unwrap_or_else(|| "IN, US".into()),
             hook_claude: true,
+            hook_line: String::new(),
+            find_hook: false,
             sound: false,
             music_source: "internet",
             music_folder: setting_str("music_folder").unwrap_or_default(),
@@ -519,6 +524,10 @@ impl Draft {
         d.resolution = pick("resolution", &RESOLUTIONS.map(|a| a.0), d.resolution);
         d.vo_hook = pick("hook", &HOOK_MODES.map(|a| a.0), d.vo_hook);
         d.hook_claude = flag("hookClaude", d.hook_claude);
+        d.find_hook = flag("findHook", d.find_hook);
+        if let Some(v) = s("hookLine") {
+            d.hook_line = v;
+        }
         if let Some(v) = s("niches") {
             d.hook_niches = v;
         }
@@ -800,6 +809,11 @@ impl Draft {
                 }
                 if self.fresh {
                     a.push("--fresh".into());
+                }
+                if !self.hook_line.trim().is_empty() {
+                    push(&mut a, "--hook-line", self.hook_line.trim()); // yours wins over a search
+                } else if self.find_hook {
+                    a.push("--find-hook".into());
                 }
                 if self.make_video {
                     push(&mut a, "--voice", self.voice.trim());
@@ -2430,6 +2444,23 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                                 elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
                             });
                             ui.end_row();
+                            ui.label("Hook (optional)");
+                            ui.vertical(|ui| {
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(&mut d.hook_line).hint_text("your own first line, spoken word for word").desired_width(380.0),
+                                );
+                                elems.push((format!("{p}.hookLine"), r.rect, d.hook_line.clone()));
+                                ui.add_enabled_ui(d.hook_line.trim().is_empty(), |ui| {
+                                    let r = ui.checkbox(&mut d.find_hook, "Search online for a hook for this topic (its top videos, Claude with web search)");
+                                    elems.push((format!("{p}.findHook"), r.rect, d.find_hook.to_string()));
+                                });
+                                if d.hook_line.trim().is_empty() {
+                                    ui.label(egui::RichText::new("Empty: the hook is written from your hook library.").small().weak());
+                                } else {
+                                    ui.label(egui::RichText::new("The video opens with your line (no cold open before it).").small().weak());
+                                }
+                            });
+                            ui.end_row();
                             if d.make_video {
                                 ui.label("Voiceover");
                                 let mut voices: Vec<(String, String)> = saved_voices().into_iter().map(|v| (v.clone(), format!("{v} (your clone)"))).collect();
@@ -3837,6 +3868,18 @@ mod tests {
         let mut off = Draft::from_params(Kind::Clips, &json!({"input": clip.to_string_lossy()}));
         assert!(!off.engine_args().unwrap().contains(&"--sound-design".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn topic_hook_line_and_search() {
+        let a = Draft::from_params(Kind::Topic, &json!({"topic": "GTA 6", "voice": "mac:Rishi", "hookLine": "  GTA 6 is finally here!  ", "findHook": true}))
+            .engine_args()
+            .unwrap();
+        assert!(a.windows(2).any(|w| w == ["--hook-line", "GTA 6 is finally here!"]) && !a.contains(&"--find-hook".to_string()), "{a:?}");
+        let a = Draft::from_params(Kind::Topic, &json!({"topic": "GTA 6", "voice": "mac:Rishi", "findHook": true})).engine_args().unwrap();
+        assert!(a.contains(&"--find-hook".to_string()) && !a.contains(&"--hook-line".to_string()), "{a:?}");
+        let a = Draft::from_params(Kind::Topic, &json!({"topic": "GTA 6", "voice": "mac:Rishi"})).engine_args().unwrap();
+        assert!(!a.contains(&"--find-hook".to_string()) && !a.contains(&"--hook-line".to_string()), "{a:?}");
     }
 
     #[test]

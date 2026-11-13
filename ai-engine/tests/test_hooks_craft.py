@@ -116,3 +116,34 @@ def test_same_scene_is_not_shown_twice_in_a_row():
     cands = [[{"clip": 0, "in": 0.0, "score": 2.0, "size": "wide"}],
              [{"clip": 1, "in": 0.0, "score": 2.0, "size": "aerial"}, {"clip": 2, "in": 0.0, "score": 1.5, "size": "aerial"}]]
     assert [p["clip"] for p in nr.choose(slots, cands, clips, story_order=False)] == [0, 2]
+
+
+def test_your_hook_line_opens_the_script():
+    import script_writer as sw
+
+    segs = [{"section": "hook", "text": "Twelve years of waiting.", "emotion": "Awe", "intensity": 0.8, "emphasis": ["Twelve"]},
+            {"section": "build", "text": "Then it got delayed.", "emotion": "Tension", "intensity": 0.6}]
+    out = sw.with_hook_line(segs, "GTA 6 is finally here!")
+    assert [s["text"] for s in out] == ["GTA 6 is finally here!", "Then it got delayed."]  # the model's hook is replaced
+    assert out[0]["emotion"] == "Awe" and out[0]["emphasis"] == []
+    body = [{"section": "intro", "text": "Let me tell you a story.", "emotion": "Nostalgia", "intensity": 0.5}]
+    out = sw.with_hook_line(body, "Nobody saw this coming.")
+    assert [s["text"] for s in out] == ["Nobody saw this coming.", "Let me tell you a story."] and out[0]["emotion"] == "Surprise"
+    same = sw.with_hook_line([{"section": "hook", "text": "nobody saw this coming", "emotion": "Surprise", "intensity": 0.9}], "Nobody saw this coming!")
+    assert [s["text"] for s in same] == ["Nobody saw this coming!"]
+
+
+def test_topic_hook_search_is_kept(monkeypatch, tmp_path):
+    import script_writer as sw
+    import topic_video as tv
+
+    monkeypatch.setattr(hk, "youtube_top", lambda q, n=15: [{"title": "I Waited 12 Years For This", "views": 9_000_000, "url": "u", "niche": q}])
+    reply = '{"hooks": [{"text": "Twelve years. Six days left.", "pattern": "urgency", "emotion": "Anticipation", "why": "countdown", "hot": 0.9}]}'
+    monkeypatch.setattr(tv, "ask_claude_research", lambda prompt, model: reply)
+    found = hk.find_for_topic("GTA 6 release", "gaming", "en", lib=tmp_path)
+    assert found[0]["text"] == "Twelve years. Six days left." and found[0]["trend"] == "GTA 6 release"
+    assert any(h["text"] == "Twelve years. Six days left." for h in hk.load(tmp_path)["hooks"])
+    assert "Hooks found online for this exact topic" in hk.topic_block(found)
+    monkeypatch.setattr(tv, "ask_claude_research", lambda prompt, model: (_ for _ in ()).throw(sw.AutocutError("offline")))
+    found = hk.find_for_topic("GTA 6 release", "gaming", "en", lib=tmp_path)
+    assert found[0]["text"] == "I Waited 12 Years For This"  # without Claude: the topic's most-viewed titles

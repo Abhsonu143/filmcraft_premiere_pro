@@ -180,6 +180,8 @@ fn ai_menu_and_dialogs() {
                 "writer",
                 "video",
                 "fresh",
+                "hookLine",
+                "findHook",
                 "voice",
                 "free",
                 "cards",

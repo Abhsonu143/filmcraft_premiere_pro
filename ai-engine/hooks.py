@@ -358,6 +358,99 @@ def sync(niches: list[str] | None = None, geos: list[str] | None = None, use_cla
     return {"outputs": [str(path)], "out_dir": str(path.parent), "added": added, "total": len(data["hooks"]), "trends": len(trends)}
 
 
+def youtube_top(query: str, n: int = 15) -> list[dict]:
+    """The most-viewed YouTube videos for a search (all time): how the biggest videos on a topic open."""
+    import script_writer as sw
+
+    url = "https://www.youtube.com/results?" + urllib.parse.urlencode({"search_query": query, "sp": "CAM="})
+    cmd = sw.yt_dlp_cmd() + ["--flat-playlist", "--playlist-end", str(n), "--print", "%(view_count)s\t%(duration)s\t%(title)s\t%(url)s", url]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    vids = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 4:
+            try:
+                views = int(parts[0])
+            except ValueError:
+                views = 0
+            vids.append({"title": parts[2].strip(), "views": views, "url": parts[3].strip(), "niche": query})
+    return vids
+
+
+def topic_prompt(topic: str, niche: str, language: str, vids: list[dict], facts: str, n: int) -> str:
+    vt = "\n".join(f"- {v['title']} ({v['views']:,} views)" for v in sorted(vids, key=lambda v: -v["views"])[:20])
+    pats = "\n".join(f"- {k}: {v[0]}" for k, v in PATTERNS.items())
+    lang = {"en": "English", "hi": "Hindi (Devanagari)", "hinglish": "Hinglish (Devanagari with English words in English)"}.get(language, "English")
+    return f"""Find the best opening hooks for ONE short video. Topic: {topic}
+Niche: {niche or "general"}. Language of the video: {lang}.
+
+Use web search: how do the most successful videos, reels and posts about this topic (and very similar ones) open right
+now? What angle, number, surprise or question makes people stop? What is new or hot about it this week?
+
+The most-viewed YouTube videos on this topic:
+{vt or "(none found)"}
+{("Researched facts about the topic (stay true to them):" + chr(10) + facts) if facts else ""}
+
+Hook patterns:
+{pats}
+
+Write {n} different hooks for this exact video, in {lang}: spoken, 4–14 words, true (no clickbait lie), each a
+different pattern where possible, the strongest first.
+
+Reply with only JSON:
+{{"hooks": [{{"text": "...", "pattern": "one of the pattern names", "emotion": "one of: {', '.join(x for x in em.EMOTIONS if x != 'Neutral')}",
+  "why": "why it works for this topic, 6-15 words", "source": "the video/post/article it learned from, or empty", "hot": 0.0-1.0}}]}}
+"""
+
+
+def find_for_topic(topic: str, niche: str = "", language: str = "en", facts: str = "", n: int = 8, model: str | None = None,
+                   lib: Path | None = None) -> list[dict]:
+    """Hooks found online for one topic (the topic's most-viewed videos + Claude with web search),
+    best first. They are also kept in the library."""
+    vids = youtube_top(topic)
+    log(f"hook search: {len(vids)} most-viewed videos on “{topic[:60]}”")
+    found: list[dict] = []
+    try:
+        import script_writer as sw
+        import topic_video as tv
+
+        log("Claude is looking online for hooks that work for this topic")
+        res = sw.extract_json(tv.ask_claude_research(topic_prompt(topic, niche, language, vids, facts, n), model))
+        for h in res.get("hooks", []):
+            text = re.sub(r"\s+", " ", str(h.get("text", ""))).strip().strip('"')
+            if not text:
+                continue
+            try:
+                hot = float(h.get("hot", 0.8))
+            except (TypeError, ValueError):
+                hot = 0.8
+            found.append({"text": text, "pattern": h.get("pattern") if h.get("pattern") in PATTERNS else guess_pattern(text), "language": language,
+                          "niche": (niche or "any").lower(), "emotion": em.resolve(h.get("emotion")), "why": str(h.get("why", ""))[:160],
+                          "trend": topic[:120], "hot": round(min(1.0, max(0.0, hot)), 2), "source": str(h.get("source") or "topic search")[:200],
+                          "added": now_iso()})
+    except AutocutError as e:
+        log(f"Claude could not search for hooks ({e}); using the topic's most-viewed titles")
+    if not found:
+        found = [{**h, "trend": topic[:120]} for h in title_hooks(vids)][:n]
+    data = load(lib)
+    added = merge(data, found)
+    save(data, lib)
+    log(f"hook search: {len(found)} hook(s) for this topic ({added} new in the library)" + (f"; best: “{found[0]['text']}”" if found else ""))
+    return found
+
+
+def topic_block(found: list[dict]) -> str:
+    """The prompt section for hooks found online for this exact topic."""
+    if not found:
+        return ""
+    lines = "\n".join(f"- [{h['pattern']}] {h['text']}" + (f"  ({h['why']})" if h.get("why") else "") for h in found[:8])
+    return ("\n## Hooks found online for this exact topic (strongest first): open with the best one, or a sharper version of it\n"
+            + lines + "\n")
+
+
 # ---------------------------------------------------------------------------------------------
 # Choosing hooks for a video (offline)
 # ---------------------------------------------------------------------------------------------
