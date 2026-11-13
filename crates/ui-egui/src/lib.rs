@@ -1347,6 +1347,9 @@ impl FilmcraftApp {
         self.handle_drops(&ctx);
         if let Some(rx) = self.command_inbox.take() {
             while let Ok(id) = rx.try_recv() {
+                if ctx.egui_wants_keyboard_input() && text_field_edit(&ctx, &id) {
+                    continue;
+                }
                 if let Err(e) = menus::invoke(self, &ctx, &id, json!({})) {
                     self.ui.status = e;
                 }
@@ -1747,6 +1750,97 @@ pub fn playback_mix(session: &Session, seq_id: filmcraft_project::ItemId, sr: u3
             filmcraft_engine::settings::map_output(&mix.channels[0], &mix.channels[1.min(mix.channels.len() - 1)], buf, ch, map);
         }
         panels::voiceover::mix_cues(buf, ch, cursor, &cues);
+    }
+}
+
+/// On macOS the native menu bar owns Cmd+C/X/V/A/Z as key equivalents of Edit ▸ Copy, Cut, Paste,
+/// Select All, Undo and Redo, so those keys reach the app as menu commands, never as key presses:
+/// a text field with keyboard focus (paths and text in the AI dialogs, names, search boxes) could not
+/// copy or paste. When a text field has focus, those commands go to it instead, as the events the
+/// text field understands (as in any Mac app); otherwise they edit the timeline as before.
+/// Returns true when the command was handed to the text field.
+fn text_field_edit(ctx: &egui::Context, id: &str) -> bool {
+    let Some(events) = text_field_events(id, clipboard_text) else {
+        return false;
+    };
+    ctx.input_mut(|i| i.events.extend(events));
+    true
+}
+
+/// The text-field events for an Edit menu command (`paste` reads the clipboard), or None for
+/// any other command.
+fn text_field_events(id: &str, paste: impl FnOnce() -> Option<String>) -> Option<Vec<egui::Event>> {
+    use egui::{Event, Key, Modifiers};
+    let key = |key: Key, modifiers: Modifiers| Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers };
+    Some(match id {
+        "edit.copy" => vec![Event::Copy],
+        "edit.cut" => vec![Event::Cut],
+        "edit.paste" => paste().filter(|t| !t.is_empty()).map(|t| vec![Event::Paste(t)]).unwrap_or_default(),
+        "edit.selectAll" => vec![key(Key::A, Modifiers::COMMAND)],
+        "edit.undo" => vec![key(Key::Z, Modifiers::COMMAND)],
+        "edit.redo" => vec![key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT)],
+        _ => return None,
+    })
+}
+
+/// The clipboard's text (macOS: `pbpaste`, in UTF-8 even when the app was started from the Finder
+/// without a locale). None elsewhere: there the keys reach text fields directly.
+fn clipboard_text() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("/usr/bin/pbpaste").env("LANG", "en_US.UTF-8").env("LC_ALL", "en_US.UTF-8").output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod text_field_edit_tests {
+    use egui::{Event, Key, Modifiers};
+
+    #[test]
+    fn edit_menu_commands_become_text_field_events() {
+        let ev = |id: &str| super::text_field_events(id, || Some("/Users/me/clip.mov".into()));
+        assert!(matches!(ev("edit.copy").as_deref(), Some([Event::Copy])));
+        assert!(matches!(ev("edit.cut").as_deref(), Some([Event::Cut])));
+        assert!(matches!(ev("edit.paste").as_deref(), Some([Event::Paste(t)]) if t == "/Users/me/clip.mov"));
+        assert!(matches!(ev("edit.selectAll").as_deref(), Some([Event::Key { key: Key::A, modifiers, .. }]) if *modifiers == Modifiers::COMMAND));
+        assert!(matches!(ev("edit.redo").as_deref(), Some([Event::Key { key: Key::Z, modifiers, .. }]) if modifiers.shift));
+        // an empty clipboard pastes nothing, but the timeline still doesn't get the paste
+        assert_eq!(super::text_field_events("edit.paste", || None).map(|v| v.len()), Some(0));
+        // everything else is left to the menu
+        assert!(ev("edit.ripple_delete").is_none() && ev("file.save").is_none() && ev("ai.clips").is_none());
+    }
+
+    #[test]
+    fn a_focused_text_field_receives_the_menu_paste() {
+        // the menu command arrives during a frame, before the dialogs are drawn (as in `ui`)
+        let ctx = egui::Context::default();
+        let mut text = String::from("old");
+        let id = egui::Id::new("field");
+        let mut frame = |command: Option<&str>| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let ctx = ui.ctx().clone();
+                let mut handled = false;
+                if let Some(c) = command
+                    && ctx.egui_wants_keyboard_input()
+                {
+                    let events = super::text_field_events(c, || Some("/Users/me/clip.mov".into())).unwrap_or_default();
+                    ctx.input_mut(|i| i.events.extend(events));
+                    handled = true;
+                }
+                assert_eq!(handled, command.is_some());
+                let r = ui.add(egui::TextEdit::singleline(&mut text).id(id));
+                if command.is_none() {
+                    r.request_focus();
+                }
+            });
+            out.textures_delta.clear();
+        };
+        frame(None);
+        frame(None);
+        frame(Some("edit.selectAll"));
+        frame(Some("edit.paste"));
+        assert_eq!(text, "/Users/me/clip.mov");
     }
 }
 
