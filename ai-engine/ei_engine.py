@@ -18,6 +18,8 @@ Subcommands (all paths absolute or relative to the current folder):
     voice-prompts / voice-mics / voice-record --out F / voice-enroll --name N [--files F...] [--takes T.json] / voice-list
     speak     --voice N --script S --out O.wav   a script in your cloned voice (+ .narration.json); N = mac:<voice> for macOS voices
               [--sound-design --music-source internet|folder|ai|none]   also "<O> - scored.wav": music per emotion, hits, risers
+    hooks-sync [--niches N...] [--geo IN US]   refresh the local hook library from what is hot (trends, top videos, Claude)
+    hooks-list [--topic T --niche N]            the best hooks for a video (offline), or the library's state
     score     VOICE.wav --narration N.json --out O.wav   the sound design alone (or --narration X.score.json to mix an edited plan)
     tv-scan FOLDER / tv-frame REC --out P.png / tv-calibrate REC --quad … --ref-t T
     tv-make   CLIP --recordings FOLDER --out O.mp4 [--orientation horizontal|vertical]   clip on the TV, backlight matched
@@ -124,6 +126,9 @@ def run(argv: list[str]) -> dict:
     tv_light.add_args(sub)
     topic_video.add_args(sub.add_parser("topic", help="topic or link -> research -> script -> voice -> edited video"))
     voice.add_args(sub)
+    import hooks
+
+    hooks.add_args(sub)
     import score
 
     score.add_args(sub.add_parser("score", help="emotional sound design under a voice: music per mood, hits, risers, pauses"))
@@ -159,6 +164,8 @@ def run(argv: list[str]) -> dict:
         return voice.run_args(a)
     if a.cmd == "score":
         return score.run_args(a)
+    if a.cmd.startswith("hooks-"):
+        return hooks.run_args(a)
     if a.cmd == "voiceover":
         if getattr(a, "preset", None) == "short" and a.aspect == "horizontal":
             a.aspect = "vertical"

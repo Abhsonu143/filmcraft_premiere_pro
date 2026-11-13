@@ -316,7 +316,7 @@ def target_words(seconds: float, language: str, style: dict | None, wpm_override
 
 
 def build_prompt(topic: str, *, niche: str, seconds: float, language: str, tone: str, audience: str, notes: str,
-                 style: dict | None, footage: list[str] | None, wpm: float | None = None) -> str:
+                 style: dict | None, footage: list[str] | None, wpm: float | None = None, hooks: str = "") -> str:
     nwords = target_words(seconds, language, style, wpm)
     lang_rule = {
         "en": "Write in natural spoken English.",
@@ -350,8 +350,10 @@ def build_prompt(topic: str, *, niche: str, seconds: float, language: str, tone:
 - Length: about {seconds:.0f} seconds of speech, about {nwords} words in total.
 - Language: {lang_rule}
 {('- Notes from the creator: ' + notes) if notes else ''}
-{style_txt}{foot}
+{style_txt}{foot}{hooks}
 ## How to write it
+- The hook decides if anyone watches: the first segment (under 3 seconds, 4–12 words) must stop the scroll. Use one of the
+  hook patterns above that fits this topic (or a better one), make it specific to this video, and pay it off later.
 - Structure: a hook in the first 3 seconds (a surprising fact, a question, a bold claim, or the payoff teased), then build, the core, a peak moment, and a short ending (with a call to action only if it fits the style).
 - Write for the ear: short spoken sentences, contractions, rhythm. Vary sentence length. Real emotion, not marketing.
 - Depth: concrete details, numbers, sensory words, one small story or personal moment. No filler sentences.
@@ -453,7 +455,15 @@ def write_script(topic: str, out: str, *, niche: str = "", seconds: float = 60, 
         raise AutocutError("length must be 5–1800 seconds")
     prof = load_style(style)
     wpm = voice_wpm(voice or pace_voice, language)
-    prompt = build_prompt(topic, niche=niche, seconds=seconds, language=language, tone=tone, audience=audience, notes=notes, style=prof, footage=footage, wpm=wpm)
+    try:  # the best-fitting hooks of the local hook library (no internet needed)
+        import hooks as hk
+
+        hooks_txt = hk.prompt_block(hk.suggest(topic, niche, language))
+    except (OSError, ValueError, KeyError) as e:
+        log(f"hook library unavailable ({type(e).__name__})")
+        hooks_txt = ""
+    prompt = build_prompt(topic, niche=niche, seconds=seconds, language=language, tone=tone, audience=audience, notes=notes, style=prof, footage=footage,
+                          wpm=wpm, hooks=hooks_txt)
     t0 = time.time()
     if backend == "claude":
         log("Claude is writing the script")

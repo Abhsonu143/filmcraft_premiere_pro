@@ -75,6 +75,7 @@ pub enum Kind {
     Topic,
     Tv,
     Speak,
+    Hooks,
 }
 
 impl Kind {
@@ -92,6 +93,7 @@ impl Kind {
             Kind::Topic => "topic",
             Kind::Tv => "tv",
             Kind::Speak => "speak",
+            Kind::Hooks => "hooks",
         }
     }
     fn from_command(id: &str) -> Option<Kind> {
@@ -108,6 +110,7 @@ impl Kind {
             "ai.topic" => Kind::Topic,
             "ai.tv" => Kind::Tv,
             "ai.speak" => Kind::Speak,
+            "ai.hooks" => Kind::Hooks,
             _ => return None,
         })
     }
@@ -125,6 +128,7 @@ impl Kind {
             Kind::Topic => "Video from Topic",
             Kind::Tv => "TV Light Sync",
             Kind::Speak => "Speak Script",
+            Kind::Hooks => "Hook Library",
         }
     }
     fn input_label(self) -> &'static str {
@@ -137,7 +141,7 @@ impl Kind {
         }
     }
     fn needs_input(self) -> bool {
-        !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Tv | Kind::Speak)
+        !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Tv | Kind::Speak | Kind::Hooks)
     }
     /// Tools that render a video in a chosen shape (and so offer 1080p or 4K).
     fn has_resolution(self) -> bool {
@@ -229,6 +233,11 @@ struct Draft {
     clip_type: &'static str,
     /// "1080p" or "4k" (in every shape)
     resolution: &'static str,
+    // hooks: the voiceover edit's opening, and the hook library's sync
+    vo_hook: &'static str,
+    hook_niches: String,
+    hook_geos: String,
+    hook_claude: bool,
     // optional emotional sound design (music per mood, hits, risers, pauses)
     sound: bool,
     music_source: &'static str,
@@ -389,6 +398,11 @@ impl Draft {
             tv_bezel: false,
             clip_type: "edited",
             resolution: "1080p",
+            vo_hook: "auto",
+            hook_niches: setting_str("hook_niches")
+                .unwrap_or_else(|| "gaming, tech, travel, finance, fitness, food, motivation, movies, news, education".into()),
+            hook_geos: setting_str("hook_geos").unwrap_or_else(|| "IN, US".into()),
+            hook_claude: true,
             sound: false,
             music_source: "internet",
             music_folder: setting_str("music_folder").unwrap_or_default(),
@@ -503,6 +517,14 @@ impl Draft {
         d.clip_type = pick("clipType", &CLIP_TYPES.map(|a| a.0), d.clip_type);
         d.sound = flag("soundDesign", d.sound);
         d.resolution = pick("resolution", &RESOLUTIONS.map(|a| a.0), d.resolution);
+        d.vo_hook = pick("hook", &HOOK_MODES.map(|a| a.0), d.vo_hook);
+        d.hook_claude = flag("hookClaude", d.hook_claude);
+        if let Some(v) = s("niches") {
+            d.hook_niches = v;
+        }
+        if let Some(v) = s("countries") {
+            d.hook_geos = v;
+        }
         d.music_source = pick("musicSource", &MUSIC_SOURCES.map(|a| a.0), d.music_source);
         d.licence = pick("licence", &LICENCES.map(|a| a.0), d.licence);
         d.sound_effects = flag("soundEffects", d.sound_effects);
@@ -694,6 +716,12 @@ impl Draft {
                 a.push(self.input.trim().into());
                 a.push("--clips".into());
                 a.extend(self.clips.iter().cloned());
+                if self.vo_hook != "auto" {
+                    push(&mut a, "--hook", self.vo_hook);
+                }
+                if !self.niche.trim().is_empty() {
+                    push(&mut a, "--niche", self.niche.trim());
+                }
                 push(&mut a, "--out", self.out.trim());
                 push(&mut a, "--aspect", if self.aspect == "same" { "horizontal" } else { self.aspect });
                 push(&mut a, "--pace", self.pace);
@@ -795,6 +823,23 @@ impl Draft {
                     }
                 } else {
                     a.push("--script-only".into());
+                }
+            }
+            Kind::Hooks => {
+                let list = |v: &str| v.split([',', ' ']).map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect::<Vec<_>>();
+                let niches = list(&self.hook_niches);
+                if niches.is_empty() {
+                    return Err("Write at least one niche (e.g. gaming, travel).".into());
+                }
+                a = vec!["hooks-sync".into(), "--niches".into()];
+                a.extend(niches);
+                let geos = list(&self.hook_geos);
+                if !geos.is_empty() {
+                    a.push("--geo".into());
+                    a.extend(geos);
+                }
+                if !self.hook_claude {
+                    a.push("--no-claude".into());
                 }
             }
             Kind::Speak => {
@@ -909,6 +954,13 @@ const EFFECTS: [(&str, &str); 3] =
     [("full", "Full: speed ramps, punch-ins, flashes, transitions"), ("subtle", "Subtle: slow motion, push-ins, dissolves"), ("none", "Clean cuts only")];
 const ORDERS: [(&str, &str); 2] = [("time", "Follow the trip (shooting order)"), ("free", "Best shots first")];
 
+const HOOK_MODES: [(&str, &str); 5] = [
+    ("auto", "Automatic: open on the strongest line, on-screen hook, fast first cuts"),
+    ("teaser", "Open on the strongest line (cold open), then the start"),
+    ("text", "On-screen hook text over the first seconds"),
+    ("both", "Cold open and on-screen hook"),
+    ("off", "No hook (start as recorded)"),
+];
 const RESOLUTIONS: [(&str, &str); 2] = [("1080p", "1080p (Full HD)"), ("4k", "4K (Ultra HD: 3840 on the long side; slower, bigger files)")];
 const MUSIC_SOURCES: [(&str, &str); 4] = [
     ("internet", "Free music from the internet, chosen by mood (credited in the description)"),
@@ -1202,6 +1254,7 @@ fn default_output(d: &Draft) -> String {
         Kind::Script => movies_dir().join("Scripts").join(slug(if d.topic.trim().is_empty() { "script" } else { &d.topic })).to_string_lossy().to_string(),
         Kind::Voice => voices_dir().join(slug(&d.voice_name)).to_string_lossy().to_string(),
         Kind::Topic => String::new(), // the engine names the folder after the topic (Movies/EI/Topics/…)
+        Kind::Hooks => String::new(), // the library has one place (Application Support/EI/hooks)
         Kind::Speak => {
             let stem = if d.script.trim().is_empty() { "spoken".to_string() } else { file_stem(&d.script).trim_end_matches(".script").to_string() };
             free_path(&movies_dir().join("Sound"), &stem, ".wav")
@@ -1640,6 +1693,7 @@ fn run_draft(d: &mut Draft) -> Result<u64, String> {
         Kind::Voice => format!("{}: {}", d.kind.title(), d.voice_name.trim()),
         Kind::Topic => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Speak => format!("{}: {}", d.kind.title(), file_stem(&d.out)),
+        Kind::Hooks => format!("{}: sync {}", d.kind.title(), d.hook_niches.trim().chars().take(40).collect::<String>()),
         Kind::Tv => match d.clips.len() {
             1 => format!("{}: {}", d.kind.title(), d.clips.first().map(|c| file_stem(c)).unwrap_or_default()),
             n => format!("{}: {n} clips", d.kind.title()),
@@ -1750,6 +1804,70 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if jobs().lock().unwrap_or_else(PoisonError::into_inner).iter().any(|j| j.status == Status::Running) {
         ctx.request_repaint_after(Duration::from_millis(300));
     }
+}
+
+/// The hook library: its state, and what the next sync fetches.
+fn hooks_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
+    let lib = settings_path().parent().map(Path::to_path_buf).unwrap_or_else(support_dir).join("hooks").join("library.json");
+    let data: Value = std::fs::read_to_string(&lib).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+    let hooks = data.get("hooks").and_then(Value::as_array).cloned().unwrap_or_default();
+    let last = data.get("syncs").and_then(Value::as_array).and_then(|v| v.last()).and_then(|v| v.get("at")).and_then(Value::as_str).unwrap_or("never");
+    ui.label("Library");
+    ui.vertical(|ui| {
+        let found = hooks.iter().filter(|h| h.get("source").and_then(Value::as_str) != Some("built in")).count();
+        ui.label(format!(
+            "{} hooks ({} built in, {} found online) · last sync: {}",
+            hooks.len(),
+            hooks.len() - found,
+            found,
+            last.replace('T', " ").trim_end_matches('Z')
+        ));
+        let mut fresh: Vec<&Value> = hooks.iter().filter(|h| h.get("source").and_then(Value::as_str) != Some("built in")).collect();
+        fresh.sort_by(|a, b| {
+            let k = |h: &Value| (h.get("added").and_then(Value::as_str).unwrap_or_default().to_string(), h.get("hot").and_then(Value::as_f64).unwrap_or(0.0));
+            let (ka, kb) = (k(a), k(b));
+            kb.0.cmp(&ka.0).then(kb.1.partial_cmp(&ka.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        if !fresh.is_empty() {
+            egui::CollapsingHeader::new("Newest hooks").id_salt(format!("{p}.newest")).show(ui, |ui| {
+                for h in fresh.iter().take(12) {
+                    let text = h.get("text").and_then(Value::as_str).unwrap_or_default();
+                    let niche = h.get("niche").and_then(Value::as_str).unwrap_or_default();
+                    let trend = h.get("trend").and_then(Value::as_str).unwrap_or_default();
+                    let r = ui.label(format!("• {text}  [{niche}]"));
+                    if !trend.is_empty() {
+                        r.on_hover_text(format!("rides: {trend}"));
+                    }
+                }
+            });
+        }
+        if let Some(formats) = data.get("formats").and_then(Value::as_array).filter(|f| !f.is_empty()) {
+            egui::CollapsingHeader::new("Hook formats trending this month").id_salt(format!("{p}.formats")).show(ui, |ui| {
+                for f in formats.iter().filter_map(Value::as_str).take(8) {
+                    ui.label(format!("• {f}"));
+                }
+            });
+        }
+    });
+    ui.end_row();
+    ui.label("Niches");
+    let r = ui.add(egui::TextEdit::singleline(&mut d.hook_niches).hint_text("gaming, travel, tech …").desired_width(380.0));
+    elems.push((format!("{p}.niches"), r.rect, d.hook_niches.clone()));
+    if r.changed() {
+        let _ = save_setting("hook_niches", d.hook_niches.trim());
+    }
+    ui.end_row();
+    ui.label("Countries");
+    let r = ui.add(egui::TextEdit::singleline(&mut d.hook_geos).hint_text("IN, US (trending searches)").desired_width(380.0));
+    elems.push((format!("{p}.countries"), r.rect, d.hook_geos.clone()));
+    if r.changed() {
+        let _ = save_setting("hook_geos", d.hook_geos.trim());
+    }
+    ui.end_row();
+    ui.label("");
+    let r = ui.checkbox(&mut d.hook_claude, "Claude writes new hooks from the trends (with web search); off: only the top video titles");
+    elems.push((format!("{p}.claude"), r.rect, d.hook_claude.to_string()));
+    ui.end_row();
 }
 
 /// The optional sound design rows. Returns true when the music folder should be chosen.
@@ -2128,7 +2246,17 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             let r = ui.checkbox(&mut d.ambience, "Keep a little of each clip's own sound under the voice");
                             elems.push((format!("{p}.ambience"), r.rect, d.ambience.to_string()));
                             ui.end_row();
+                            ui.label("Hook");
+                            combo_row(ui, &mut d.vo_hook, &HOOK_MODES, &format!("{p}.hook"), &mut elems);
+                            ui.end_row();
+                            if d.vo_hook != "off" {
+                                ui.label("Niche");
+                                let r = ui.add(egui::TextEdit::singleline(&mut d.niche).hint_text("e.g. travel (helps pick hooks)").desired_width(330.0));
+                                elems.push((format!("{p}.niche"), r.rect, d.niche.clone()));
+                                ui.end_row();
+                            }
                         }
+                        Kind::Hooks => hooks_rows(ui, &mut d, &p, &mut elems),
                         Kind::Script => {
                             ui.label("Topic");
                             let r = ui.add(egui::TextEdit::singleline(&mut d.topic).hint_text("what the video is about").desired_width(380.0));
@@ -2431,7 +2559,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     if d.kind.has_sound_design() && !(d.kind == Kind::Topic && !d.make_video) && sound_rows(ui, &mut d, &p, &mut elems) {
                         pick = Some(Pick::MusicFolder);
                     }
-                    if d.kind != Kind::Voice {
+                    if !matches!(d.kind, Kind::Voice | Kind::Hooks) {
                         let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv);
                         ui.label(if folder_out { "Output folder" } else { "Save as" });
                         let hint = match d.kind {
@@ -2445,7 +2573,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         }
                         ui.end_row();
                     }
-                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic) {
+                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic | Kind::Hooks) {
                         ui.label("");
                         let label = match d.kind {
                             Kind::Split | Kind::Clips | Kind::Tv => "Import the videos into the project",
@@ -2480,6 +2608,8 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Topic if d.make_video => "Make Video",
                     Kind::Tv => "Make Video",
                     Kind::Topic => "Research and Write",
+                    Kind::Hooks => "Sync Hooks",
+                    Kind::Speak => "Speak",
                     _ => "Run",
                 };
                 let o = ui.add(egui::Button::new(egui::RichText::new(run_label).color(egui::Color32::WHITE)).fill(app.tokens.accent));
@@ -3216,6 +3346,9 @@ fn poll_recorder(d: &mut Draft) {
 
 fn description(kind: Kind) -> &'static str {
     match kind {
+        Kind::Hooks => {
+            "Your hook library: proven opening lines (the first 3 seconds that keep viewers watching), kept on this Mac so the script writer, Video from Topic and the voiceover edit can use them offline. Sync fetches what is hot now (Google Trends for your countries, this week's most-viewed YouTube videos in your niches), and Claude (with web search) turns it into new hooks in English, Hindi and Hinglish."
+        }
         Kind::Speak => {
             "Speaks a script in your cloned voice (or a macOS voice) and saves the audio, so you can hear it without making a video. Every line is spoken with its emotion (set them below). With sound design, a second file also has music that follows the emotions, hits, risers and pauses."
         }
@@ -3703,6 +3836,29 @@ mod tests {
         assert!(a.contains(&"--sound-design".to_string()) && !a.contains(&"--music".to_string()), "{a:?}");
         let mut off = Draft::from_params(Kind::Clips, &json!({"input": clip.to_string_lossy()}));
         assert!(!off.engine_args().unwrap().contains(&"--sound-design".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hook_library_and_voiceover_hook_arguments() {
+        let mut h = Draft::from_params(Kind::Hooks, &json!({"niches": "gaming, travel", "countries": "IN US", "hookClaude": false}));
+        h.hook_niches = "gaming, travel".into(); // (without touching the saved settings in this test)
+        let a = h.engine_args().unwrap_or_default();
+        assert_eq!(a.first().map(String::as_str), Some("hooks-sync"), "{a:?}");
+        assert!(a.windows(3).any(|w| w == ["--niches", "gaming", "travel"]) && a.windows(3).any(|w| w == ["--geo", "IN", "US"]), "{a:?}");
+        assert!(a.contains(&"--no-claude".to_string()));
+        let mut empty = Draft::from_params(Kind::Hooks, &json!({}));
+        empty.hook_niches = " , ".into();
+        assert!(empty.engine_args().is_err());
+        let dir = std::env::temp_dir().join(format!("ei-ai-hook-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("v.wav");
+        std::fs::write(&v, b"x").unwrap();
+        let vs = v.to_string_lossy().to_string();
+        let a = Draft::from_params(Kind::Voiceover, &json!({"input": vs, "clips": [vs], "hook": "teaser", "niche": "travel"})).engine_args().unwrap();
+        assert!(a.windows(2).any(|w| w == ["--hook", "teaser"]) && a.windows(2).any(|w| w == ["--niche", "travel"]), "{a:?}");
+        let a = Draft::from_params(Kind::Voiceover, &json!({"input": vs, "clips": [vs]})).engine_args().unwrap();
+        assert!(!a.contains(&"--hook".to_string()), "auto is the default: {a:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

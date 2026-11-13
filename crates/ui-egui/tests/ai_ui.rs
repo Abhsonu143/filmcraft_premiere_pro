@@ -105,10 +105,10 @@ impl Driver {
 fn ai_menu_and_dialogs() {
     let mut d = Driver::demo();
     let menu = d.ok("ui.menu.list", json!({})).to_string();
-    for id in ["ai.split", "ai.music", "ai.reference", "ai.talk", "ai.voiceover", "ai.clips", "ai.audio", "ai.speak", "ai.jobs", "ai.setup"] {
+    for id in ["ai.split", "ai.music", "ai.reference", "ai.talk", "ai.voiceover", "ai.clips", "ai.audio", "ai.speak", "ai.hooks", "ai.jobs", "ai.setup"] {
         assert!(menu.contains(id), "{id} in the menus");
     }
-    let expect: [(&str, &[&str]); 12] = [
+    let expect: [(&str, &[&str]); 13] = [
         ("split", &["input", "clipLength", "quality.same", "quality.exact", "out", "import", "run"]),
         (
             "music",
@@ -130,7 +130,25 @@ fn ai_menu_and_dialogs() {
         ),
         ("reference", &["input", "clips.add", "music", "aspect.same", "aspect.square", "look", "effects", "order", "run"]),
         ("talk", &["input", "preset.short", "captions", "music", "run"]),
-        ("voiceover", &["input", "clips.add", "script", "captions", "captionStyle", "aspect.vertical", "pace.fast", "describe", "ambience", "sound", "run"]),
+        (
+            "voiceover",
+            &[
+                "input",
+                "clips.add",
+                "script",
+                "captions",
+                "captionStyle",
+                "aspect.vertical",
+                "pace.fast",
+                "describe",
+                "ambience",
+                "hook",
+                "niche",
+                "sound",
+                "resolution.4k",
+                "run",
+            ],
+        ),
         (
             "script",
             &[
@@ -173,6 +191,7 @@ fn ai_menu_and_dialogs() {
         ),
         ("voice", &["name", "lang.hi", "lang.mix", "lang.en", "source.record", "source.files", "run"]),
         ("speak", &["script", "text", "voice", "sound", "out", "run"]),
+        ("hooks", &["niches", "countries", "claude", "run"]),
         (
             "clips",
             &[
@@ -212,10 +231,13 @@ fn ai_menu_and_dialogs() {
             assert!(ids.contains(&id), "{id} in {ids:?}");
         }
         d.snapshot(kind);
-        // Run with nothing filled in: the dialog stays open with an error, nothing starts.
-        d.ok("ui.click", json!({"id": format!("ai.{kind}.run")}));
-        d.frames(3);
-        assert!(!d.ids(&format!("ai.{kind}.run")).is_empty(), "{kind}: dialog stays open on a missing input");
+        // Run with nothing filled in: the dialog stays open with an error, nothing starts. (The hook
+        // library needs nothing filled in: its Run would start a real sync, so it is not clicked.)
+        if kind != "hooks" {
+            d.ok("ui.click", json!({"id": format!("ai.{kind}.run")}));
+            d.frames(3);
+            assert!(!d.ids(&format!("ai.{kind}.run")).is_empty(), "{kind}: dialog stays open on a missing input");
+        }
         d.ok("ui.key", json!({"key": "Escape"}));
         d.frames(3);
         assert!(d.ids(&format!("ai.{kind}.")).is_empty(), "{kind}: Escape closes the dialog");

@@ -270,8 +270,10 @@ def shots_for_lines(lines: list[dict], total: float, pace: str, lead: float = 0.
     starts = [0.0] + [max(0.0, l["start"] - lead) for l in lines[1:]]
     ends = starts[1:] + [total]
     slots = []
+    import narrate_craft as nc
+
     for i, (a, b, l) in enumerate(zip(starts, ends, lines)):
-        n = max(1, int(np.ceil((b - a) / mx)))
+        n = max(1, int(np.ceil((b - a) / (mx * nc.pace_factor(l)))))  # tense lines cut quicker, calm ones breathe
         cuts = [a + (b - a) * k / n for k in range(1, n)]
         if n > 1 and l.get("words"):  # move each even split onto the nearest breath (within 1 s)
             breaths = [((w1["end"] + w2["start"]) / 2 - lead, w2["start"] - w1["end"]) for w1, w2 in zip(l["words"], l["words"][1:])]
@@ -286,7 +288,8 @@ def shots_for_lines(lines: list[dict], total: float, pace: str, lead: float = 0.
     return [s for s in slots if s["end"] - s["start"] > 0.2]
 
 
-def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], first: bool, k: int = 30, hinted: set[int] | None = None) -> list[dict]:
+def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], first: bool, k: int = 30, hinted: set[int] | None = None,
+               hook: bool = False) -> list[dict]:
     """Best windows (clip, in) of the slot's length, with their unary score."""
     dur = slot["end"] - slot["start"]
     emo = line.get("emotion", "neutral")
@@ -318,8 +321,10 @@ def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], fir
     mu, sd = float(np.median(sems)), float(sems.std() + 1e-6)
     for x in out:
         s = 1.0 * (x["sem"] - mu) / sd + 0.5 * x["qual"] + 0.2 * float(np.clip(x["look"], -1, 1)) - 0.3 * abs(min(1.0, x["mot"]) - want_motion)
-        if first and x["size"] in ("aerial", "wide"):
+        if first and x["size"] in ("aerial", "wide") and not hook:
             s += 0.2  # establish the place first
+        if hook:  # the first seconds: the most striking pictures (sharp, well exposed, moving)
+            s += 0.6 * x["qual"] + 0.4 * min(1.0, x["mot"]) + 0.2 * float(np.clip(x["look"], -1, 1))
         if hinted and x["clip"] in hinted:
             s += 1.2  # media found for exactly this line (topic videos)
         if clips[x["clip"]].get("card"):
@@ -488,7 +493,8 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
          pace: str = "medium", captions: bool = False, caption_style: str = "clean", music: str | None = None, music_db: float = -20.0,
          ambience_db: float = -24.0, describe: str = "local", model: str | None = None, story_order: bool = True, look: str = "natural",
          whisper_model: str = ac.DEFAULT_WHISPER, workers: int = 2, plan_only: bool = False, hints: dict[str, list[int]] | None = None,
-         stills: set[str] | None = None, cards: set[str] | None = None, sound: dict | None = None, resolution: str = "1080p") -> dict:
+         stills: set[str] | None = None, cards: set[str] | None = None, sound: dict | None = None, resolution: str = "1080p",
+         hook: str = "auto", niche: str = "") -> dict:
     """`sound`: optional emotional sound design (score.options): music per mood, hits, risers, pauses."""
     import render
 
@@ -526,9 +532,30 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
     log(f"{len(lines)} narration lines")
     describe_lines(lines, describe, model)
     english_gloss(voice, lines, whisper_model)
+    import narrate_craft as nc
+
+    if hook not in nc.HOOK_MODES:
+        raise AutocutError(f"hook must be one of {', '.join(nc.HOOK_MODES)}")
+    work = Path(tempfile.mkdtemp(prefix="ei-narrate-hook-"))
+    hook_text = None
+    if hook in ("auto", "teaser", "both") and total >= 15:
+        ti = nc.teaser_pick(lines)
+        if ti is not None:  # the cold open: the narration's strongest line first
+            voice_t = work / "voice-with-teaser.wav"
+            lines, head = nc.with_teaser(voice, lines, ti, voice_t)
+            voice, total = str(voice_t), total + head
+            log(f"hook: opens on “{lines[0]['text'][:60]}” ({lines[0].get('emotion')}), then the start")
+        elif hook == "teaser":
+            log("hook: no line is strong enough for a cold open; starting with the first line")
+    if hook in ("auto", "text", "both"):
+        hook_text = nc.screen_hook(lines, niche, "hi" if any(re.search(r"[ऀ-ॿ]", str(x.get("text", ""))) for x in lines) else "en",
+                                   "claude", model)
+        log(f"hook text on screen: “{hook_text}”")
     clips = index_footage(vc.collect_clips(clips_in))
     q = line_embeddings(lines)
     slots = shots_for_lines(lines, total, pace)
+    if hook != "off":
+        slots = nc.fast_open(slots)
     for c in clips:
         c["still"] = c["path"] in (stills or set()) or c["path"] in (cards or set())
         c["card"] = c["path"] in (cards or set())
@@ -536,19 +563,26 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
     for ci, c in enumerate(clips):
         for li in (hints or {}).get(c["path"], []):
             by_line.setdefault(int(li), set()).add(ci)
-    cands = [candidates(s, lines[s["line"]], q[s["line"]], clips, first=(i == 0), hinted=by_line.get(s["line"])) for i, s in enumerate(slots)]
+    cands = [candidates(s, lines[s["line"]], q[s["line"]], clips, first=(i == 0), hinted=by_line.get(s["line"]), hook=bool(s.get("hook")) and hook != "off")
+             for i, s in enumerate(slots)]
     picks = choose(slots, cands, clips, story_order)
     shots = build_shots(slots, picks, lines, clips, fps, W, H)
+    by_path = {c["path"]: c for c in clips}
+    craft = nc.treat(shots, slots, lines, by_path, fps)
+    framed = nc.frame_for_shape(shots, W, H, fps, by_path)
+    log(f"craft: {craft['punches']} punch-in(s), {craft['slow']} slow-motion shot(s), {craft['transitions']} mood transition(s), "
+        f"{framed} shot(s) framed on their subject")
     outp = Path(out).resolve()
     outp.parent.mkdir(parents=True, exist_ok=True)
     plan = {"version": 2, "mode": "narrate", "voice": voice, "width": W, "height": H, "fps": fps, "look": look, "lines": lines, "shots": shots,
-            "music": music, "language": lang}
+            "music": music, "language": lang, "hook": hook, "hook_text": hook_text}
     plan_path = outp.with_suffix(".narrate.json")
     plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=1, default=float), encoding="utf-8")
     used = len({s["clip"] for s in shots})
     log(f"planned {len(shots)} shots from {used} clip(s) for {total:.0f}s of narration in {time.time() - t0:.0f}s; "
         f"mean picture match {np.mean([s['match'] for s in shots]):.2f}")
     if plan_only:
+        __import__("shutil").rmtree(work, ignore_errors=True)
         return {"outputs": [], "plan": str(plan_path), "out_dir": str(outp.parent)}
     with tempfile.TemporaryDirectory(prefix="ei-narrate-") as tmp:
         rplan = Path(tmp) / "plan.json"
@@ -577,11 +611,11 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
             build_sound(voice, shots, clips, fps, vtotal, sound, str(Path(music).resolve()) if music else None, ambience_db, music_db)
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(sound)]
         words = caption_words(lines)
-        if captions and words:
+        if (captions and words) or hook_text:
             import captions as cap
 
-            ass = cap.build_ass(words, None, W, H, total, caption_style, "off")
-            if any(re.search(r"[ऀ-ॿ]", w["word"]) for w in words):
+            ass = cap.build_ass(words if captions else [], hook_text, W, H, total, caption_style, "intro" if hook_text else "off")
+            if any(re.search(r"[ऀ-ॿ]", w["word"]) for w in words) or re.search(r"[ऀ-ॿ]", hook_text or ""):
                 ass = ass.replace("Avenir Next Heavy", "Kohinoor Devanagari").replace("Avenir Next Demi Bold", "Kohinoor Devanagari")
             af = Path(tmp) / "c.ass"
             af.write_text(ass, encoding="utf-8")
@@ -593,6 +627,9 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
         cmd += ["-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(partial)]
         ac.run(cmd)
         partial.replace(outp)
+    import shutil
+
+    shutil.rmtree(work, ignore_errors=True)
     if words:
         outp.with_suffix(".srt").write_text(ac.to_srt(ac.group_words(words, max_words=7, max_chars=42)), encoding="utf-8")
     log(f"done: {outp.name} in {time.time() - t0:.0f}s")
@@ -618,6 +655,9 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-story-order", action="store_true")
     p.add_argument("--look", default="natural")
     p.add_argument("--plan-only", action="store_true")
+    p.add_argument("--hook", default="auto", choices=["auto", "teaser", "text", "both", "off"],
+                   help="auto: open on the strongest line (cold open) + an on-screen hook + fast first cuts; teaser/text: only one; off: none")
+    p.add_argument("--niche", default="", help="the channel's niche (for the hook library)")
     import score
 
     score.add_sound_args(p)
@@ -629,7 +669,7 @@ def run_args(a) -> dict:
     return make(a.voice, a.clips, a.out, narration=a.narration, script=a.script, aspect=a.aspect, pace=a.pace, captions=a.captions,
                 caption_style=a.caption_style, music=a.music, music_db=a.music_db, ambience_db=a.ambience_db, describe=a.describe,
                 model=a.llm, story_order=not a.no_story_order, look=a.look, workers=getattr(a, "workers", 2), plan_only=a.plan_only,
-                sound=score.options(a), resolution=a.resolution)
+                sound=score.options(a), resolution=a.resolution, hook=a.hook, niche=a.niche)
 
 
 def main(argv: list[str] | None = None) -> int:

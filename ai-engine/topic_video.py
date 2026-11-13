@@ -514,7 +514,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         cards = {str(Path(i["file"]).resolve()) for i in items if i["kind"] == "card"}
         nr.make(sp["outputs"][0], clips, str(video_out), narration=sp["narration"], aspect=aspect, pace=pace, captions=captions,
                 caption_style=caption_style or ("pop" if aspect == "vertical" else "clean"), music=music, describe="none", hints=hints, stills=stills, cards=cards,
-                ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound, resolution=resolution)
+                ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound, resolution=resolution, niche=niche)
         outputs.insert(0, str(video_out))
     (folder / "sources.md").write_text(sources_md(data, items, script), encoding="utf-8")
     desc = description_txt(data, items, script)
