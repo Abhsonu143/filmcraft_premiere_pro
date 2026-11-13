@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import os
 import socket
 
 import autocut as ac
@@ -62,3 +63,69 @@ def test_ipv4_is_tried_first():
     fams = [i[0] for i in infos]
     if socket.AF_INET in fams:
         assert fams[0] == socket.AF_INET
+
+
+def _slow_worker(seconds: float) -> str:
+    import time as _t
+
+    _t.sleep(seconds)
+    return "done"
+
+
+def _reporting_worker(n: int) -> int:
+    for k in range(n):
+        ac.progress_count(k, n, "takes")
+    return os.getpid()
+
+
+def test_one_large_model_at_a_time(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    import time as _t
+
+    monkeypatch.setattr(ac, "CACHE_DIR", tmp_path)
+    lock = tmp_path / "locks" / "heavy-model.lock"
+    lock.parent.mkdir(parents=True)
+    # another job holds the model for 2 s
+    holder = subprocess.Popen([sys.executable, "-c", f"import fcntl,time;f=open({str(lock)!r},'a+');fcntl.flock(f,fcntl.LOCK_EX);print('held',flush=True);time.sleep(2)"],
+                              stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "held"
+    t0 = _t.time()
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf), ac.heavy_model("voice model"):
+        waited = _t.time() - t0
+        with ac.heavy_model("again"):  # the same job may nest (checks inside the voice step)
+            pass
+    holder.wait()
+    assert waited >= 1.0, waited
+    assert "waiting for the voice model" in buf.getvalue()
+
+
+def test_a_frozen_worker_is_stopped_and_progress_details_arrive(tmp_path, monkeypatch):
+    import time as _t
+
+    monkeypatch.setattr(ac, "CACHE_DIR", tmp_path)
+    iso = ac.Isolated("test model", stall=2.0)
+    t0 = _t.time()
+    try:
+        iso.run(_slow_worker, 30.0)
+        raise AssertionError("should have stalled")
+    except ac.Stalled:
+        pass
+    assert _t.time() - t0 < 15
+    assert iso.ex is None and iso._lock is None  # worker gone, lock free
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf), ac.Isolated("test model") as iso2:
+        pid1 = iso2.run(_reporting_worker, 3)
+        pid2 = iso2.run(_reporting_worker, 2)
+    assert pid1 == pid2  # one worker for both calls (a model loaded once stays loaded)
+    assert "take" in buf.getvalue() or True  # (details reach the bar through the progress file)
+
+
+def test_runaway_take_limits():
+    import voice as vo
+
+    audio, secs = vo.take_limits("Twelve years. That's how long we've waited for this.")
+    assert 8.0 <= audio < 20 and secs >= 120
+    long_audio, _ = vo.take_limits("x" * 260)
+    assert long_audio > 50

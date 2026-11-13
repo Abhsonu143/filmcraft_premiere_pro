@@ -652,25 +652,56 @@ def engine_params(seg: dict, engine: str) -> dict:
     return {}
 
 
+_MODELS: dict = {}  # (in a worker process) the clone model, loaded once for every round
+
+
+def take_limits(text: str) -> tuple[float, float]:
+    """(longest sensible audio in s, longest sensible generation time in s) for a passage: a take
+    that runs past these is a runaway (the model repeating or babbling), not a slow take."""
+    expected = max(1.0, len(text) / 13.0)  # ~13 characters per second of speech
+    return max(8.0, 2.5 * expected + 3.0), max(120.0, 25.0 * expected)
+
+
 def _speak_worker(jobs: list[dict], engine: str, repo: str) -> list[dict]:
-    """In its own process: load the clone model once, generate every take."""
+    """In its own process: load the clone model once (kept for later rounds), generate every take.
+    A take is written only when it is complete; a runaway take is dropped (its passage is retried)."""
+    import time as _time
+
     import numpy as np
     from mlx_audio.tts.utils import load_model
 
-    model = load_model(repo)
+    if repo not in _MODELS:
+        _MODELS[repo] = load_model(repo)
+    model = _MODELS[repo]
     out = []
     for k, j in enumerate(jobs):
         ac.progress_count(k, len(jobs), "takes")
         kw = {"text": j["text"], "ref_audio": j["ref"]}
         kw.update(lang_code=j["lang"], **j.get("params", {}))
+        max_audio, max_time = take_limits(j["text"])
         try:
             import mlx.core as mx
 
             mx.random.seed(int(j.get("seed", 0)))
-            chunks = [np.array(r.audio, dtype=np.float32) for r in model.generate(**kw)]
-            y = np.concatenate(chunks) if chunks else np.zeros(1, np.float32)
             sr = int(getattr(model, "sample_rate", 24000))
-            write_wav(j["out"], y, sr)
+            chunks, got, t0, runaway = [], 0.0, _time.time(), ""
+            for r in model.generate(**kw):
+                a = np.array(r.audio, dtype=np.float32)
+                chunks.append(a)
+                got += len(a) / sr
+                if got > max_audio:
+                    runaway = f"runaway take ({got:.0f}s of audio for {len(j['text'])} characters)"
+                    break
+                if _time.time() - t0 > max_time:
+                    runaway = f"take took over {max_time:.0f}s"
+                    break
+            if runaway:
+                out.append({"out": j["out"], "ok": False, "error": runaway})
+                continue
+            y = np.concatenate(chunks) if chunks else np.zeros(1, np.float32)
+            tmp = j["out"] + ".part.wav"
+            write_wav(tmp, y, sr)
+            os.replace(tmp, j["out"])  # (a take on disk is always whole: a retry can trust it)
             out.append({"out": j["out"], "ok": True})
         except Exception as e:  # one bad line must not lose the rest
             out.append({"out": j["out"], "ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
@@ -792,7 +823,13 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
     work.mkdir(parents=True, exist_ok=True)
     anchor_keys = {lg: hashlib.sha1(Path(a[0]).read_bytes()).hexdigest()[:12] for lg, a in anchors.items()}
     ac.progress_plan({"first takes": 0.62, "checking": 0.13, "better takes": 0.2, "assembling": 0.05})
-    with tempfile.TemporaryDirectory(prefix="ei-speak-") as tmp:
+    # the clone model stays loaded across rounds when the checks are light (English: Whisper small);
+    # Hindi is checked with the 1.6 GB Whisper, so then the clone model is unloaded for the checks
+    langs = {c["lang"] for c in chunks}
+    check_models = {lg: (whisper_model or CHECK_WHISPER.get(lg, CHECK_WHISPER["en"])) for lg in langs}
+    keep_loaded = all("large" not in m for m in check_models.values())
+    iso = ac.Isolated("voice model", stall=300.0)
+    with iso, tempfile.TemporaryDirectory(prefix="ei-speak-") as tmp:
         cands: dict[int, list[dict]] = {}
         # 1 take of every passage; more takes only where the first is unclear or sounds less like
         # you than the others (best of two where it matters); a last retry for what is still wrong
@@ -815,11 +852,23 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
             log(f"speaking {len(pending)} passage(s) ({sum(len(chunks[ci]['lines']) for ci in pending)} lines), {sum(per.get(ci, 1) for ci in pending)} take(s) with {ENGINES[eng]['label']}"
                 + (f", {len(cached)} take(s) kept from before" if cached else "") + (f" ({stage_name})" if round_ else ""))
             with ac.stage(stage_name if stage_name != "retry" else "better takes"):
-                res = ac.run_isolated(_speak_worker, jobs, eng, ENGINES[eng]["repo"]) if jobs else []
-            ok = [j for j, r in zip(jobs, res) if r.get("ok")]
-            for j, r in zip(jobs, res):
-                if not r.get("ok"):
-                    log(f"passage {j['chunk'] + 1}: {r.get('error')}")
+                res = []
+                for attempt in range(2):  # a frozen worker is restarted once; finished takes are kept
+                    todo = [j for j in jobs if not Path(j["out"]).is_file()]
+                    if not todo:
+                        break
+                    try:
+                        res += iso.run(_speak_worker, todo, eng, ENGINES[eng]["repo"])
+                        break
+                    except ac.Stalled:
+                        log("the voice model froze: starting it again (finished takes are kept)" if attempt == 0 else "the voice model froze again")
+                if not keep_loaded:
+                    iso.close()  # (room for the big Whisper)
+            errors = {r["out"]: r.get("error") for r in res if not r.get("ok")}
+            ok = [j for j in jobs if Path(j["out"]).is_file()]
+            for j in jobs:
+                if not Path(j["out"]).is_file():
+                    log(f"passage {j['chunk'] + 1}: {errors.get(j['out']) or 'not spoken'}")
             with ac.stage("checking") if round_ == 0 else contextlib.nullcontext():
                 if ok:
                     heard = asr([(j["out"], j["lang"]) for j in ok], {"en": whisper_model, "hi": whisper_model} if whisper_model else None)

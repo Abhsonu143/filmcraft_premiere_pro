@@ -1,5 +1,25 @@
 # Progress
 
+## 2026-11-14: the voice step no longer gets stuck
+
+Measured on a running queue: one voice take = ~28 s of work for ~4 s of speech, the voice model 3.4–3.9 GB,
+9–10 GB of swap in use, and a left-over model worker of an earlier stopped job still holding 1.9 GB.
+Two jobs in the voice step at once (two models on 8 GB) made both crawl for a long time.
+
+- **One large model at a time across all EI jobs** (`autocut.heavy_model`, a lock file). A job that needs a model
+  while another job holds one waits, and AI Jobs says "waiting for the voice model (another job is using it)".
+- **No left-overs:** every model worker exits on its own when the job that started it is gone.
+- **The voice model is loaded once per narration:** first takes, better takes and the retry use one worker
+  (`autocut.Isolated`). Hindi narrations still free it for the large Whisper check.
+- **Runaway takes are stopped:** a take whose audio grows past 2.5× what its text needs, or that runs past its
+  time limit, is dropped and its passage retried. A take is written to disk only when complete.
+- **A frozen worker is stopped after 5 minutes without progress** and started again once. Finished takes are
+  kept.
+- **AI Jobs shows the detail** ("voice · take 18 of 30"), warns after 10 minutes without progress, and warns when
+  memory is very tight (more than 4 GB of swap).
+- `ai-engine/tools/ei_check.py`: a health check (memory, jobs and their processes, takes/shots saved and how
+  fast, stuck jobs, left-overs; `--clean`, `--watch N`).
+
 ## 2026-11-14: a queue for every tool, editable, reorderable, importable
 
 - Every tool's dialog has **Add to Queue** (except Voice Clone, which records with you there). Tasks run one at a

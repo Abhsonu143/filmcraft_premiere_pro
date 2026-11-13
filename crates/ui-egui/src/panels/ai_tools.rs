@@ -53,6 +53,8 @@ use crate::FilmcraftApp;
 
 /// Most log lines kept per job (older ones are dropped).
 const MAX_LOG: usize = 400;
+/// A running job whose progress has not moved for this long may be stuck (seconds).
+const STUCK_AFTER_S: f64 = 600.0;
 /// Most jobs kept in the list (finished ones are dropped first).
 const MAX_JOBS: usize = 50;
 
@@ -1617,6 +1619,8 @@ struct Job {
     pid: Option<u32>,
     /// The engine's own estimate: (fraction done, current stage).
     progress: Option<(f32, String)>,
+    /// When the progress last moved (a job that does not move for long may be stuck).
+    progress_at: Instant,
     paused_since: Option<Instant>,
     paused_total: Duration,
     /// Started from the queue (the next queued job waits for it).
@@ -1709,6 +1713,7 @@ fn start_job_ex(title: String, kind: Option<Kind>, steps: Vec<Vec<String>>, impo
             cwd: cwd.clone(),
             pid: None,
             progress: None,
+            progress_at: Instant::now(),
             paused_since: None,
             paused_total: Duration::ZERO,
             queued,
@@ -1775,7 +1780,12 @@ fn run_steps(id: u64, steps: &[Vec<String>], cwd: Option<&Path>) -> Result<(), S
             std::thread::spawn(move || {
                 for line in BufReader::new(s).lines().map_while(Result::ok) {
                     if let Some(p) = parse_progress(&line) {
-                        with_job(id, |j| j.progress = Some(p));
+                        with_job(id, |j| {
+                            if j.progress.as_ref() != Some(&p) {
+                                j.progress_at = Instant::now();
+                            }
+                            j.progress = Some(p);
+                        });
                         continue;
                     }
                     let line = line.strip_prefix("[autocut] ").map(str::to_string).unwrap_or(line);
@@ -1844,11 +1854,51 @@ fn cancel_job(id: u64) -> bool {
     .unwrap_or(false)
 }
 
-/// `EI_PROGRESS {"fraction": 0.42, "stage": "voice"}` -> (0.42, "voice").
+/// `EI_PROGRESS {"fraction": 0.42, "stage": "voice", "detail": "take 18 of 30"}` ->
+/// (0.42, "voice · take 18 of 30").
 fn parse_progress(line: &str) -> Option<(f32, String)> {
     let v: Value = serde_json::from_str(line.strip_prefix("EI_PROGRESS ")?).ok()?;
     let f = v.get("fraction").and_then(Value::as_f64).filter(|f| f.is_finite())?.clamp(0.0, 1.0) as f32;
-    Some((f, v.get("stage").and_then(Value::as_str).unwrap_or_default().to_string()))
+    let stage = v.get("stage").and_then(Value::as_str).unwrap_or_default();
+    let detail = v.get("detail").and_then(Value::as_str).unwrap_or_default();
+    let label = match (stage.is_empty(), detail.is_empty()) {
+        (_, true) => stage.to_string(),
+        (true, false) => detail.to_string(),
+        (false, false) => format!("{stage} · {detail}"),
+    };
+    Some((f, label))
+}
+
+/// Swap in use (GB), read at most every 15 s (macOS; None elsewhere). Heavy swap is why AI steps
+/// crawl on an 8 GB Mac.
+fn swap_gb() -> Option<f64> {
+    static LAST: OnceLock<Mutex<Option<(Instant, Option<f64>)>>> = OnceLock::new();
+    let cell = LAST.get_or_init(|| Mutex::new(None));
+    let mut g = cell.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((t, v)) = *g
+        && t.elapsed() < Duration::from_secs(15)
+    {
+        return v;
+    }
+    let v = if cfg!(target_os = "macos") {
+        Command::new("/usr/sbin/sysctl")
+            .args(["-n", "vm.swapusage"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .and_then(|o| parse_swap(&String::from_utf8_lossy(&o.stdout)))
+    } else {
+        None
+    };
+    *g = Some((Instant::now(), v));
+    v
+}
+
+/// "total = 10240.00M  used = 9478.00M  free = 762.00M" -> 9.26 (GB).
+fn parse_swap(text: &str) -> Option<f64> {
+    let used = text.split("used = ").nth(1)?.split('M').next()?.trim().parse::<f64>().ok()?;
+    used.is_finite().then_some(used / 1024.0)
 }
 
 /// Send a signal to a job's whole process group (the engine, ffmpeg, model workers).
@@ -4096,6 +4146,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         error: String,
         secs: f64,
         progress: Option<(f32, String)>,
+        still_for: f64,
         paused: bool,
         queued: bool,
         retry: bool,
@@ -4122,6 +4173,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
             error: j.error.clone(),
             secs: j.active().as_secs_f64(),
             progress: j.progress.clone(),
+            still_for: j.progress_at.elapsed().as_secs_f64(),
             paused: j.paused_since.is_some(),
             queued: j.queued,
             retry: j.status != Status::Running && !j.steps.is_empty(),
@@ -4232,6 +4284,14 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         if rows.is_empty() && waiting.is_empty() {
             ui.label("No AI jobs yet. Start one from the AI menu.");
         }
+        if rows.iter().any(|r| r.status == Status::Running)
+            && let Some(gb) = swap_gb().filter(|g| *g > 4.0)
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xE5, 0x9B, 0x4B),
+                format!("Memory is very tight ({gb:.1} GB of swap in use): AI steps run several times slower. Close heavy apps, or let one job run at a time."),
+            );
+        }
         egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
             for r in &rows {
                 let (icon, color) = match r.status {
@@ -4265,6 +4325,15 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         let br = ui.add(if r.progress.is_none() && !r.paused { bar.animate(true) } else { bar });
                         elems.push((format!("ai.jobs.{}.progress", r.id), br.rect, format!("{frac:.3}")));
                         ui.weak(&r.last);
+                        if !r.paused && r.still_for > STUCK_AFTER_S && !stage.contains("waiting for") {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xE5, 0x9B, 0x4B),
+                                format!(
+                                    "No progress for {}: it may be stuck. Cancel and Retry continues from what is saved (or run ai-engine/tools/ei_check.py).",
+                                    fmt_duration(r.still_for)
+                                ),
+                            );
+                        }
                     }
                     Status::Failed | Status::Cancelled => {
                         ui.colored_label(color, if r.error.is_empty() { "Stopped" } else { &r.error });
@@ -4757,6 +4826,21 @@ mod tests {
         let mut off = Draft::from_params(Kind::Clips, &json!({"input": clip.to_string_lossy()}));
         assert!(!off.engine_args().unwrap().contains(&"--sound-design".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn progress_details_and_memory() {
+        assert_eq!(
+            parse_progress(r#"EI_PROGRESS {"fraction": 0.3, "stage": "voice", "detail": "take 18 of 30"}"#),
+            Some((0.3, "voice · take 18 of 30".to_string()))
+        );
+        assert_eq!(
+            parse_progress(r#"EI_PROGRESS {"fraction": 0.1, "stage": "", "detail": "waiting for the voice model"}"#),
+            Some((0.1, "waiting for the voice model".to_string()))
+        );
+        let g = parse_swap("total = 10240.00M  used = 9478.00M  free = 762.00M  (encrypted)").unwrap();
+        assert!((g - 9.2559).abs() < 0.001);
+        assert_eq!(parse_swap("nonsense"), None);
     }
 
     #[test]

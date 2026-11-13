@@ -119,7 +119,7 @@ class _Node:
 
 
 _ROOT: list[_Node | None] = [None]
-_LAST: dict = {"f": -1.0, "label": None, "t": 0.0}
+_LAST: dict = {"f": -1.0, "label": None, "t": 0.0, "detail": "", "sent": ""}
 
 
 def _path() -> list:
@@ -168,14 +168,16 @@ def stage(name: str):
                 _emit(force=True)
 
 
-def stage_progress(frac: float) -> None:
-    """How far the current stage is (0–1)."""
+def stage_progress(frac: float, detail: str | None = None) -> None:
+    """How far the current stage is (0–1); `detail` says what exactly ("take 18 of 30")."""
     if os.environ.get("EI_PROGRESS_FILE"):  # a model worker: tell the parent process
         try:
-            Path(os.environ["EI_PROGRESS_FILE"]).write_text(f"{max(0.0, min(1.0, frac)):.4f}")
+            Path(os.environ["EI_PROGRESS_FILE"]).write_text(f"{max(0.0, min(1.0, frac)):.4f}|{detail or ''}")
         except OSError:
             pass
         return
+    if detail is not None:
+        _LAST["detail"] = detail
     with _P_LOCK:
         path = _path()
         if path:
@@ -205,7 +207,8 @@ def progress_count(k: int, n: int, unit: str = "") -> None:
     else:
         _TLS.counts.setdefault(key, {})["outer"] = (min(k, n), n)
         frac = min(1.0, k / n)
-    stage_progress(frac)
+    noun = unit[:-1] if unit.endswith("s") else unit
+    stage_progress(frac, f"{noun} {min(k + (1 if k < n and unit in _INNER_UNITS else 0), n)} of {n}" if noun else None)
 
 
 def _emit(force: bool = False) -> None:
@@ -215,10 +218,21 @@ def _emit(force: bool = False) -> None:
     f = root.fraction()
     label = "; ".join(root.active())
     now = time.time()
-    if not force and label == _LAST["label"] and abs(f - _LAST["f"]) < 0.004 and now - _LAST["t"] < 2.0:
+    if not force and label == _LAST["label"] and abs(f - _LAST["f"]) < 0.004 and now - _LAST["t"] < 2.0 and _LAST.get("detail") == _LAST.get("sent"):
         return
+    _LAST["sent"] = _LAST.get("detail")
     _LAST.update(f=f, label=label, t=now)
-    print("EI_PROGRESS " + json.dumps({"fraction": round(f, 4), "stage": label}), file=sys.stderr, flush=True)
+    out = {"fraction": round(f, 4), "stage": label}
+    if _LAST.get("detail"):
+        out["detail"] = _LAST["detail"]
+    print("EI_PROGRESS " + json.dumps(out, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
+def _emit_detail(detail: str) -> None:
+    """Say what is happening without moving the bar (e.g. waiting for the voice model)."""
+    _LAST["detail"] = detail
+    with _P_LOCK:
+        _emit(force=True)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -508,44 +522,155 @@ def _transcribe_worker(wav: str, model: str, prompt: str | None, language: str |
     return {"language": res.get("language"), "segments": segs, "words": words}
 
 
-def run_isolated(fn, *args):
-    """Run `fn(*args)` in a fresh process (one heavy model at a time; memory freed on exit)."""
-    import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor
+class Stalled(RuntimeError):
+    """A model worker reported no progress for too long and was stopped."""
 
-    # the worker reports its progress through a file (it has no line to the app of its own)
-    pf = Path(tempfile.mkdtemp(prefix="ei-progress-")) / "p"
-    with _P_LOCK:
-        old = os.environ.get("EI_PROGRESS_FILE")
-        os.environ["EI_PROGRESS_FILE"] = str(pf)
+
+_MODEL_LOCK_DEPTH = _threading.local()
+
+
+@_contextmanager
+def heavy_model(what: str = "model"):
+    """Only one large model in memory at a time, across every EI job on this Mac (two voice
+    models do not fit in 8 GB: both would crawl in swap). A job that needs a model while another
+    job holds one waits here, and says so."""
+    import fcntl
+
+    depth = getattr(_MODEL_LOCK_DEPTH, "n", 0)
+    if depth:  # (already held by this thread)
+        _MODEL_LOCK_DEPTH.n = depth + 1
         try:
-            ex = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
-            fut = ex.submit(fn, *args)  # (the worker process starts here, with the variable set)
+            yield
         finally:
-            if old is None:
-                os.environ.pop("EI_PROGRESS_FILE", None)
-            else:
-                os.environ["EI_PROGRESS_FILE"] = old
+            _MODEL_LOCK_DEPTH.n -= 1
+        return
+    path = CACHE_DIR / "locks" / "heavy-model.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")  # noqa: SIM115 (held for the whole block)
     try:
-        seen = ""
+        t0 = time.time()
+        said = False
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not said or time.time() - t0 > 60 and int(time.time() - t0) % 60 < 2:
+                    log(f"waiting for the {what}: another EI job is using a large model (one at a time fits in memory)")
+                    _emit_detail(f"waiting for the {what} (another job is using it)")
+                    said = True
+                time.sleep(2.0)
+        if said:
+            log(f"the {what} is free after {time.time() - t0:.0f}s of waiting")
+            _emit_detail("")
+        _MODEL_LOCK_DEPTH.n = 1
+        try:
+            yield
+        finally:
+            _MODEL_LOCK_DEPTH.n = 0
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
+def _worker_init(parent: int) -> None:
+    """In a model worker: exit as soon as the job that started it is gone (a cancelled or crashed
+    job must not leave a 2–4 GB model behind)."""
+    def watch() -> None:
+        while True:
+            time.sleep(2.0)
+            if os.getppid() != parent:
+                os._exit(1)
+
+    _threading.Thread(target=watch, name="ei-parent-watch", daemon=True).start()
+
+
+class Isolated:
+    """A model worker in its own process. `run` may be called several times (the model a function
+    loads stays loaded in the worker between calls); `close` (or the end of a `with` block) frees it.
+    Holds the one-large-model-at-a-time lock while the worker lives. A call whose worker reports no
+    progress for `stall` seconds is stopped (Stalled)."""
+
+    def __init__(self, what: str = "model", stall: float | None = None):
+        self.what, self.stall = what, stall
+        self.ex = None
+        self._lock = None
+
+    def __enter__(self) -> "Isolated":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def _start(self) -> None:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        if self._lock is None:
+            self._lock = heavy_model(self.what)
+            self._lock.__enter__()
+        self.pf = Path(tempfile.mkdtemp(prefix="ei-progress-")) / "p"
+        with _P_LOCK:
+            old = os.environ.get("EI_PROGRESS_FILE")
+            os.environ["EI_PROGRESS_FILE"] = str(self.pf)
+            try:
+                self.ex = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"), initializer=_worker_init, initargs=(os.getpid(),))
+                # (the worker process starts at the first submit, with the variable set)
+                self._warm = self.ex.submit(os.getpid)
+                self._warm.result(timeout=120)
+            finally:
+                if old is None:
+                    os.environ.pop("EI_PROGRESS_FILE", None)
+                else:
+                    os.environ["EI_PROGRESS_FILE"] = old
+
+    def run(self, fn, *args):
+        if self.ex is None:
+            self._start()
+        fut = self.ex.submit(fn, *args)
+        seen, last = "", time.time()
         while True:
             try:
                 return fut.result(timeout=1.0)
             except TimeoutError:
                 pass
             try:
-                txt = pf.read_text()
+                txt = self.pf.read_text()
             except OSError:
                 txt = ""
             if txt and txt != seen:
-                seen = txt
+                seen, last = txt, time.time()
+                frac, _, detail = txt.partition("|")
                 try:
-                    stage_progress(float(txt))
+                    stage_progress(float(frac), detail or None)
                 except ValueError:
                     pass
-    finally:
-        ex.shutdown(wait=True)
-        shutil.rmtree(pf.parent, ignore_errors=True)
+            if self.stall and time.time() - last > self.stall:
+                log(f"the {self.what} made no progress for {self.stall:.0f}s: stopping it")
+                self.close(kill=True)
+                raise Stalled(f"the {self.what} made no progress for {self.stall:.0f}s")
+
+    def close(self, kill: bool = False) -> None:
+        if self.ex is not None:
+            if kill:
+                for proc in list(getattr(self.ex, "_processes", {}).values()):
+                    try:
+                        proc.kill()
+                    except Exception:  # (already gone)
+                        pass
+            self.ex.shutdown(wait=not kill, cancel_futures=True)
+            self.ex = None
+            shutil.rmtree(self.pf.parent, ignore_errors=True)
+        if self._lock is not None:
+            self._lock.__exit__(None, None, None)
+            self._lock = None
+
+
+def run_isolated(fn, *args):
+    """Run `fn(*args)` in a fresh process (one heavy model at a time across all EI jobs; memory
+    freed on exit; progress reported through a file the parent watches)."""
+    with Isolated(getattr(fn, "__name__", "model").strip("_").replace("_worker", "") + " model") as iso:
+        return iso.run(fn, *args)
 
 
 def transcribe(src: str, *, model: str = DEFAULT_WHISPER, prompt: str | None = None, language: str | None = None) -> dict:
