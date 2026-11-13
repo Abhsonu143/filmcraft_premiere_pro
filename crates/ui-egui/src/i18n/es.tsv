@@ -3509,6 +3509,9 @@
 	Retry AI Job	Reintentar trabajo de IA
 	AI Queue	Cola de IA
 	Cancel AI Queue	Cancelar cola de IA
+	Import AI Queue Tasks	Importar tareas a la cola de IA
+	Export AI Queue	Exportar cola de IA
+	Move AI Queue Task	Mover tarea de la cola de IA
 	Based on FilmCraft…	Basado en FilmCraft…
 	A video editor with local AI auto-editing, based on the open-source FilmCraft editor.	Un editor de video con edición automática por IA local, basado en el editor de código abierto FilmCraft.
 	Ai	IA

@@ -241,6 +241,8 @@ struct Draft {
     // video from topic: your own first line, or hooks looked up online for the topic
     hook_line: String,
     find_hook: bool,
+    /// Editing this waiting queue item (its id) instead of starting a new job.
+    queue_edit: Option<u64>,
     // optional emotional sound design (music per mood, hits, risers, pauses)
     sound: bool,
     music_source: &'static str,
@@ -408,6 +410,7 @@ impl Draft {
             hook_claude: true,
             hook_line: String::new(),
             find_hook: false,
+            queue_edit: None,
             sound: false,
             music_source: "internet",
             music_folder: setting_str("music_folder").unwrap_or_default(),
@@ -550,6 +553,94 @@ impl Draft {
             d.script = a.to_string();
         }
         d
+    }
+
+    /// The draft as control-channel parameters (`Draft::from_params` reads them back): what the
+    /// queue keeps, edits and exports.
+    fn to_params(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("input".into(), json!(self.input));
+        m.insert("music".into(), json!(self.music));
+        m.insert("script".into(), json!(self.script));
+        m.insert("out".into(), json!(self.out));
+        m.insert("clips".into(), json!(self.clips));
+        m.insert("clipLength".into(), json!(self.clip_len));
+        m.insert("length".into(), json!(self.length));
+        m.insert("quality".into(), json!(self.quality));
+        m.insert("count".into(), json!(self.count));
+        m.insert("min".into(), json!(self.min_len));
+        m.insert("target".into(), json!(self.target_len));
+        m.insert("max".into(), json!(self.max_len));
+        m.insert("content".into(), json!(self.content));
+        m.insert("framing".into(), json!(self.framing));
+        m.insert("captionMode".into(), json!(self.caption_mode));
+        m.insert("titleMode".into(), json!(self.title_mode));
+        m.insert("captionStyle".into(), json!(self.caption_style));
+        m.insert("llm".into(), json!(self.llm));
+        m.insert("format".into(), json!(self.format));
+        m.insert("audioQuality".into(), json!(self.audio_quality));
+        m.insert("start".into(), json!(self.start));
+        m.insert("end".into(), json!(self.end));
+        m.insert("mono".into(), json!(self.mono));
+        m.insert("normalize".into(), json!(self.normalize));
+        m.insert("aspect".into(), json!(self.aspect));
+        m.insert("pace".into(), json!(self.pace));
+        m.insert("preset".into(), json!(self.preset));
+        m.insert("look".into(), json!(self.look));
+        m.insert("effects".into(), json!(self.effects));
+        m.insert("order".into(), json!(self.order));
+        m.insert("musicStart".into(), json!(self.music_start));
+        m.insert("captions".into(), json!(self.captions));
+        m.insert("import".into(), json!(self.import));
+        m.insert("describe".into(), json!(self.describe));
+        m.insert("ambience".into(), json!(self.ambience));
+        m.insert("topic".into(), json!(self.topic));
+        m.insert("niche".into(), json!(self.niche));
+        m.insert("tone".into(), json!(self.tone));
+        m.insert("audience".into(), json!(self.audience));
+        m.insert("notes".into(), json!(self.notes));
+        m.insert("style".into(), json!(self.style));
+        m.insert("voice".into(), json!(self.voice));
+        m.insert("name".into(), json!(self.voice_name));
+        m.insert("newStyle".into(), json!(self.new_style));
+        m.insert("language".into(), json!(self.language));
+        m.insert("writer".into(), json!(self.writer));
+        m.insert("source".into(), json!(self.source));
+        m.insert("seconds".into(), json!(self.seconds));
+        m.insert("takes".into(), json!(self.takes));
+        m.insert("styleSources".into(), json!(self.style_sources));
+        m.insert("video".into(), json!(self.make_video));
+        m.insert("free".into(), json!(self.src_free));
+        m.insert("cards".into(), json!(self.src_cards));
+        m.insert("youtube".into(), json!(self.src_youtube));
+        m.insert("fresh".into(), json!(self.fresh));
+        m.insert("recordings".into(), json!(self.tv_folder));
+        m.insert("relight".into(), json!(self.relight));
+        m.insert("bezel".into(), json!(self.tv_bezel));
+        m.insert("clipType".into(), json!(self.clip_type));
+        m.insert("soundDesign".into(), json!(self.sound));
+        m.insert("resolution".into(), json!(self.resolution));
+        m.insert("hookClaude".into(), json!(self.hook_claude));
+        m.insert("findHook".into(), json!(self.find_hook));
+        m.insert("hookLine".into(), json!(self.hook_line));
+        m.insert("niches".into(), json!(self.hook_niches));
+        m.insert("countries".into(), json!(self.hook_geos));
+        m.insert("musicSource".into(), json!(self.music_source));
+        m.insert("licence".into(), json!(self.licence));
+        m.insert("soundEffects".into(), json!(self.sound_effects));
+        m.insert("musicLevel".into(), json!(self.music_level));
+        m.insert("musicFolder".into(), json!(self.music_folder));
+        let mut p = Value::Object(m);
+        let mut langs = Vec::new();
+        for (on, c) in [(self.lang_en, "en"), (self.lang_hi, "hi"), (self.lang_mix, "mix")] {
+            if on {
+                langs.push(c);
+            }
+        }
+        p["languages"] = json!(langs);
+        // "hook" is the teaser checkbox for short clips, and the opening style for a voiceover edit
+        p["hook"] = if self.kind == Kind::Clips { json!(self.hook) } else { json!(self.vo_hook) };
+        p
     }
 
     fn style_args(&self, a: &mut Vec<String>) {
@@ -1828,6 +1919,18 @@ struct QueueItem {
     steps: Vec<Vec<String>>,
     import: bool,
     cwd: Option<String>,
+    /// The dialog's settings (control-channel parameters): what Edit reopens and Export writes.
+    #[serde(default)]
+    params: Option<Value>,
+    #[serde(default)]
+    uid: u64,
+}
+
+fn next_uid() -> u64 {
+    static N: OnceLock<Mutex<u64>> = OnceLock::new();
+    let mut n = N.get_or_init(|| Mutex::new(0)).lock().unwrap_or_else(PoisonError::into_inner);
+    *n += 1;
+    *n
 }
 
 #[derive(Default)]
@@ -1874,18 +1977,179 @@ fn load_queue(q: &mut QueueState) {
     let Ok(v) = serde_json::from_str::<Value>(&t) else { return };
     let items: Vec<QueueItem> = v.get("items").and_then(|i| serde_json::from_value(i.clone()).ok()).unwrap_or_default();
     if !items.is_empty() {
-        q.note = format!("{} video(s) waiting from last time: press Resume Queue to continue", items.len());
-        q.items = items;
+        q.note = format!("{} task(s) waiting from last time: press Resume Queue to continue", items.len());
+        q.items = items
+            .into_iter()
+            .map(|mut it| {
+                it.uid = next_uid();
+                if it.params.is_none() {
+                    it.params = params_from_args(&it.kind, it.steps.first().map(|s| s.get(2..).unwrap_or_default()).unwrap_or_default());
+                }
+                it
+            })
+            .collect();
         q.paused = true;
     }
 }
 
-fn enqueue(title: String, kind: Kind, steps: Vec<Vec<String>>, import: bool, cwd: Option<PathBuf>) -> usize {
+fn enqueue(title: String, kind: Kind, steps: Vec<Vec<String>>, import: bool, cwd: Option<PathBuf>, params: Option<Value>) -> usize {
     let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
     load_queue(&mut q);
-    q.items.push(QueueItem { title, kind: kind.id().to_string(), steps, import, cwd: cwd.map(|c| c.to_string_lossy().to_string()) });
+    q.items.push(QueueItem { title, kind: kind.id().to_string(), steps, import, cwd: cwd.map(|c| c.to_string_lossy().to_string()), params, uid: next_uid() });
     save_queue(&q);
     q.items.len()
+}
+
+/// Settings from an older queue item's command line (Video from Topic), so it can be edited.
+fn params_from_args(kind: &str, args: &[String]) -> Option<Value> {
+    if kind != "topic" || args.first().map(String::as_str) != Some("topic") {
+        return None;
+    }
+    let mut p = json!({"topic": args.get(1)?, "video": true});
+    let mut i = 2;
+    while let Some(a) = args.get(i) {
+        let val = args.get(i + 1).cloned().unwrap_or_default();
+        let num = |v: &str| v.parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| json!(x)).unwrap_or(Value::Null);
+        let (key, value, used) = match a.as_str() {
+            "--fresh" => ("fresh", json!(true), 1),
+            "--find-hook" => ("findHook", json!(true), 1),
+            "--no-captions" => ("captions", json!(false), 1),
+            "--script-only" => ("video", json!(false), 1),
+            "--sound-design" => ("soundDesign", json!(true), 1),
+            "--no-effects" => ("soundEffects", json!(false), 1),
+            "--seconds" => ("seconds", num(&val), 2),
+            "--takes" => ("takes", num(&val), 2),
+            "--music-level" => ("musicLevel", num(&val), 2),
+            "--language" => ("language", json!(val), 2),
+            "--aspect" => ("aspect", json!(val), 2),
+            "--writer" => ("writer", json!(val), 2),
+            "--style" => ("style", json!(val), 2),
+            "--out-dir" => ("out", json!(val), 2),
+            "--hook-line" => ("hookLine", json!(val), 2),
+            "--voice" => ("voice", json!(val), 2),
+            "--pace" => ("pace", json!(val), 2),
+            "--music" => ("music", json!(val), 2),
+            "--resolution" => ("resolution", json!(val), 2),
+            "--music-source" => ("musicSource", json!(val), 2),
+            "--music-folder" => ("musicFolder", json!(val), 2),
+            "--licence" => ("licence", json!(val), 2),
+            "--niche" => ("niche", json!(val), 2),
+            "--sources" | "--footage" => {
+                let vals: Vec<String> = args.get(i + 1..).unwrap_or_default().iter().take_while(|v| !v.starts_with("--")).cloned().collect();
+                let n = vals.len();
+                if a == "--sources" {
+                    for s in ["free", "cards", "youtube"] {
+                        p[s] = json!(vals.iter().any(|v| v == s));
+                    }
+                } else {
+                    p["clips"] = json!(vals);
+                }
+                i += 1 + n;
+                continue;
+            }
+            _ => return None, // an option this version does not know: not editable, still runnable
+        };
+        p[key] = value;
+        i += used;
+    }
+    Some(p)
+}
+
+/// The engine arguments of a waiting item (to recognise the same task twice).
+fn item_args(it: &QueueItem) -> Vec<String> {
+    it.steps.first().map(|s| s.get(2..).unwrap_or_default().to_vec()).unwrap_or_default()
+}
+
+/// Add tasks from a queue file (`{"tasks": [{"command": "ai.topic", "params": {...}}]}`, or a list
+/// of tasks). Each is checked like its dialog would; a task already waiting is skipped.
+/// Returns (added, already waiting, problems).
+fn import_tasks(v: &Value) -> (usize, usize, Vec<String>) {
+    let (mut added, mut dup, mut errors) = (0, 0, Vec::new());
+    for t in check_tasks(v) {
+        match t {
+            Ok((title, kind, steps, engine, d)) => {
+                let args = steps.first().map(|s| s.get(2..).unwrap_or_default().to_vec()).unwrap_or_default();
+                let waiting = {
+                    let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+                    load_queue(&mut q);
+                    q.items.iter().any(|it| item_args(it) == args)
+                };
+                if waiting {
+                    dup += 1;
+                } else {
+                    enqueue(title, kind, steps, d.import, Some(engine), Some(d.to_params()));
+                    added += 1;
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    (added, dup, errors)
+}
+
+type CheckedTask = (String, Kind, Vec<Vec<String>>, PathBuf, Draft);
+
+/// Every task of a queue file checked like its dialog would (no queue touched).
+fn check_tasks(v: &Value) -> Vec<Result<CheckedTask, String>> {
+    let list = v.get("tasks").and_then(Value::as_array).or_else(|| v.as_array()).cloned().unwrap_or_default();
+    if list.is_empty() {
+        return vec![Err("no tasks in the file (expected {\"tasks\": [...]})".to_string())];
+    }
+    list.iter()
+        .enumerate()
+        .map(|(k, t)| {
+            let cmd = t.get("command").or_else(|| t.get("kind")).and_then(Value::as_str).unwrap_or_default();
+            let id = if cmd.starts_with("ai.") { cmd.to_string() } else { format!("ai.{cmd}") };
+            let label = t.get("title").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("task {}", k + 1));
+            let kind = Kind::from_command(&id).filter(|k| *k != Kind::Voice).ok_or_else(|| format!("{label}: unknown command “{cmd}”"))?;
+            // settings, or (an older export) the engine command line
+            let params = match t.get("params").filter(|p| p.is_object()) {
+                Some(p) => p.clone(),
+                None => t
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>())
+                    .and_then(|a| params_from_args(kind.id(), &a))
+                    .ok_or_else(|| format!("{label}: no settings"))?,
+            };
+            let mut d = Draft::from_params(kind, &params);
+            let (title, steps, engine) = draft_job(&mut d).map_err(|e| format!("{label}: {e}"))?;
+            let title = t.get("title").and_then(Value::as_str).map(str::to_string).unwrap_or(title);
+            Ok((title, kind, steps, engine, d))
+        })
+        .collect()
+}
+
+/// The waiting tasks as a queue file (the format `import_tasks` reads).
+fn export_tasks() -> Value {
+    let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+    load_queue(&mut q);
+    let tasks: Vec<Value> = q
+        .items
+        .iter()
+        .map(|it| json!({"command": format!("ai.{}", it.kind), "title": it.title, "params": it.params.clone().unwrap_or(Value::Null), "args": item_args(it)}))
+        .collect();
+    json!({"ei_queue": 1, "tasks": tasks})
+}
+
+/// Move a waiting task: `to` is its new position (0 = next to run).
+fn move_waiting(from: usize, to: usize) -> bool {
+    let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+    let ok = move_in(&mut q.items, from, to);
+    if ok {
+        save_queue(&q);
+    }
+    ok
+}
+
+fn move_in<T>(v: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from >= v.len() {
+        return false;
+    }
+    let it = v.remove(from);
+    let to = to.min(v.len());
+    v.insert(to, it);
+    true
 }
 
 /// Start the next queued job when nothing from the queue is running (called every frame).
@@ -1939,6 +2203,8 @@ fn requeue_running() {
             steps: j.steps.clone(),
             import: j.import,
             cwd: j.cwd.as_ref().map(|c| c.to_string_lossy().to_string()),
+            params: j.kind.and_then(|k| params_from_args(k.id(), j.steps.first().map(|s| s.get(2..).unwrap_or_default()).unwrap_or_default())),
+            uid: next_uid(),
         })
         .collect();
     if running.is_empty() {
@@ -1952,8 +2218,8 @@ fn requeue_running() {
     save_queue(&q);
 }
 
-/// Run a draft: returns the job id.
-fn run_draft(d: &mut Draft) -> Result<u64, String> {
+/// A draft's job: (title, steps, engine folder), after checking it can run.
+fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), String> {
     let args = d.engine_args()?;
     let engine = engine_dir().ok_or("The AI engine was not found. Reinstall EI, or set EI_ENGINE_DIR to the ai-engine folder.")?;
     let py = python(Some(&engine));
@@ -1973,17 +2239,51 @@ fn run_draft(d: &mut Draft) -> Result<u64, String> {
             n => format!("{}: {n} clips", d.kind.title()),
         },
     };
-    Ok(start_job(title, Some(d.kind), vec![step], d.import, Some(engine)))
+    Ok((title, vec![step], engine))
+}
+
+/// Run a draft: returns the job id.
+fn run_draft(d: &mut Draft) -> Result<u64, String> {
+    let (title, steps, engine) = draft_job(d)?;
+    Ok(start_job(title, Some(d.kind), steps, d.import, Some(engine)))
 }
 
 /// Put a draft in the queue instead of running it now. Returns the number waiting.
 fn queue_draft(d: &mut Draft) -> Result<usize, String> {
-    let args = d.engine_args()?;
-    let engine = engine_dir().ok_or("The AI engine was not found. Reinstall EI, or set EI_ENGINE_DIR to the ai-engine folder.")?;
-    let mut step = vec![python(Some(&engine)).to_string_lossy().to_string(), engine.join("ei_engine.py").to_string_lossy().to_string()];
-    step.extend(args);
-    let title = format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>());
-    Ok(enqueue(title, d.kind, vec![step], d.import, Some(engine)))
+    if d.kind == Kind::Voice {
+        return Err("Voice Clone records with you there, so it cannot wait in the queue.".into());
+    }
+    let (title, steps, engine) = draft_job(d)?;
+    Ok(enqueue(title, d.kind, steps, d.import, Some(engine), Some(d.to_params())))
+}
+
+/// Save an edited waiting task back into its place in the queue.
+fn save_queue_edit(d: &mut Draft, uid: u64) -> Result<(), String> {
+    let (title, steps, engine) = draft_job(d)?;
+    let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+    let it = q.items.iter_mut().find(|it| it.uid == uid).ok_or("That task is no longer waiting (it started, or was removed).")?;
+    it.title = title;
+    it.steps = steps;
+    it.import = d.import;
+    it.cwd = Some(engine.to_string_lossy().to_string());
+    it.params = Some(d.to_params());
+    save_queue(&q);
+    Ok(())
+}
+
+/// Open a waiting task's dialog with its settings, to edit it.
+fn edit_waiting(ctx: &egui::Context, uid: u64) -> Result<(), String> {
+    let (kind, params) = {
+        let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+        load_queue(&mut q);
+        let it = q.items.iter().find(|it| it.uid == uid).ok_or("That task is no longer waiting.")?;
+        let kind = Kind::from_command(&format!("ai.{}", it.kind)).ok_or("Unknown task kind.")?;
+        (kind, it.params.clone().ok_or("This task was queued by an older EI and cannot be edited: remove it and queue it again.")?)
+    };
+    let mut d = Draft::from_params(kind, &params);
+    d.queue_edit = Some(uid);
+    ctx.data_mut(|m| m.insert_temp(draft_id(), Some(d)));
+    Ok(())
 }
 
 fn install_steps() -> Result<Vec<Vec<String>>, String> {
@@ -2046,6 +2346,32 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             }
             Ok(json!({"waiting": q.items.iter().map(|i| i.title.clone()).collect::<Vec<_>>(), "paused": q.paused}))
         }
+        "ai.queueImport" => {
+            let v = match params.get("path").and_then(Value::as_str) {
+                Some(path) => {
+                    std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| e.to_string()))
+                }
+                None => Ok(params.clone()),
+            };
+            v.map(|v| {
+                let (added, dup, errors) = import_tasks(&v);
+                json!({"added": added, "alreadyWaiting": dup, "errors": errors})
+            })
+        }
+        "ai.queueExport" => {
+            let v = export_tasks();
+            match params.get("path").and_then(Value::as_str) {
+                Some(path) => serde_json::to_string_pretty(&v)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| std::fs::write(path, t).map_err(|e| e.to_string()))
+                    .map(|()| json!({"path": path, "tasks": v["tasks"].as_array().map(Vec::len)})),
+                None => Ok(v),
+            }
+        }
+        "ai.queueMove" => match (params.get("index").and_then(Value::as_u64), params.get("to").and_then(Value::as_u64)) {
+            (Some(i), Some(t)) => Ok(json!({"moved": move_waiting(i as usize, t as usize)})),
+            _ => Err("ai.queueMove needs {index, to} (0 = next to run)".into()),
+        },
         "ai.queueCancel" => {
             let all = params.get("current").and_then(Value::as_bool).unwrap_or(false);
             Ok(json!({"removed": cancel_queue(all)}))
@@ -2330,10 +2656,12 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut close = false;
     let mut run = false;
     let mut add_to_queue = false;
+    let mut save_edit = false;
     let mut pick: Option<Pick> = None;
     let mut learn_style = false;
     let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
-    egui::Window::new(d.kind.title())
+    let title = if d.queue_edit.is_some() { format!("{} (queued task)", d.kind.title()) } else { d.kind.title().to_string() };
+    egui::Window::new(title)
         .id(egui::Id::new(("ei-ai-dialog", d.kind.id())))
         .collapsible(false)
         .resizable(false)
@@ -2943,17 +3271,26 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Speak => "Speak",
                     _ => "Run",
                 };
-                if d.kind == Kind::Topic {
-                    let q = ui.button("Add to Queue");
-                    elems.push((format!("{p}.queue"), q.rect, "Add to Queue".into()));
-                    if q.clicked() {
-                        add_to_queue = true;
+                if d.queue_edit.is_some() {
+                    // editing a waiting task: save it back into its place in the queue
+                    let o = ui.add(egui::Button::new(egui::RichText::new("Save Changes").color(egui::Color32::WHITE)).fill(app.tokens.accent));
+                    elems.push((format!("{p}.saveQueued"), o.rect, "Save Changes".into()));
+                    if o.clicked() {
+                        save_edit = true;
                     }
-                }
-                let o = ui.add(egui::Button::new(egui::RichText::new(run_label).color(egui::Color32::WHITE)).fill(app.tokens.accent));
-                elems.push((format!("{p}.run"), o.rect, "Run".into()));
-                if o.clicked() {
-                    run = true;
+                } else {
+                    if d.kind != Kind::Voice {
+                        let q = ui.button("Add to Queue").on_hover_text("Wait in the queue (AI ▸ AI Jobs) and run after the tasks before it");
+                        elems.push((format!("{p}.queue"), q.rect, "Add to Queue".into()));
+                        if q.clicked() {
+                            add_to_queue = true;
+                        }
+                    }
+                    let o = ui.add(egui::Button::new(egui::RichText::new(run_label).color(egui::Color32::WHITE)).fill(app.tokens.accent));
+                    elems.push((format!("{p}.run"), o.rect, "Run".into()));
+                    if o.clicked() {
+                        run = true;
+                    }
                 }
             });
         });
@@ -3067,8 +3404,21 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 app.ui.status = format!("Added to the queue ({n} waiting; AI ▸ AI Jobs shows it)");
                 ctx.data_mut(|m| m.insert_temp(jobs_open_id(), true));
                 d.error.clear();
-                d.topic.clear(); // ready for the next topic
-                d.hook_line.clear();
+                if d.kind == Kind::Topic {
+                    d.topic.clear(); // ready for the next topic
+                    d.hook_line.clear();
+                }
+                d.out.clear(); // (a fresh automatic output name for the next one)
+            }
+            Err(e) => d.error = e,
+        }
+    }
+    if save_edit && let Some(uid) = d.queue_edit {
+        match save_queue_edit(&mut d, uid) {
+            Ok(()) => {
+                app.ui.status = "Queued task updated".into();
+                ctx.data_mut(|m| m.insert_temp(jobs_open_id(), true));
+                close = true;
             }
             Err(e) => d.error = e,
         }
@@ -3789,7 +4139,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let (waiting, queue_paused, queue_note) = {
         let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
         load_queue(&mut q);
-        (q.items.iter().map(|i| i.title.clone()).collect::<Vec<_>>(), q.paused, q.note.clone())
+        (q.items.iter().map(|i| (i.title.clone(), i.uid, i.params.is_some())).collect::<Vec<_>>(), q.paused, q.note.clone())
     };
     let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
     let mut cancel: Option<u64> = None;
@@ -3801,9 +4151,23 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut copy: Option<String> = None;
     let mut queue_action: Option<&str> = None;
     let mut remove_waiting: Option<usize> = None;
+    let mut move_item: Option<(usize, usize)> = None;
+    let mut edit_item: Option<u64> = None;
+    let mut import_file = false;
+    let mut export_file = false;
     let mut clear = false;
     egui::Window::new("AI Jobs").id(egui::Id::new("ei-ai-jobs")).open(&mut open).default_width(600.0).resizable(true).show(ctx, |ui| {
-        // the queue (Video from Topic): what waits, and its controls
+        // the queue: what waits (in the order it will run), and its controls
+        ui.horizontal(|ui| {
+            let i = ui.button("Import Tasks…").on_hover_text("Add tasks from a queue file (.json)");
+            elems.push(("ai.jobs.queue.import".into(), i.rect, "Import Tasks…".into()));
+            import_file = i.clicked();
+            if !waiting.is_empty() {
+                let e = ui.button("Export Queue…").on_hover_text("Save the waiting tasks as a queue file (.json)");
+                elems.push(("ai.jobs.queue.export".into(), e.rect, "Export Queue…".into()));
+                export_file = e.clicked();
+            }
+        });
         if !waiting.is_empty() || queue_paused {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -3827,11 +4191,36 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 if !queue_note.is_empty() {
                     ui.weak(&queue_note);
                 }
-                for (k, t) in waiting.iter().enumerate() {
+                let n = waiting.len();
+                for (k, (t, uid, editable)) in waiting.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.label(format!("{}. {t}", k + 1));
+                        let id = format!("ai.jobs.queue.{k}");
+                        let up = ui.add_enabled(k > 0, egui::Button::new("↑").small()).on_hover_text("Run earlier");
+                        elems.push((format!("{id}.up"), up.rect, "Up".into()));
+                        if up.clicked() {
+                            move_item = Some((k, k - 1));
+                        }
+                        let down = ui.add_enabled(k + 1 < n, egui::Button::new("↓").small()).on_hover_text("Run later");
+                        elems.push((format!("{id}.down"), down.rect, "Down".into()));
+                        if down.clicked() {
+                            move_item = Some((k, k + 1));
+                        }
+                        let top = ui.add_enabled(k > 0, egui::Button::new("Top").small()).on_hover_text("Run next");
+                        elems.push((format!("{id}.top"), top.rect, "Top".into()));
+                        if top.clicked() {
+                            move_item = Some((k, 0));
+                        }
+                        let e = ui
+                            .add_enabled(*editable, egui::Button::new("Edit").small())
+                            .on_hover_text("Change its settings")
+                            .on_disabled_hover_text("Queued by an older EI: remove it and queue it again to edit");
+                        elems.push((format!("{id}.edit"), e.rect, "Edit".into()));
+                        if e.clicked() {
+                            edit_item = Some(*uid);
+                        }
                         let r = ui.small_button("Remove");
-                        elems.push((format!("ai.jobs.queue.{k}.remove"), r.rect, "Remove".into()));
+                        elems.push((format!("{id}.remove"), r.rect, "Remove".into()));
                         if r.clicked() {
                             remove_waiting = Some(k);
                         }
@@ -3968,6 +4357,33 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     {
         app.ui.status = "Running it again: it continues from what was already made".into();
     }
+    if let Some((from, to)) = move_item {
+        move_waiting(from, to);
+    }
+    if let Some(uid) = edit_item
+        && let Err(e) = edit_waiting(ctx, uid)
+    {
+        app.ui.status = e;
+    }
+    if import_file && let Some(path) = app.hooks.pick_open_file.as_mut().and_then(|f| f("Queue file", &["json"])) {
+        app.ui.status =
+            match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| e.to_string())) {
+                Ok(v) => import_summary(import_tasks(&v)),
+                Err(e) => format!("Could not read the queue file: {e}"),
+            };
+    }
+    if export_file {
+        let name = format!("EI queue {}.json", waiting.len());
+        if let Some(path) = app.hooks.pick_save_as.as_mut().and_then(|f| f("Queue file", &["json"], &name)) {
+            app.ui.status = match serde_json::to_string_pretty(&export_tasks())
+                .map_err(|e| e.to_string())
+                .and_then(|t| std::fs::write(&path, t).map_err(|e| e.to_string()))
+            {
+                Ok(()) => format!("Queue saved: {path}"),
+                Err(e) => format!("Could not save the queue: {e}"),
+            };
+        }
+    }
     if let Some(k) = remove_waiting {
         let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
         if k < q.items.len() {
@@ -4008,6 +4424,18 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         jobs().lock().unwrap_or_else(PoisonError::into_inner).retain(|j| j.status == Status::Running);
     }
     ctx.data_mut(|m| m.insert_temp(jobs_open_id(), open));
+}
+
+/// The result of an import, for the status line.
+fn import_summary((added, dup, errors): (usize, usize, Vec<String>)) -> String {
+    let mut out = format!("Queue: {added} task(s) added");
+    if dup > 0 {
+        out += &format!(", {dup} already waiting");
+    }
+    if !errors.is_empty() {
+        out += &format!("; {} not added: {}", errors.len(), errors.join("; "));
+    }
+    out
 }
 
 /// "45s", "3m 20s", "1h 05m".
@@ -4347,6 +4775,108 @@ mod tests {
     }
 
     #[test]
+    fn settings_round_trip_for_every_tool() {
+        let dir = std::env::temp_dir().join(format!("ei-ai-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("long.mov");
+        std::fs::write(&v, b"x").unwrap();
+        let vs = v.to_string_lossy().to_string();
+        let cases = [
+            (
+                Kind::Topic,
+                json!({"topic": "GTA 6 map", "voice": "nxstory-a1", "seconds": 45, "language": "hinglish", "aspect": "vertical", "hookLine": "Big news.",
+                "youtube": true, "soundDesign": true, "musicSource": "ai", "resolution": "4k", "takes": 3}),
+            ),
+            (Kind::Clips, json!({"input": vs, "clipType": "sections", "count": 3, "aspect": "same", "hook": false, "captionMode": "off"})),
+            (Kind::Clips, json!({"input": vs, "count": 7, "pace": "fast", "titleMode": "intro", "llm": "none"})),
+            (Kind::Voiceover, json!({"input": vs, "clips": [vs], "hook": "teaser", "niche": "travel", "captions": true, "pace": "slow"})),
+            (Kind::Music, json!({"music": vs, "clips": [vs], "length": 20, "look": "warm", "soundDesign": true})),
+            (Kind::Speak, json!({"notes": "[Awe 0.8] Hi.", "voice": "mac:Rishi", "soundDesign": true, "licence": "personal"})),
+            (Kind::Split, json!({"input": vs, "clipLength": 30, "quality": "high"})),
+            (Kind::Audio, json!({"clips": [vs], "format": "flac", "start": "5", "normalize": true})),
+            (Kind::Hooks, json!({"niches": "gaming, travel", "countries": "IN", "hookClaude": false})),
+        ];
+        for (kind, params) in cases {
+            let mut a = Draft::from_params(kind, &params);
+            let first = a.engine_args().unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            let mut b = Draft::from_params(kind, &a.to_params());
+            assert_eq!(b.engine_args().unwrap(), first, "{kind:?} keeps every setting through the queue");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn older_queue_items_become_editable() {
+        // a task exactly as the previous EI saved it
+        let args: Vec<String> = [
+            "topic",
+            "gta 6 Pre-order records",
+            "--seconds",
+            "60",
+            "--language",
+            "en",
+            "--aspect",
+            "vertical",
+            "--writer",
+            "claude",
+            "--fresh",
+            "--hook-line",
+            "GTA 6 just broke a record no game has ever touched",
+            "--voice",
+            "nxstory-a1",
+            "--takes",
+            "2",
+            "--pace",
+            "medium",
+            "--sources",
+            "free",
+            "cards",
+            "youtube",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let p = params_from_args("topic", &args).unwrap();
+        let mut d = Draft::from_params(Kind::Topic, &p);
+        assert_eq!(d.engine_args().unwrap(), args, "the same command after editing nothing");
+        assert!(params_from_args("topic", &["topic".into(), "x".into(), "--unknown".into()]).is_none());
+        assert!(params_from_args("clips", &args).is_none());
+        // an export file is checked task by task
+        let file = json!({"tasks": [
+            {"command": "ai.topic", "title": "Pre-order records", "params": p},
+            {"command": "ai.topic", "args": args},
+            {"command": "ai.nothing", "params": {}},
+            {"command": "ai.topic", "params": {"topic": ""}},
+            {"command": "ai.voice", "params": {"name": "x"}},
+        ]});
+        let r = check_tasks(&file);
+        assert!(
+            r[0].is_ok() && r[1].is_ok() && r[2].is_err() && r[3].is_err() && r[4].is_err(),
+            "{:?}",
+            r.iter().map(|x| x.as_ref().err()).collect::<Vec<_>>()
+        );
+        assert_eq!(r[0].as_ref().map(|t| t.0.clone()).unwrap(), "Pre-order records");
+        assert!(check_tasks(&json!({}))[0].is_err());
+        let mut v = vec![1, 2, 3, 4];
+        assert!(move_in(&mut v, 3, 0) && v == [4, 1, 2, 3]);
+        assert!(move_in(&mut v, 0, 9) && v == [1, 2, 3, 4]);
+        assert!(!move_in(&mut v, 7, 0));
+    }
+
+    /// Opt-in: EI_QUEUE_FILE=/path/to/queue.json checks that every task in a queue file imports.
+    #[test]
+    fn a_queue_file_imports() {
+        let Ok(path) = std::env::var("EI_QUEUE_FILE") else { return };
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for r in check_tasks(&v) {
+            match r {
+                Ok(t) => eprintln!("ok: {}", t.0),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    #[test]
     fn queue_items_round_trip() {
         let it = QueueItem {
             title: "Video from Topic: GTA 6".into(),
@@ -4354,6 +4884,8 @@ mod tests {
             steps: vec![vec!["python".into(), "ei_engine.py".into(), "topic".into(), "GTA 6".into()]],
             import: false,
             cwd: Some("/tmp".into()),
+            params: None,
+            uid: 1,
         };
         let v = json!({"items": [it.clone()], "paused": true});
         let back: Vec<QueueItem> = serde_json::from_value(v["items"].clone()).unwrap();

@@ -1,5 +1,21 @@
 # Progress
 
+## 2026-11-14: a queue for every tool, editable, reorderable, importable
+
+- Every tool's dialog has **Add to Queue** (except Voice Clone, which records with you there). Tasks run one at a
+  time, in queue order.
+- **Edit** reopens a waiting task's dialog with its settings, and **Save Changes** puts it back in its place. Each
+  queue item keeps its settings in the control channel's own format (`Draft::to_params`, the reverse of
+  `from_params`). Tasks saved by the previous EI are converted from their command line.
+- **↑ / ↓ / Top** reorder the waiting tasks.
+- **Import Tasks… / Export Queue…** read and write queue files:
+  `{"ei_queue": 1, "tasks": [{"command": "ai.topic", "title": "…", "params": {…}}]}`. Each task is checked like
+  its dialog would, a task already waiting is skipped, and problems are listed per task.
+- Control channel: `ai.<tool> {…, "queue": true}`, `ai.queueImport {path | tasks}`, `ai.queueExport {path?}`,
+  `ai.queueMove {index, to}`, `ai.queue {paused?}`, `ai.queueCancel {current?}`.
+- The 6 waiting videos of 2026-11-13 were exported (without stopping the running ones) to
+  `~/Movies/EI/Queue/queue-export-2026-11-13-2355.json`, and all 6 pass the import check.
+
 ## 2026-11-14: why a topic video took an hour and failed; faster, resumable, queued, with progress
 
 - **The failure:** two parallel render workers made the same shot (the cold open reused a photo), shared one

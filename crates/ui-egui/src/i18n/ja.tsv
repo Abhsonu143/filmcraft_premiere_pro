@@ -3502,6 +3502,9 @@
 	Retry AI Job	AIジョブを再試行
 	AI Queue	AIキュー
 	Cancel AI Queue	AIキューをキャンセル
+	Import AI Queue Tasks	AIキューにタスクを読み込む
+	Export AI Queue	AIキューを書き出す
+	Move AI Queue Task	AIキューのタスクを移動
 	Based on FilmCraft…	FilmCraft について…
 	A video editor with local AI auto-editing, based on the open-source FilmCraft editor.	ローカル AI による自動編集を備えた、オープンソースの FilmCraft エディターをもとにした動画編集ソフトです。
 	Ai	AI
