@@ -18,10 +18,10 @@
   <launchable type="desktop-id">ai.storyteller.filmcraft.desktop</launchable>
   <icon type="stock">ai.storyteller.filmcraft</icon>
   <!-- Only url types known to appstream 0.15 (Ubuntu 22.04, where CI validates): no vcs-browser. -->
-  <url type="homepage">https://getartcraft.com/apps/filmcraft</url>
+  <url type="homepage">https://github.com/Abhsonu143/filmcraft_premiere_pro</url>
   <url type="bugtracker">https://github.com/storytold/filmcraft/issues</url>
   <url type="help">https://github.com/storytold/filmcraft</url>
-  <url type="contact">https://discord.gg/artcraft</url>
+  <url type="contact">https://github.com/Abhsonu143/filmcraft_premiere_pro/issues</url>
   <categories>
     <category>AudioVideo</category>
     <category>Video</category>

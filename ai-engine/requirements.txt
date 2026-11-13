@@ -1,0 +1,21 @@
+# Magic Movie Maker — AI engine (Python, runs locally on Apple Silicon; no API keys).
+# System dependency: ffmpeg with VideoToolbox + libass (`brew install ffmpeg`).
+numpy>=1.26
+pillow>=10.0
+# Speech-to-text on the Apple GPU (MIT licence; Whisper weights are MIT).
+mlx-whisper>=0.4
+# CLIP footage search (MIT licence; ViT-B-32 "openai" weights are MIT).
+torch>=2.2
+open_clip_torch>=2.24
+# Interchange with FilmCraft / Resolve (Apache-2.0); used to validate .otio files.
+opentimelineio>=0.17
+# Local language model for clip titles and ratings (MIT); models: Qwen (Apache-2.0, except Qwen2.5-3B).
+mlx-lm>=0.30
+# Apple Vision face detection for reframing (MIT; macOS only).
+pyobjc-framework-Vision>=10; sys_platform == "darwin"
+# YouTube captions for talking-style profiles (Unlicense); only captions are downloaded.
+yt-dlp>=2026.10
+# Voice cloning: Chatterbox Multilingual v3 on MLX (MIT code and weights; Hindi + English).
+mlx-audio>=0.6.5
+# Speaker verification (ECAPA, Apache-2.0) to check a cloned take sounds like you.
+speechbrain>=1.1
