@@ -494,7 +494,9 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
     elif find_hook:  # hooks for exactly this topic, looked up online now
         import hooks as hk
 
-        found = hk.find_for_topic(data.get("title_idea") or topic, niche, language, facts=facts_notes(data)[:3000], model=model if writer == "claude" else None)
+        # search with your own words (a link: the researched topic), not the script's title idea
+        query = data.get("topic") or data.get("title_idea") or topic if re.match(r"https?://", topic.strip()) else topic
+        found = hk.find_for_topic(query, niche, language, facts=facts_notes(data)[:3000], model=model if writer == "claude" else None)
     res = sw.write_script(data.get("title_idea") or topic, str(folder / name), niche=niche, seconds=seconds, language=language, tone=tone,
                           notes=facts_notes(data), style=style, backend=writer, model=model if writer == "claude" else None, pace_voice=clone,
                           hook_line=hook_line, found_hooks=found)
