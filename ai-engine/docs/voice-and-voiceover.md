@@ -144,3 +144,21 @@ Only clone your own voice, or a voice you have permission to use.
   English words in Devanagari or numbers as digits; the first version of the check did not, so 6 correct lines
   were regenerated for nothing.
 - Speed on this 8 GB Mac with other apps open: about 30 s per take of 4–5 s. "Takes per line: 1" halves the time.
+
+## Voiceover edit: hook and craft (2026-11-13)
+
+`narrate_craft.py`, option **Hook** in AI ▸ Voiceover Edit (`--hook auto|teaser|text|both|off`, `--niche`):
+
+- **Cold open:** the narration's strongest line (peak emotion, 1.5–4.5 s) plays first with quick cuts, then a white
+  flash into the start. The voice track, the lines, the captions and the score all move with it.
+- **On-screen hook:** 3–7 big words on a dark box for the first ~2.8 s, written for this video from the hook
+  library (Claude; the first line when Claude is not available).
+- **Fast open:** the first ~3 s are cut quicker, on the best-looking, moving footage.
+- **Pacing by emotion:** shot length × 0.6 (rage, euphoria) … × 1.35 (calm).
+- **Punch-ins:** on the script's emphasis words and on peak lines.
+- **Transitions:** a dissolve into calm, sad, nostalgic or loving parts and at real pauses; a white flash into
+  intense parts; cuts otherwise.
+- **Slow motion:** 0.5× on awe, wonder, triumph, sorrow and love lines when the footage is 50/60 fps.
+- **No repeats:** a shot that looks like the same scene as the one before it is avoided (CLIP picture similarity).
+- **Framing:** vertical and square crops follow the subject when the footage has another shape.
+- **Samples:** `~/Movies/EI/Voiceover/`, where `v1 before` is the previous editor and `v2`/`v3` are the new one.

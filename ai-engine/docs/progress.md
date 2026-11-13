@@ -1,5 +1,26 @@
 # Progress
 
+## 2026-11-13 (night): subtle music, 4K, hook library, voiceover craft
+
+- **Music felt, not noticed:**
+  - The bed sits about 16 dB under the voice in pauses (it was 5 dB).
+  - Under speech it ducks further, with the speech band (250 Hz – 4 kHz) carved out more than the lows and highs.
+  - It comes up only before the first word, after reveals, in long pauses and at the end.
+  - Effects are quieter too.
+- **4K in every tool and shape:** `--resolution 4k` gives 3840x2160, 2160x3840, 2160x2160, or the video's own shape at
+  3840 on the long side. Bitrate is 40 Mb/s at 4K.
+- **Hook library:** see `docs/hooks.md`. AI ▸ Hook Library… shows it and syncs it.
+- **Voiceover edit (`narrate_craft.py`):**
+  - cold open on the strongest line, then a white flash into the start;
+  - an on-screen hook from the library;
+  - fast first cuts on the best-looking moving shots;
+  - shot length by emotion;
+  - punch-ins on emphasised words and peak lines;
+  - dissolves into calm parts and flashes into intense ones;
+  - slow motion on awe, triumph and sorrow lines with 50/60 fps footage;
+  - vertical and square framing that follows the subject;
+  - `--hook auto|teaser|text|both|off`.
+
 ## 2026-11-13 (evening): sound design: emotions you can hear (optional)
 
 - New: `emotions.py` (the 42 emotions: mood family, voice delivery, effects), `sfx.py` (9 effects made in code),

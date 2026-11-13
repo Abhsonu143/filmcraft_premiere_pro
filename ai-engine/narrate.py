@@ -346,6 +346,18 @@ def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], fir
     return short
 
 
+def same_scene(clips: list[dict], a: dict, b: dict) -> float:
+    """0 … 1: how much two windows look like the same scene (CLIP picture similarity above 0.85)."""
+    ea, eb = clips[a["clip"]].get("emb", ()), clips[b["clip"]].get("emb", ())
+    if not len(ea) or not len(eb):
+        return 0.0
+    va, vb = ea[min(len(ea) - 1, int(a["in"]))], eb[min(len(eb) - 1, int(b["in"]))]
+    na, nb = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+    if na < 1e-6 or nb < 1e-6:
+        return 0.0
+    return float(np.clip((float(va @ vb) / (na * nb) - 0.85) / 0.12, 0.0, 1.0))
+
+
 def choose(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_order: bool, beam: int = 12) -> list[dict]:
     """The whole edit at once (beam search over slots). A still (photo, title card: `clip["still"]`)
     is one moment: shown once, never in two slots."""
@@ -371,6 +383,9 @@ def choose(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_
                 if prev is not None:
                     if prev["clip"] == c["clip"]:
                         s -= 0.6 if slot["part"] == 0 else 0.2  # same clip again (softer inside one long line)
+                    look_alike = same_scene(clips, prev, c)
+                    if look_alike > 0:
+                        s -= 0.9 * look_alike  # the same place again right away reads as a repeat
                     if prev["size"] == c["size"] and len(picks) >= 2 and picks[-2]["size"] == c["size"]:
                         s -= 0.2  # three of the same shot size in a row
                     if story_order and clips[c["clip"]]["created"] and clips[prev["clip"]]["created"]:
@@ -410,7 +425,8 @@ def build_shots(slots: list[dict], picks: list[dict], lines: list[dict], clips: 
             prev_sec = lines[slots[i - 1]["line"]].get("section")
             cur_sec = lines[s["line"]].get("section")
             gap = lines[s["line"]]["start"] - lines[slots[i - 1]["line"]]["end"]
-            if (cur_sec and prev_sec and cur_sec != prev_sec) or gap > 0.9:
+            _ = (prev_sec, cur_sec)
+            if gap > 0.9:  # a real pause in the narration (mood changes: narrate_craft.treat)
                 sh["transition_in"] = {"type": "dissolve", "frames": int(round(0.4 * fps))}
         shots.append(sh)
     if shots:
@@ -614,7 +630,9 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
         if (captions and words) or hook_text:
             import captions as cap
 
-            ass = cap.build_ass(words if captions else [], hook_text, W, H, total, caption_style, "intro" if hook_text else "off")
+            ass = cap.build_ass(words if captions else [], None, W, H, total, caption_style, "off")
+            if hook_text:
+                ass = nc.hook_ass(ass, hook_text, W, H)
             if any(re.search(r"[ऀ-ॿ]", w["word"]) for w in words) or re.search(r"[ऀ-ॿ]", hook_text or ""):
                 ass = ass.replace("Avenir Next Heavy", "Kohinoor Devanagari").replace("Avenir Next Demi Bold", "Kohinoor Devanagari")
             af = Path(tmp) / "c.ass"

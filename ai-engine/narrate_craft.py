@@ -191,12 +191,14 @@ def treat(shots: list[dict], slots: list[dict], lines: list[dict], clips_by_path
             sh["speed"] = 0.5
             n_slow += 1
         # transitions at a change of mood
-        if k > 0 and sl.get("part", 0) == 0 and not sh.get("transition_in"):
+        if k > 0 and sl.get("part", 0) == 0:
             prev = lines[slots[k - 1]["line"]]
             pf = emotion_of(prev)[2]["family"]
             if prev.get("teaser") and not ln.get("teaser"):
                 sh["transition_in"] = {"type": "fadewhite", "frames": int(round(0.3 * fps))}  # out of the cold open
                 n_trans += 1
+            elif sh.get("transition_in"):
+                pass  # (a pause in the narration already dissolves)
             elif e["family"] != pf and e["family"] in CALM_FAMILIES:
                 sh["transition_in"] = {"type": "dissolve", "frames": int(round(0.5 * fps))}
                 n_trans += 1
@@ -237,3 +239,20 @@ def frame_for_shape(shots: list[dict], W: int, H: int, fps: float, clips_by_path
             if active:
                 shots[k]["active"] = active
     return n
+
+
+def hook_ass(ass: str, text: str, W: int, H: int, seconds: float = 2.8) -> str:
+    """Adds the on-screen hook to an ASS file: big bold words on a dark box in the upper third,
+    popping in, gone after ~2.8 s."""
+    import captions as cap
+
+    devanagari = bool(re.search(r"[ऀ-ॿ]", text))
+    font = "Kohinoor Devanagari" if devanagari else "Avenir Next Heavy"
+    fs = int(min(W, H) * (0.095 if H > W else 0.07))
+    style = (f"Style: Hook,{font},{fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H99000000,1,0,0,0,100,100,0,0,3,{max(10, fs // 4)},0,8,"
+             f"{W // 9},{W // 9},{int(H * (0.2 if H > W else 0.12))},1")
+    ev = (f"Dialogue: 2,{cap.ass_time(0.05)},{cap.ass_time(seconds)},Hook,,0,0,0,,"
+          f"{{\\fad(60,260)\\fscx70\\fscy70\\t(0,170,\\fscx104\\fscy104)\\t(170,260,\\fscx100\\fscy100)}}{cap.esc(text)}")
+    ev = ev.replace("\\\\", "\\")
+    out = re.sub(r"(\[V4\+ Styles\]\nFormat:[^\n]*\n)", lambda m: m.group(1) + style + "\n", ass, count=1)
+    return out.rstrip("\n") + "\n" + ev + "\n"

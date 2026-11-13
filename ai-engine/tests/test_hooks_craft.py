@@ -99,3 +99,20 @@ def test_cold_open_voice(tmp_path):
     assert abs(dur - (10 + head)) < 0.05 and abs(head - (3.18 + 0.35)) < 0.01
     assert out[0]["teaser"] and out[0]["start"] == 0.06 and out[0]["words"][0]["start"] == np.float64(6.0 - 5.44)
     assert out[1]["start"] == round(head, 3) and out[3]["start"] == round(5.5 + head, 3)
+
+
+def test_same_scene_is_not_shown_twice_in_a_row():
+    import narrate as nr
+
+    e1 = np.zeros((10, 4), np.float32)
+    e1[:, 0] = 1.0
+    e2 = e1.copy()  # another clip of the same place
+    e3 = np.zeros((10, 4), np.float32)
+    e3[:, 1] = 1.0  # somewhere else
+    clips = [{"emb": e1, "created": 0}, {"emb": e2, "created": 0}, {"emb": e3, "created": 0}]
+    assert nr.same_scene(clips, {"clip": 0, "in": 1}, {"clip": 1, "in": 2}) == 1.0
+    assert nr.same_scene(clips, {"clip": 0, "in": 1}, {"clip": 2, "in": 2}) == 0.0
+    slots = [{"start": 0, "end": 3, "line": 0, "part": 0}, {"start": 3, "end": 6, "line": 1, "part": 0}]
+    cands = [[{"clip": 0, "in": 0.0, "score": 2.0, "size": "wide"}],
+             [{"clip": 1, "in": 0.0, "score": 2.0, "size": "aerial"}, {"clip": 2, "in": 0.0, "score": 1.5, "size": "aerial"}]]
+    assert [p["clip"] for p in nr.choose(slots, cands, clips, story_order=False)] == [0, 2]
