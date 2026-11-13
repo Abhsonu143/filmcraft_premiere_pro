@@ -83,7 +83,7 @@ def test_good_quad_rejects_triangles():
 def test_batch_keeps_going_and_names_outputs(tmp_path, monkeypatch):
     made = []
 
-    def fake_make(clip, folder, out, orientation="horizontal", relight=1.0, fps=30.0, recording=None):
+    def fake_make(clip, folder, out, orientation="horizontal", relight=1.0, fps=30.0, recording=None, bezel=0.0):
         if "bad" in clip:
             raise tl.AutocutError("cannot read")
         made.append(out)
@@ -96,3 +96,13 @@ def test_batch_keeps_going_and_names_outputs(tmp_path, monkeypatch):
     assert res["failed"][0]["clip"].endswith("bad.mp4")
     with pytest.raises(tl.AutocutError):
         tl.make_batch([str(tmp_path / "bad.mp4")], str(tmp_path), str(tmp_path / "out"))
+
+
+def test_bezel_thin_sides_wider_bottom():
+    img = np.full((720, 1280, 3), 200, np.uint8)
+    out = tl.add_bezel(img, 0.012)
+    assert out.shape == img.shape
+    b = round(0.012 * 1280)
+    assert out[360, 2].max() < 40 and out[360, 1280 - 3].max() < 40 and out[3, 640].max() < 40  # dark sides and top
+    assert out[720 - b - 3, 640].max() < 40  # the bottom bezel is wider than the sides
+    assert out[720 - 2 * b - 4, 640].min() > 150 and out[b + 3, b + 3].min() > 150  # the picture inside

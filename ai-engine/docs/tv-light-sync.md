@@ -37,6 +37,13 @@ AI ▸ TV Light Sync ▸ **Check corners** (or **Re-check**) opens its own windo
 - **Preview Alignment:** shows six moments across the recording with the tracked outline, so drift is visible
   at a glance. The first time, it analyses the recording.
 
+## TV bezel (optional)
+
+**TV bezel** draws a thin, near-black frame around your clip: 1.2% of its width on the left, top and right, and
+twice that at the bottom, like a real TV, with a faint highlight on the inner edge. Use it when you place the
+corners on the TV's **outer** edge (the whole TV), so the bezel comes from EI and fits your clip exactly. Leave
+it off when the corners sit on the picture inside the real bezel. Engine option: `--bezel 0.012`.
+
 ## Several clips
 
 Add as many clips as you like. They run one after another in one background job (AI ▸ AI Jobs shows

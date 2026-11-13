@@ -209,6 +209,7 @@ struct Draft {
     // TV light sync
     tv_folder: String,
     relight: f64,
+    tv_bezel: bool,
     tv: TvState,
 }
 
@@ -358,6 +359,7 @@ impl Draft {
             fresh: false,
             tv_folder: setting_str("tv_recordings").unwrap_or_default(),
             relight: 1.0,
+            tv_bezel: false,
             tv: TvState::default(),
         }
     }
@@ -461,6 +463,7 @@ impl Draft {
             d.clips.push(d.input.trim().to_string()); // one clip given as "input"
         }
         d.relight = num("relight", d.relight);
+        d.tv_bezel = flag("bezel", d.tv_bezel);
         if let Some(a) = p.get("takesFile").and_then(Value::as_str) {
             d.script = a.to_string();
         }
@@ -723,6 +726,9 @@ impl Draft {
                 push(&mut a, "--recordings", self.tv_folder.trim());
                 push(&mut a, "--orientation", orientation);
                 push(&mut a, "--relight", &format!("{}", self.relight));
+                if self.tv_bezel {
+                    push(&mut a, "--bezel", "0.012"); // thin; the bottom is twice as wide
+                }
                 push(&mut a, "--out-dir", self.out.trim());
             }
             Kind::Voice => {
@@ -1823,6 +1829,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             ui.label("Backlight matching");
                             let r = ui.add(egui::Slider::new(&mut d.relight, 0.0..=1.0).text("recolour the glow"));
                             elems.push((format!("{p}.relight"), r.rect, d.relight.to_string()));
+                            ui.end_row();
+                            ui.label("TV bezel");
+                            let r = ui
+                                .checkbox(&mut d.tv_bezel, "Draw a thin bezel around the clip (wider at the bottom); place the corners on the TV's outer edge");
+                            elems.push((format!("{p}.bezel"), r.rect, d.tv_bezel.to_string()));
                             ui.end_row();
                             ui.label("Recordings");
                             ui.vertical(|ui| tv_recordings_ui(ui, &mut d, &p, &mut elems));
@@ -3241,6 +3252,10 @@ mod tests {
         }
         assert!(a.windows(2).any(|w| w[0] == "--out-dir" && w[1].ends_with("EI on TV")), "{a:?}");
         assert!(d.out.ends_with("EI on TV"), "{}", d.out);
+        assert!(!a.contains(&"--bezel".to_string()), "no bezel unless asked");
+        let with_bezel =
+            Draft::from_params(Kind::Tv, &json!({"clips": [c1.to_string_lossy()], "recordings": dir.to_string_lossy(), "bezel": true})).engine_args().unwrap();
+        assert!(with_bezel.windows(2).any(|w| w == ["--bezel", "0.012"]));
         // one clip given the old way ("input") still works
         let a = Draft::from_params(Kind::Tv, &json!({"input": c1.to_string_lossy(), "recordings": dir.to_string_lossy(), "aspect": "vertical"}))
             .engine_args()

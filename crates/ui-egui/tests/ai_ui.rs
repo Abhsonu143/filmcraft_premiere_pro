@@ -150,7 +150,7 @@ fn ai_menu_and_dialogs() {
                 "run",
             ],
         ),
-        ("tv", &["clips.add", "clips.addFolder", "recordings", "aspect.horizontal", "aspect.vertical", "relight", "out", "run"]),
+        ("tv", &["clips.add", "clips.addFolder", "recordings", "aspect.horizontal", "aspect.vertical", "relight", "bezel", "out", "run"]),
         (
             "topic",
             &[

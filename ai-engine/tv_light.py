@@ -474,8 +474,28 @@ def screen_match(clip_lin: np.ndarray, a: dict) -> np.ndarray:
     return np.clip(clip_lin * (target / np.maximum(lum, 1e-4))[..., None], 0, 1)
 
 
+def add_bezel(img: np.ndarray, side: float, bottom_factor: float = 2.0) -> np.ndarray:
+    """The picture inside a thin dark TV bezel: `side` = bezel width as a fraction of the picture
+    width (left, top, right), the bottom bezel `bottom_factor` times wider, like a real TV. A faint
+    lighter line on the bezel's inner edge catches the light as a real bezel does."""
+    import cv2
+
+    h, w = img.shape[:2]
+    b = max(1, int(round(side * w)))
+    bb = max(b, int(round(side * bottom_factor * w)))
+    out = np.empty_like(img)
+    out[:] = (14, 13, 12)  # near-black, slightly warm (BGR)
+    # a soft vertical gradient: real bezels are a touch lighter at the top edge
+    grad = np.linspace(1.25, 0.85, h, dtype=np.float32)[:, None, None]
+    out = np.clip(out.astype(np.float32) * grad, 0, 255).astype(np.uint8)
+    inner = cv2.resize(img, (w - 2 * b, h - b - bb), interpolation=cv2.INTER_AREA)
+    out[b : h - bb, b : w - b] = inner
+    cv2.rectangle(out, (b - 1, b - 1), (w - b, h - bb), (38, 38, 40), 1)  # the inner edge highlight
+    return out
+
+
 def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], out: str, W: int, H: int, fps: float = 30.0,
-           relight: float = 1.0) -> None:
+           relight: float = 1.0, bezel: float = 0.0) -> None:
     """Background = the chosen recording moments; glow relit to the clip; the clip on the TV."""
     import cv2
 
@@ -549,6 +569,8 @@ def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], 
             # the clip on the TV
             c = np.frombuffer(buf, np.uint8).reshape(ch, cw, 3)
             c = srgb(screen_match(lin(c), a))
+            if bezel > 0:  # the corners sit on the TV's outer edge: draw the bezel inside them
+                c = add_bezel(c, bezel)
             c = cv2.GaussianBlur(c, (0, 0), 0.6)
             M = cv2.getPerspectiveTransform(src_quad, np.float32(quad))
             warped = cv2.warpPerspective(c, M, (W, H), flags=cv2.INTER_LINEAR)
@@ -785,7 +807,7 @@ def preview(path: str, out_png: str, n: int = 6) -> dict:
 
 
 def make_batch(clips: list[str], folder: str, out_dir: str, orientation: str = "horizontal", relight: float = 1.0,
-               recording: str | None = None) -> dict:
+               recording: str | None = None, bezel: float = 0.0) -> dict:
     """Several clips one after another (the room analysis is shared, so later clips go faster).
     A clip that fails is reported and the rest carry on."""
     outd = Path(out_dir).expanduser().resolve()
@@ -799,7 +821,7 @@ def make_batch(clips: list[str], folder: str, out_dir: str, orientation: str = "
             n += 1
         log(f"clip {k}/{len(clips)}: {Path(c).name}")
         try:
-            make(c, folder, str(out), orientation, relight, recording=recording)
+            make(c, folder, str(out), orientation, relight, recording=recording, bezel=bezel)
             done.append(str(out))
         except AutocutError as e:
             log(f"{Path(c).name} failed: {e}")
@@ -811,11 +833,13 @@ def make_batch(clips: list[str], folder: str, out_dir: str, orientation: str = "
 
 
 def make(clip: str, folder: str, out: str, orientation: str = "horizontal", relight: float = 1.0, fps: float = 30.0,
-         recording: str | None = None) -> dict:
+         recording: str | None = None, bezel: float = 0.0) -> dict:
     """Clip on the TV of the best-matching recording of that orientation, backlight matched."""
     ac.require_tools()
     if orientation not in SIZES:
         raise AutocutError("orientation must be horizontal or vertical")
+    if not 0.0 <= bezel <= 0.05:
+        raise AutocutError("bezel must be between 0 (none) and 0.05 (5% of the picture width)")
     if not Path(clip).is_file():
         raise AutocutError(f"clip not found: {clip}")
     recs = [r for r in scan(folder) if r["orientation"] == orientation and (not recording or Path(r["path"]).name == Path(recording).name)]
@@ -843,7 +867,7 @@ def make(clip: str, folder: str, out: str, orientation: str = "horizontal", reli
     outp = Path(out).resolve()
     outp.parent.mkdir(parents=True, exist_ok=True)
     part = outp.with_name(outp.stem + ".part.mp4")
-    render(clip, a, path, tgt, str(part), W, H, fps, relight)
+    render(clip, a, path, tgt, str(part), W, H, fps, relight, bezel)
     part.replace(outp)
     plan = {"version": 1, "clip": str(Path(clip).resolve()), "recording": r["path"], "orientation": orientation, "match": round(cost, 3),
             "path": path.tolist(), "relight": relight}
@@ -876,6 +900,9 @@ def add_args(sub) -> None:
     p.add_argument("--orientation", default="horizontal", choices=list(SIZES))
     p.add_argument("--relight", type=float, default=1.0, help="0 = only choose matching moments, 1 = also recolour the glow fully")
     p.add_argument("--recording", help="use this recording only")
+    p.add_argument("--bezel", type=float, default=0.0,
+                   help="draw a thin TV bezel around the clip (fraction of its width; 0.012 is thin; the bottom is twice as wide). "
+                        "Use it when the corners are placed on the TV's outer edge")
     _ = argparse
 
 
@@ -906,9 +933,9 @@ def run_args(a) -> dict:
         if not clips:
             raise AutocutError("none of the clips were found")
         if len(clips) == 1 and a.out and not a.out_dir:
-            return make(clips[0], a.recordings, a.out, a.orientation, a.relight, recording=a.recording)
+            return make(clips[0], a.recordings, a.out, a.orientation, a.relight, recording=a.recording, bezel=a.bezel)
         out_dir = a.out_dir or (str(Path(a.out).parent) if a.out else str(Path(clips[0]).parent / "EI on TV"))
-        res = make_batch(clips, a.recordings, out_dir, a.orientation, a.relight, recording=a.recording)
+        res = make_batch(clips, a.recordings, out_dir, a.orientation, a.relight, recording=a.recording, bezel=a.bezel)
         res["failed"] = missing + res.get("failed", [])
         return res
     raise AutocutError(f"unknown command {a.cmd}")
