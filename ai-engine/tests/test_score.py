@@ -155,3 +155,20 @@ def test_mix_ducks_music_under_the_voice(tmp_path, monkeypatch):
     assert len(music_only) == 10 * sr
     j = json.dumps(plan)
     assert "impact" in j
+
+
+def test_calibration_is_fair_to_weak_moods():
+    # CLAP likes "heroic" much more than "wonder" for everything; calibration measures each mood
+    # against its own average, so the most wonder-like track still becomes wonder
+    fams = list(em.FAMILIES)
+    tracks = []
+    for k in range(10):
+        sims = {f: 0.10 for f in fams}
+        sims["heroic"] = 0.30 + 0.01 * k
+        sims["wonder"] = 0.05 + (0.08 if k == 3 else 0.0)
+        tracks.append({"heard": {"sims": sims, "_vocals": 0.1 if k != 5 else 0.9}, "family": "?"})
+    ml.calibrate(tracks)
+    assert tracks[3]["family"] == "wonder"
+    assert max(range(10), key=lambda k: ml.fit(tracks[k], "wonder")) == 3
+    # a song with singing suits a narration less than the same music without
+    assert tracks[5]["moods"]["_vocals"] == 0.9 and ml.fit(tracks[5], "heroic") < 0.3 * tracks[5]["moods"]["heroic"] + 1e-9

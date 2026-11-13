@@ -41,7 +41,8 @@ Every line carries one of 42 emotions plus an intensity (0–1):
     really has. Licence "Safe for monetized videos" takes only CC0, CC BY and CC BY-SA. Credits go into
     `<video>.credits.txt` and Video from Topic's description.
   - **My music folder:** your tracks, sorted by mood by listening.
-  - **AI-composed score:** MusicGen small composes a cue per mood on this Mac (slow; personal use only).
+  - **AI-composed score:** MusicGen small composes a 15 s cue per mood on this Mac, looped for longer acts (~50 s per cue once the 1.2 GB model is
+    downloaded; personal use only).
 - **Transitions:** a surprise, triumph, rage or fear after a calmer act is a hard cut: the music stops for a beat,
   an impact lands on the first word, and the new cue starts on it (with a riser before it when the act was
   building). Other acts crossfade in the pause between lines.

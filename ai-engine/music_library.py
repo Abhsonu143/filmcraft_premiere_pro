@@ -156,44 +156,65 @@ def _clap_worker(paths: list[str], texts: list[str]) -> list[list[float] | None]
                 ai = proc(audio=clips, sampling_rate=48000, return_tensors="pt")
                 aemb = _emb(model.get_audio_features(**ai))
                 aemb = aemb / aemb.norm(dim=-1, keepdim=True)
-                logits = 30.0 * aemb.mean(dim=0, keepdim=True) @ temb.T  # soft: a track can suit two moods
-                k = len(texts) - len(VOCAL_TEXTS)
-                moods = torch.softmax(logits[:, :k], dim=-1)[0].tolist()
-                vocals = torch.softmax(logits[:, k:], dim=-1)[0].tolist()
-                out.append(moods + [vocals[1]])
+                a = aemb.mean(dim=0, keepdim=True)
+                a = a / a.norm(dim=-1, keepdim=True)
+                out.append((a @ temb.T)[0].tolist())  # raw similarities; calibrated over the library later
             except Exception:  # one unreadable track must not lose the others
                 out.append(None)
     return out
 
 
 def listen(paths: list[str]) -> list[dict | None]:
-    """Mood of each track by listening (CLAP): {family: probability}, cached; None when CLAP is unavailable."""
+    """What each track sounds like (CLAP), cached: {"sims": {family: similarity}, "_vocals": p}.
+    None when CLAP is unavailable. Turn sims into moods with `calibrate`."""
     fams = list(em.FAMILIES)
     res: list[dict | None] = [None] * len(paths)
     todo = []
+
+    def cache_of(pth: str) -> Path:
+        return ac.CACHE_DIR / "mood" / f"{ac.file_key(pth, 'clap-v4')}.json"
+
     for i, pth in enumerate(paths):
-        cache = ac.CACHE_DIR / "mood" / f"{ac.file_key(pth, 'clap-v3')}.json"
-        if cache.is_file():
-            res[i] = json.loads(cache.read_text())
+        if cache_of(pth).is_file():
+            res[i] = json.loads(cache_of(pth).read_text())
         else:
             todo.append(i)
     if todo:
         log(f"listening to {len(todo)} track(s) for their mood (CLAP; the first use downloads it, ~600 MB)")
         try:
-            probs = ac.run_isolated(_clap_worker, [paths[i] for i in todo], [em.FAMILIES[f]["listen"] for f in fams] + VOCAL_TEXTS)
+            sims = ac.run_isolated(_clap_worker, [paths[i] for i in todo], [em.FAMILIES[f]["listen"] for f in fams] + VOCAL_TEXTS)
         except Exception as e:
             log(f"mood listening unavailable ({type(e).__name__}); using the sound features")
             return res
-        for i, pr in zip(todo, probs):
-            if pr is None:
+        for i, sv in zip(todo, sims):
+            if sv is None:
                 continue
-            d = {f: round(float(x), 4) for f, x in zip(fams, pr)}
-            d["_vocals"] = round(float(pr[-1]), 4)  # singing under a narration clashes
-            cache = ac.CACHE_DIR / "mood" / f"{ac.file_key(paths[i], 'clap-v3')}.json"
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(json.dumps(d))
+            k = len(fams)
+            voc = np.exp(30 * np.asarray(sv[k:], dtype=np.float64))
+            d = {"sims": {f: round(float(x), 5) for f, x in zip(fams, sv[:k])}, "_vocals": round(float(voc[1] / voc.sum()), 4)}
+            cache_of(paths[i]).parent.mkdir(parents=True, exist_ok=True)
+            cache_of(paths[i]).write_text(json.dumps(d))
             res[i] = d
     return res
+
+
+def calibrate(tracks: list[dict]) -> None:
+    """Moods from similarities, fair to every mood: some descriptions attract CLAP more than others
+    (nothing ever scored "wonder" before), so each mood is measured against its average over the
+    library, then turned into probabilities. Sets track["moods"] and track["family"]."""
+    fams = list(em.FAMILIES)
+    heard = [t for t in tracks if (t.get("heard") or {}).get("sims")]
+    if not heard:
+        return
+    S = np.asarray([[t["heard"]["sims"].get(f, 0.0) for f in fams] for t in heard])
+    bias = S.mean(axis=0) if len(heard) >= 8 else np.zeros(len(fams))
+    for t, row in zip(heard, S):
+        z = 60.0 * (row - bias)
+        p = np.exp(z - z.max())
+        p /= p.sum()
+        t["moods"] = {f: round(float(x), 4) for f, x in zip(fams, p)}
+        t["moods"]["_vocals"] = t["heard"].get("_vocals", 0.0)
+        t["family"] = fams[int(np.argmax(p))]
 
 
 def fit(track: dict, fam: str) -> float:
@@ -240,10 +261,10 @@ def scan_folder(folder: str) -> list[dict]:
             out.append(rec)
         except (AutocutError, OSError, ValueError) as e:
             log(f"skipped {p.name} ({e})")
-    for rec, moods in zip(out, listen([r["file"] for r in out])):
-        if moods:
-            rec["moods"] = moods
-            rec["family"] = max((k for k in moods if not k.startswith("_")), key=moods.get)
+    for rec, h in zip(out, listen([r["file"] for r in out])):
+        rec["heard"] = h
+    lib_tracks = [t for t in load_index()["tracks"] if (t.get("heard") or {}).get("sims")]
+    calibrate(out + (lib_tracks if len(out) < 8 else []))  # a small folder is measured against the library
     log(f"{len(out)} track(s) in your music folder: " + ", ".join(f"{k} {v}" for k, v in sorted(_count(out).items())))
     return out
 
@@ -328,12 +349,12 @@ def fetch_family(fam: str, licence: str = "monetized", want: int = PER_FAMILY, l
     under the mood it really has, so a miss for one mood is a find for another."""
     lib = lib or library_dir()
     idx = load_index(lib)
-    unheard = [t for t in idx["tracks"] if "_vocals" not in (t.get("moods") or {}) and Path(t["file"]).is_file()]
-    if unheard:  # tracks from before EI could listen: listen once and remember
-        for t, moods in zip(unheard, listen([t["file"] for t in unheard])):
-            t["moods"] = moods
-            if moods:
-                t["family"] = max((k for k in moods if not k.startswith("_")), key=moods.get)
+    unheard = [t for t in idx["tracks"] if not (t.get("heard") or {}).get("sims") and Path(t["file"]).is_file()]
+    if unheard:  # tracks from before EI could listen this way: listen once and remember
+        for t, h in zip(unheard, listen([t["file"] for t in unheard])):
+            t["heard"] = h
+    calibrate(idx["tracks"])
+    if unheard:
         save_index(idx, lib)
 
     def suits(t: dict) -> bool:  # by what it sounds like (whatever it was searched for)
@@ -368,20 +389,23 @@ def fetch_family(fam: str, licence: str = "monetized", want: int = PER_FAMILY, l
                     log(f"skipped “{r['title']}” ({e})")
                     dst.unlink(missing_ok=True)
             heard = listen([str(d) for _, d, _ in got]) if got else []
-            for (r, dst, f), moods in zip(got, heard):
+            new = []
+            for (r, dst, f), h in zip(got, heard):
                 fam_heard, v, a = classify(f)
-                if moods:
-                    fam_heard = max((k for k in moods if not k.startswith("_")), key=moods.get)
-                elif em.family_distance(fam, fam_heard) <= 1.25:
+                if not h and em.family_distance(fam, fam_heard) <= 1.25:
                     fam_heard = fam
-                rec = {"file": str(dst), "family": fam_heard, "searched": fam, "valence": v, "arousal": a, "source": "internet", "moods": moods,
+                rec = {"file": str(dst), "family": fam_heard, "searched": fam, "valence": v, "arousal": a, "source": "internet", "heard": h,
                        "safe": r["code"] in SAFE_LICENCES, **{k: r[k] for k in ("id", "title", "author", "license", "page", "provider")}, **f}
                 idx["tracks"].append(rec)
+                new.append(rec)
+            calibrate(idx["tracks"])
+            for rec in new:
+                fam_heard = rec["family"]
                 if usable(rec) and suits(rec):
                     have.append(rec)
-                    log(f"music for {fam}: “{r['title']}” by {r['author'] or 'unknown'} ({r['license']})")
+                    log(f"music for {fam}: “{rec['title']}” by {rec['author'] or 'unknown'} ({rec['license']})")
                 else:
-                    log(f"“{r['title']}” sounds {fam_heard}, not {fam}: kept in the library for {fam_heard}")
+                    log(f"“{rec['title']}” sounds {fam_heard}, not {fam}: kept in the library for {fam_heard}")
             save_index(idx, lib)
     return have
 
@@ -418,9 +442,10 @@ def _musicgen_worker(jobs: list[dict]) -> list[dict]:
 
 
 def ai_cue(fam: str, seconds: float, seed: int = 0, lib: Path | None = None) -> dict:
-    """A cue composed for a family (at most 30 s; longer acts loop it), cached."""
+    """A cue composed for a family, cached. At most 15 s (longer acts loop it with crossfades):
+    MusicGen slows down sharply with length (15 s in ~50 s, 30 s in ~13 min on an M3)."""
     lib = lib or library_dir()
-    seconds = float(np.clip(seconds, 8, 30))
+    seconds = float(np.clip(seconds, 8, 15))
     seconds = float(np.ceil(seconds / 5) * 5)
     dst = lib / "ai" / f"{fam}-{int(seconds)}s-{seed}.wav"
     idx = load_index(lib)
