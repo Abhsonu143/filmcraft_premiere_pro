@@ -107,15 +107,33 @@ def parse_timed(text: str) -> list[dict]:
     return out
 
 
+def js_runtime() -> list[str]:
+    """YouTube needs a JavaScript runtime to unlock every format (without one, yt-dlp may miss the
+    best ones): deno, node or bun, wherever it is installed (apps started from the Finder do not
+    see nvm's PATH)."""
+    import shutil
+
+    for name in ("deno", "node", "bun"):
+        found = shutil.which(name)
+        if not found:
+            cands = sorted(Path.home().glob(f".nvm/versions/node/*/bin/{name}"), reverse=True) if name == "node" else []
+            cands += [Path(p) for p in (f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}", str(Path.home() / f".{name}/bin/{name}"))]
+            found = next((str(c) for c in cands if Path(c).is_file()), None)
+        if found:
+            return ["--js-runtimes", f"{name}:{found}"]
+    return []
+
+
 def yt_dlp_cmd() -> list[str]:
     """yt-dlp from EI's own Python (kept current with pip; YouTube changes often), else the system one."""
     import importlib.util
 
     # --force-ipv4: on networks where IPv6 does not route, every request would wait ~30 s first
+    # (and a JavaScript runtime: YouTube hides formats from yt-dlp without one)
     if importlib.util.find_spec("yt_dlp") is not None:
-        return [sys.executable, "-m", "yt_dlp", "--force-ipv4"]
+        return [sys.executable, "-m", "yt_dlp", "--force-ipv4", *js_runtime()]
     if shutil.which("yt-dlp"):
-        return ["yt-dlp", "--force-ipv4"]
+        return ["yt-dlp", "--force-ipv4", *js_runtime()]
     raise AutocutError("yt-dlp is not installed (AI Engine Setup installs it)")
 
 

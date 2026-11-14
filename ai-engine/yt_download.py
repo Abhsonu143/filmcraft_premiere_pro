@@ -39,20 +39,9 @@ FILE_RE = re.compile(r"^EI_FILE (.+)$")
 
 
 def js_runtime() -> list[str]:
-    """YouTube needs a JavaScript runtime to unlock every format (without one, yt-dlp may miss the
-    best ones): deno, node or bun, wherever it is installed (apps started from the Finder do not
-    see nvm's PATH)."""
-    import shutil
+    import script_writer as sw
 
-    for name in ("deno", "node", "bun"):
-        found = shutil.which(name)
-        if not found:
-            cands = sorted(Path.home().glob(f".nvm/versions/node/*/bin/{name}"), reverse=True) if name == "node" else []
-            cands += [Path(p) for p in (f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}", str(Path.home() / f".{name}/bin/{name}"))]
-            found = next((str(c) for c in cands if Path(c).is_file()), None)
-        if found:
-            return ["--js-runtimes", f"{name}:{found}"]
-    return []
+    return sw.js_runtime()
 
 
 def is_playlist(url: str) -> bool:
@@ -73,7 +62,7 @@ def build_cmd(url: str, out_dir: Path, *, audio_only: bool, audio_format: str = 
     # a playlist: a folder named after it, files numbered in playlist order; one video: no folder
     playlist = is_playlist(url)
     template = str(out_dir / ("%(playlist_title)s/%(playlist_index)03d - %(title)s.%(ext)s" if playlist else "%(title)s.%(ext)s"))
-    cmd = sw.yt_dlp_cmd() + js_runtime() + [
+    cmd = sw.yt_dlp_cmd() + [
         "--ignore-errors", "--no-overwrites", "--newline", "--no-colors", "--windows-filenames",
         "--download-archive", str(out_dir / ".downloaded.txt"),
         "--yes-playlist" if playlist else "--no-playlist",
