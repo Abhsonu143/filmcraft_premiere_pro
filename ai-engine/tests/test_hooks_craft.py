@@ -254,3 +254,19 @@ def test_topic_hints_reach_research_and_script():
     assert "creator's hints" in p and "- focus on the NDA" in p and "- keep it respectful" in p
     assert "hints" not in tv.research_prompt("x", 60, "en", None, "")
     assert tv.hints_block("") == ""
+
+
+def test_topic_feedback_is_kept_and_reaches_the_writer(tmp_path):
+    import json
+
+    import topic_video as tv
+
+    assert tv.feedback_items(tmp_path, "") == []
+    tv.feedback_items(tmp_path, "the hook is boring")
+    tv.feedback_items(tmp_path, "the hook is boring")  # (the same again is not added twice)
+    items = tv.feedback_items(tmp_path, "too many numbers, explain the NDA simply")
+    assert [i["text"] for i in items] == ["the hook is boring", "too many numbers, explain the NDA simply"]
+    sp = tmp_path / "x.script.json"
+    sp.write_text(json.dumps({"segments": [{"text": "Old line one."}, {"text": "Old line two."}]}))
+    b = tv.feedback_block("- the hook is boring", sp)
+    assert "fix ALL of it" in b and "Old line one. Old line two." in b and tv.feedback_block("", sp) == ""

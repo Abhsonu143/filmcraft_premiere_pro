@@ -43,11 +43,12 @@ import autocut as ac
 import footage as fo
 import music as mu
 import render as rd
+import dynamic_cut as dc
 import voiceover_cut as vc
 from autocut import AutocutError, log
 
 ASPECTS = {"horizontal": (1920, 1080), "vertical": (1080, 1920), "square": (1080, 1080)}
-PACE = {"fast": 0.6, "medium": 1.0, "slow": 1.6}
+PACE = {"fast": 0.6, "medium": 1.0, "slow": 1.6, "dynamic": 1.0}
 SPEEDS = [0.5, 0.75, 1.0, 1.5, 2.0]
 
 
@@ -157,10 +158,13 @@ def target_len(energy: float, pace: float) -> float:
     return pace * 3.6 * (0.8 / 3.6) ** float(np.clip(energy, 0, 1))
 
 
-def cut_points(w: dict, fps: float, pace: float, min_len: float = 0.45) -> list[dict]:
-    """Choose cut beats by dynamic programming; returns slots with frame ranges and context."""
+def cut_points(w: dict, fps: float, pace, min_len: float = 0.45, gaps: list[float] | None = None) -> list[dict]:
+    """Choose cut beats by dynamic programming; returns slots with frame ranges and context.
+    `pace`: a number, or a function of time (Dynamic); `gaps`: pauses between phrases, also cut points."""
     L = w["length"]
-    beats = [b for b in w["beats"] if 0.05 < b < L - min_len]
+    pace_at = pace if callable(pace) else (lambda t, p=float(pace): p)
+    gap_set = {round(g, 4) for g in (gaps or []) if 0.05 < g < L - min_len}
+    beats = sorted({b for b in w["beats"] if 0.05 < b < L - min_len} | gap_set)
     energy = np.asarray(w["energy"] or [0.5])
     onset = np.asarray(w["onset"] or [0.0])
     on_n = (onset - onset.min()) / max(1e-6, float(np.ptp(onset))) if len(onset) else onset
@@ -187,6 +191,8 @@ def cut_points(w: dict, fps: float, pace: float, min_len: float = 0.45) -> list[
         reward = 0.0
         if bi is not None:
             reward = 0.9 * float(on_n[bi]) + (0.45 if bi in down else 0.0)
+        if round(tj, 4) in gap_set:
+            reward += 0.9  # a line or phrase ends here
         for i in range(j - 1, -1, -1):
             d = tj - pts[i]
             if d < min_len and j != n - 1:
@@ -196,7 +202,7 @@ def cut_points(w: dict, fps: float, pace: float, min_len: float = 0.45) -> list[
             if any(i < k < j for k in forced):
                 break  # never skip over a section change
             mid_e = e_at((tj + pts[i]) / 2)
-            tl = target_len(mid_e, pace)
+            tl = target_len(mid_e, pace_at((tj + pts[i]) / 2))
             # the bar before a drop accelerates
             if any(0 < dr - tj < 2.2 for dr in drops):
                 tl *= 0.55
@@ -345,6 +351,7 @@ def candidates(slot: dict, clips: list[dict], fps: float, progress: float, opts:
                     pk = peak_offset(c, float(st), src) / sp
                     sl = {**sl, "_peak_match": max(0.0, 1 - abs(pk - slot["ref_peak"]) / 0.6)}
                 sc = unary(sl, c, f, sp, progress, opts, float(st))
+                sc += dc.window_extra(sl, ci, c, float(st), src, sp, opts)
                 if best is None or sc > best["score"]:
                     best = {"clip": ci, "in": float(st), "speed": sp, "src": src, "score": sc, "f": f}
         if best:
@@ -682,6 +689,8 @@ def song_effects(video: Path, plan: dict, opts: dict) -> None:
 
 
 def plan_music(args) -> dict:
+    import dynamic_cut as dynamic
+
     ac.require_tools()
     audio = str(Path(args.music).resolve())
     if not ac.probe(audio).has_audio:
@@ -695,19 +704,44 @@ def plan_music(args) -> dict:
     fps = float(args.fps)
     width, height = ac.sized(*ASPECTS[args.aspect], getattr(args, "resolution", "1080p"))
     clips = load_footage(vc.collect_clips(args.clips), use_clip=not args.no_clip)
-    slots = cut_points(w, fps, PACE.get(args.pace, 1.0))
+    dyn = args.pace == "dynamic"
+    # what was said about earlier versions of this edit (all of it still applies)
+    notes = dynamic.add_feedback(args.out, getattr(args, "feedback", "") or "")
+    fb = dynamic.interpret([n["text"] for n in notes], getattr(args, "writer", "claude")) if notes else None
+    base = PACE.get(args.pace, 1.0) * ({"faster": 0.75, "slower": 1.3}.get(fb["pace"], 1.0) if fb else 1.0)
+    effects = args.effects
+    if fb and fb["effects"] == "less":
+        effects = {"full": "subtle", "subtle": "none"}.get(effects, effects)
+    elif fb and fb["effects"] == "more":
+        effects = {"none": "subtle", "subtle": "full"}.get(effects, effects)
+    gaps = dynamic.phrase_gaps(audio, start, length) if dyn else []
+    if dyn:
+        dynamic.clip_signals(clips, speech=True)
+        log(f"dynamic pace: shot lengths follow the music's busy and sparse parts" + (f" and {len(gaps)} phrase pause(s)" if gaps else ""))
+    else:
+        dynamic.clip_signals(clips, speech=False)  # (scene changes inside clips: never cut across one)
+    slots = cut_points(w, fps, dynamic.pace_profile(w, base) if dyn else base, gaps=gaps)
     med = float(np.median([c["dur"] for c in clips]))
     slots = split_long(slots, w, fps, max(1.2, min(6.0, 1.8 * med)))
-    log(f"music {m['tempo']:.0f} BPM, using {start:.1f}–{start + length:.1f}s; {len(slots)} shots, sections {[s['level'] + ('*' if s.get('drop') else '') for s in w['sections']]}")
-    opts = {"order": args.order, "effects": args.effects, "width": width, "height": height}
-    seq = sequence(slots, clips, fps, opts)
+    log(f"music {m['tempo']:.0f} BPM, using {start:.1f}–{start + length:.1f}s; {len(slots)} music slots, sections {[s['level'] + ('*' if s.get('drop') else '') for s in w['sections']]}")
+    seed = int(getattr(args, "seed", None) or time.time() * 1000) % 1_000_000_007
+    plan_path = Path(args.out).with_name(Path(args.out).stem + ".montage.json")
+    avoid = dynamic.previous_windows(plan_path)
+    if avoid:
+        log(f"variety: {len(avoid)} shot(s) of the previous version are avoided this time")
+    opts = {"order": args.order, "effects": effects, "width": width, "height": height, "fps": fps, "dynamic": dyn, "seed": seed,
+            "avoid": avoid, "fb": dynamic.feedback_scorer(clips, fb["more"], fb["less"]) if fb else None}
+    if dyn:
+        seq, slots = dynamic.sequence_dynamic(sys.modules[__name__], slots, clips, fps, opts)
+    else:
+        seq = sequence(slots, clips, fps, opts)
     add_effects(seq, slots, clips, fps, opts)
     shots = finish(seq, slots, clips, fps)
     return {
         "version": 2, "mode": "montage", "kind": "music", "engine": "director",
         "width": width, "height": height, "fps": fps, "look": args.look,
         "audio": {"path": audio, "start": round(start, 3), "fade_in": 0.05 if start < 0.1 else 0.25, "fade_out": 1.0, "normalize": True},
-        "tempo": m["tempo"], "sections": w["sections"],
+        "tempo": m["tempo"], "sections": w["sections"], "pace": args.pace, "seed": seed, "feedback": [n["text"] for n in notes],
         "clips": [{"path": c["path"], "duration": c["dur"]} for c in clips],
         "shots": shots,
     }
@@ -813,6 +847,9 @@ def add_music_args(pm: argparse.ArgumentParser, workers: bool = True) -> None:
     pm.add_argument("--aspect", default="vertical", choices=sorted(ASPECTS))
     pm.add_argument("--pace", default="medium", choices=sorted(PACE))
     pm.add_argument("--music-start", default="auto")
+    pm.add_argument("--feedback", default="", help="what did not come out right last time (kept with the edit; every retry follows all of it)")
+    pm.add_argument("--seed", type=int, help="the same seed gives the same edit (default: a new one each run)")
+    pm.add_argument("--writer", default="claude", choices=["claude", "rules"], help="who reads the feedback")
     add_common(pm, workers)
     import score
 

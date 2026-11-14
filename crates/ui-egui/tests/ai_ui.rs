@@ -136,6 +136,7 @@ fn ai_menu_and_dialogs() {
                 "aspect.vertical",
                 "aspect.square",
                 "pace.fast",
+                "pace.dynamic",
                 "musicStart",
                 "look",
                 "effects",

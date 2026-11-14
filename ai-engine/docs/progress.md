@@ -462,3 +462,26 @@ Full description: `docs/voice-and-voiceover.md`.
   names and units like PS5, 4K, 1080p stay).
 - A UI test assumed no saved music folder (`sound_design_and_speak_arguments`); it now names a
   missing folder explicitly.
+
+## 2026-11-14: Dynamic pace for music edits, a different edit every run, feedback on retry
+
+- Auto Edit Clips to Music ▸ Pace ▸ Dynamic (`--pace dynamic`, `dynamic_cut.py`): the target shot
+  length changes with how busy the music is (density of strong onsets, with the energy, sections,
+  drops and hits as before); pauses between sung or spoken phrases (silencedetect on the voice
+  band) become cut points with a reward, also off the beat. Per clip (cached): scene changes inside
+  clips (frame-difference spikes; no shot crosses one — this now applies to every pace), dialogue
+  (Whisper small once per clip, Whisper's no-speech/compression filters against game sound): a
+  shot keeps a sentence whole or leaves it out and never speeds dialogue; silent footage (drone):
+  smooth long moves preferred for long calm shots. Shot lengths are then chosen with the footage:
+  a beam search over slot positions may join 2–3 calm slots of one section into one shot when the
+  footage carries it (a whole sentence, one long move).
+- Variety: every run has a new seed (small random nudges in close calls; `--seed` repeats an
+  edit) and avoids the windows the previous version of the same edit used. Measured on the GTA
+  clips: a second run reused 5 of 43 moments.
+- Feedback (AI Jobs ▸ Edit & Retry ▸ "What should be better?", `--feedback`): music edits keep it in
+  `<out>.feedback.json`; Claude turns all of it into pace (faster/slower), footage to show more or
+  less of (CLIP z-scores over every clip, added to the shot score), fewer/more effects. Measured:
+  "too many shots of cars and roads, more close-up faces, too hectic" gave 34 shots instead of 43,
+  19 with faces, 8 with roads. Video from Topic keeps it in the folder's feedback.json; the script
+  writer gets all of it first, with the earlier script; feedback about facts redoes the research
+  with it.

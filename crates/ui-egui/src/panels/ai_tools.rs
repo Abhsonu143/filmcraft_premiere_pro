@@ -260,6 +260,10 @@ struct Draft {
     find_hook: bool,
     /// Editing this waiting queue item (its id) instead of starting a new job.
     queue_edit: Option<u64>,
+    /// Opened from AI Jobs ▸ Edit & Retry: the dialog asks what should be better.
+    retrying: bool,
+    /// What did not come out right last time (music edits, Video from Topic): kept with the result.
+    feedback: String,
     // download from YouTube
     url: String,
     /// "video", "audio" (audio only) or "subs" (subtitles only)
@@ -447,6 +451,8 @@ impl Draft {
             hook_line: String::new(),
             find_hook: false,
             queue_edit: None,
+            retrying: false,
+            feedback: String::new(),
             url: String::new(),
             dl_mode: "video",
             subs_claude: true,
@@ -513,7 +519,10 @@ impl Draft {
         d.mono = p.get("mono").and_then(Value::as_bool).unwrap_or(false);
         d.normalize = p.get("normalize").and_then(Value::as_bool).unwrap_or(false);
         d.aspect = pick("aspect", &ASPECTS.map(|a| a.0), d.aspect);
-        d.pace = pick("pace", &PACES.map(|a| a.0), d.pace);
+        d.pace = pick("pace", &MUSIC_PACES.map(|a| a.0), d.pace);
+        if let Some(v) = s("feedback") {
+            d.feedback = v;
+        }
         d.preset = pick("preset", &PRESETS.map(|a| a.0), d.preset);
         d.look = pick("look", &LOOKS.map(|a| a.0), d.look);
         d.effects = pick("effects", &EFFECTS.map(|a| a.0), d.effects);
@@ -701,6 +710,7 @@ impl Draft {
         m.insert("youtube".into(), json!(self.src_youtube));
         m.insert("fresh".into(), json!(self.fresh));
         m.insert("hints".into(), json!(self.hints));
+        m.insert("feedback".into(), json!(self.feedback));
         m.insert("recordings".into(), json!(self.tv_folder));
         m.insert("relight".into(), json!(self.relight));
         m.insert("bezel".into(), json!(self.tv_bezel));
@@ -778,6 +788,11 @@ impl Draft {
         Ok(())
     }
 
+    /// Dynamic is for music edits; the other tools take the medium pace for it.
+    fn pace_for_engine(&self) -> &'static str {
+        if self.pace == "dynamic" && self.kind != Kind::Music { "medium" } else { self.pace }
+    }
+
     /// The chosen platforms of Thumbnails, Titles & Hashtags (engine ids).
     fn platform_ids(&self) -> Vec<&'static str> {
         PLATFORMS.iter().zip(self.pk_platforms).filter(|(_, on)| *on).map(|((id, _), _)| *id).collect()
@@ -830,7 +845,10 @@ impl Draft {
                 push(&mut a, "--out", self.out.trim());
                 push(&mut a, "--length", &format!("{}", self.length));
                 push(&mut a, "--aspect", self.aspect);
-                push(&mut a, "--pace", self.pace);
+                push(&mut a, "--pace", self.pace_for_engine());
+                if !self.feedback.trim().is_empty() {
+                    push(&mut a, "--feedback", self.feedback.trim());
+                }
                 let start = self.music_start.trim();
                 if !start.is_empty() && start != "auto" {
                     match start.parse::<f64>() {
@@ -877,7 +895,7 @@ impl Draft {
                 if sections {
                     a.push("--sections".into());
                 } else {
-                    push(&mut a, "--pace", self.pace);
+                    push(&mut a, "--pace", self.pace_for_engine());
                     if !self.music.trim().is_empty() && !self.sound {
                         push(&mut a, "--music", self.music.trim());
                     }
@@ -929,7 +947,7 @@ impl Draft {
                 }
                 push(&mut a, "--out", self.out.trim());
                 push(&mut a, "--aspect", if self.aspect == "same" { "horizontal" } else { self.aspect });
-                push(&mut a, "--pace", self.pace);
+                push(&mut a, "--pace", self.pace_for_engine());
                 push(&mut a, "--describe", self.describe);
                 push(&mut a, "--llm", self.llm);
                 if self.captions {
@@ -1009,6 +1027,9 @@ impl Draft {
                 if !self.hints.trim().is_empty() {
                     push(&mut a, "--hints", self.hints.trim());
                 }
+                if !self.feedback.trim().is_empty() {
+                    push(&mut a, "--feedback", self.feedback.trim());
+                }
                 if !self.hook_line.trim().is_empty() {
                     push(&mut a, "--hook-line", self.hook_line.trim()); // yours wins over a search
                 } else if self.find_hook {
@@ -1017,7 +1038,7 @@ impl Draft {
                 if self.make_video {
                     push(&mut a, "--voice", self.voice.trim());
                     push(&mut a, "--takes", &format!("{}", self.takes.round()));
-                    push(&mut a, "--pace", self.pace);
+                    push(&mut a, "--pace", self.pace_for_engine());
                     a.push("--sources".into());
                     for (on, k) in [(self.src_free, "free"), (self.src_cards, "cards"), (self.src_youtube, "youtube")] {
                         if on {
@@ -1237,6 +1258,13 @@ const QUALITIES: [(&str, &str); 5] = [
 ];
 const ASPECTS: [(&str, &str); 4] = [("same", "Same as reference"), ("horizontal", "Horizontal 16:9"), ("vertical", "Vertical 9:16"), ("square", "Square 1:1")];
 const PACES: [(&str, &str); 3] = [("fast", "Fast (~1 s shots)"), ("medium", "Medium (~2 s)"), ("slow", "Slow (~3 s)")];
+/// Auto Edit Clips to Music also cuts dynamically: shot lengths follow the music and the footage.
+const MUSIC_PACES: [(&str, &str); 4] = [
+    ("dynamic", "Dynamic (follows the beats, intensity, phrases, scene changes and dialogue)"),
+    ("fast", "Fast (~1 s shots)"),
+    ("medium", "Medium (~2 s)"),
+    ("slow", "Slow (~3 s)"),
+];
 const LOOKS: [(&str, &str); 6] = [
     ("cinematic", "Cinematic (contrast, teal & orange, vignette)"),
     ("natural", "Natural (true colours, matched exposure)"),
@@ -2527,6 +2555,7 @@ fn params_from_args(kind: &str, args: &[String]) -> Option<Value> {
             "--out-dir" => ("out", json!(val), 2),
             "--hook-line" => ("hookLine", json!(val), 2),
             "--hints" => ("hints", json!(val), 2),
+            "--feedback" => ("feedback", json!(val), 2),
             "--voice" => ("voice", json!(val), 2),
             "--pace" => ("pace", json!(val), 2),
             "--music" => ("music", json!(val), 2),
@@ -2777,6 +2806,8 @@ fn edit_job(ctx: &egui::Context, id: u64) -> Result<(), String> {
         .ok_or("EI did not keep this job's settings (it ran before Edit & Retry existed): start it again from the AI menu.")?;
     let mut d = Draft::from_params(kind, &params);
     d.fresh = false; // (continue from what is still right)
+    d.retrying = true;
+    d.feedback.clear(); // (the earlier feedback is kept with the result; this is what is new)
     ctx.data_mut(|m| m.insert_temp(draft_id(), Some(d)));
     Ok(())
 }
@@ -3224,6 +3255,28 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
             let max_h = (ui.ctx().content_rect().height() - 190.0).max(240.0);
             egui::ScrollArea::vertical().max_height(max_h).auto_shrink([true, true]).show(ui, |ui| {
                 egui::Grid::new("ei-ai-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    if (d.retrying || !d.feedback.is_empty()) && matches!(d.kind, Kind::Music | Kind::Topic) {
+                        ui.label(egui::RichText::new("What should be better?").strong());
+                        ui.vertical(|ui| {
+                            let r = ui.add(
+                                egui::TextEdit::multiline(&mut d.feedback)
+                                    .hint_text(if d.kind == Kind::Music {
+                                        "e.g. too many car shots, more faces; too hectic at the start; less zooming"
+                                    } else {
+                                        "e.g. the hook is boring; explain the NDA more simply; fewer numbers; more gameplay footage"
+                                    })
+                                    .desired_rows(3)
+                                    .desired_width(380.0),
+                            );
+                            elems.push((format!("{p}.feedback"), r.rect, d.feedback.clone()));
+                            ui.label(
+                                egui::RichText::new("Kept with the result: this retry and every later one follow it, along with what you said before.")
+                                    .small()
+                                    .weak(),
+                            );
+                        });
+                        ui.end_row();
+                    }
                     if d.kind.needs_input() {
                         ui.label(d.kind.input_label());
                         if path_row(ui, &mut d.input, &format!("{p}.input"), "a file", &mut elems) {
@@ -3315,7 +3368,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
                             ui.end_row();
                             ui.label("Pace");
-                            radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
+                            radio_row(ui, &mut d.pace, &MUSIC_PACES, &format!("{p}.pace"), &mut elems);
                             ui.end_row();
                             ui.label("Music start (s)");
                             let r =
@@ -5535,6 +5588,27 @@ mod tests {
         assert!(a.contains(&"--sound-design".to_string()) && !a.contains(&"--music".to_string()), "{a:?}");
         let mut off = Draft::from_params(Kind::Clips, &json!({"input": clip.to_string_lossy()}));
         assert!(!off.engine_args().unwrap().contains(&"--sound-design".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_pace_and_feedback_arguments() {
+        let dir = std::env::temp_dir().join(format!("ei-dyn-args-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let v = dir.join("a.mp4");
+        std::fs::write(&v, b"x").unwrap();
+        let vs = v.to_string_lossy().to_string();
+        let mut m = Draft::from_params(Kind::Music, &json!({"music": vs, "clips": [vs], "pace": "dynamic", "feedback": " more faces ", "out": "/tmp/e.mp4"}));
+        let a = m.engine_args().unwrap();
+        assert!(a.windows(2).any(|w| w == ["--pace", "dynamic"]) && a.windows(2).any(|w| w == ["--feedback", "more faces"]), "{a:?}");
+        let mut c = Draft::from_params(Kind::Clips, &json!({"input": vs, "pace": "dynamic"}));
+        let ca = c.engine_args().unwrap();
+        assert!(ca.windows(2).any(|w| w == ["--pace", "medium"]), "only music edits cut dynamically: {ca:?}");
+        let mut t = Draft::from_params(Kind::Topic, &json!({"topic": "GTA 6", "voice": "mac:Rishi", "feedback": "the hook is boring"}));
+        let ta = t.engine_args().unwrap();
+        assert!(ta.windows(2).any(|w| w == ["--feedback", "the hook is boring"]), "{ta:?}");
+        let mut back = Draft::from_params(Kind::Topic, &t.to_params());
+        assert_eq!(back.engine_args().unwrap(), ta, "feedback survives the queue");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

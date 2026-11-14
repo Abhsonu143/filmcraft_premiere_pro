@@ -99,6 +99,35 @@ def hints_block(hints: str) -> str:
             + "\n".join(f"- {l.strip(' -•')}" for l in h.splitlines() if l.strip()) + "\n")
 
 
+def feedback_items(folder: Path, new: str) -> list[dict]:
+    """The creator's feedback on earlier versions of this video (oldest first), with the new one added."""
+    f = folder / "feedback.json"
+    try:
+        items = json.loads(f.read_text(encoding="utf-8"))
+        items = items if isinstance(items, list) else []
+    except (OSError, ValueError):
+        items = []
+    t = re.sub(r"\s+", " ", new or "").strip()
+    if t and (not items or items[-1].get("text") != t):
+        items.append({"text": t, "time": time.strftime("%Y-%m-%d %H:%M")})
+        f.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+    return items
+
+
+def feedback_block(fb_text: str, script_path: Path) -> str:
+    """For the script writer: what the creator did not like, and the script it was about."""
+    if not fb_text:
+        return ""
+    prev = ""
+    try:
+        old = json.loads(script_path.read_text(encoding="utf-8"))
+        prev = " ".join(str(s.get("text", "")) for s in old.get("segments", []))[:2500]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return ("## The creator's feedback on the earlier version (fix ALL of it; it matters more than anything else here)\n" + fb_text + "\n"
+            + (f"The earlier script, for reference (do not repeat its mistakes): {prev}\n" if prev else "") + "\n")
+
+
 def research_prompt(topic: str, seconds: float, language: str, page: tuple[str, str] | None, hints: str = "") -> str:
     ref = ""
     if page:
@@ -511,7 +540,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
          script_only: bool = False, style: str | None = None, writer: str = "claude", model: str | None = None, tone: str = "", niche: str = "",
          sources: list[str] | None = None, footage: list[str] | None = None, music: str | None = None, captions: bool = True,
          caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False, sound: dict | None = None,
-         resolution: str = "1080p", hook_line: str | None = None, find_hook: bool = False, hints: str = "") -> dict:
+         resolution: str = "1080p", hook_line: str | None = None, find_hook: bool = False, hints: str = "", feedback: str = "") -> dict:
     import script_writer as sw
 
     hints = (hints or "").strip()
@@ -529,6 +558,15 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
     folder = Path(out_dir).expanduser().resolve() if out_dir else Path.home() / "Movies" / "EI" / "Topics" / name
     folder.mkdir(parents=True, exist_ok=True)
     state = State(folder / "progress.json")
+    # what was said about earlier versions (kept in the folder; every retry follows all of it)
+    fb_items = feedback_items(folder, feedback)
+    fb_text = "\n".join(f"- {x['text']}" for x in fb_items)
+    if feedback.strip():
+        log(f"your feedback: {feedback.strip()[:160]}")
+    # feedback about the facts redoes the research (with it); the rest only rewrites the script
+    research_hints = hints
+    if fb_items and re.search(r"\b(fact|facts|wrong|incorrect|outdated|old news|research|source|detail|details|accurate|more info|missing)\b", fb_text, re.I):
+        research_hints = (hints + "\nFix what the creator said about the last version:\n" + fb_text).strip()
     ac.progress_plan({"research": 0.08, "hook": 0.02, "script": 0.03} if script_only else
                      {"research": 0.06, "hook": 0.02, "script": 0.02, "voice": 0.42, "media": 0.13, "edit": 0.35})
     # 1. research (kept in the folder: running the same topic again reuses it unless asked to refresh)
@@ -537,7 +575,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
     if rj.is_file() and not fresh:
         try:
             old = json.loads(rj.read_text(encoding="utf-8"))
-            if old.get("topic") == topic and old.get("facts") and (old.get("hints") or "") == hints:
+            if old.get("topic") == topic and old.get("facts") and (old.get("hints") or "") == research_hints:
                 data = old
                 log(f"reusing the research from {time.strftime('%d %b %H:%M', time.localtime(rj.stat().st_mtime))} (fresh research: --fresh)")
         except ValueError:
@@ -546,15 +584,15 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         if data is None:
             if hints:
                 log(f"your hints: {hints[:160]}")
-            data = research(topic, seconds, language, writer, model, hints)
-            data["hints"] = hints
+            data = research(topic, seconds, language, writer, model, research_hints)
+            data["hints"] = research_hints
             data.setdefault("topic", topic)
             rj.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     # 2. script (sized to the voice's pace when there is one)
     clone = voice if (voice and not voice.startswith("mac") and not script_only) else None
     # 2. script: kept when it was written with these same settings (a retry does not rewrite it)
     script_path = folder / f"{name}.script.json"
-    script_sig = state.sig(rj.read_bytes(), seconds, language, tone, niche, style, writer, hook_line, find_hook, clone, hints)
+    script_sig = state.sig(rj.read_bytes(), seconds, language, tone, niche, style, writer, hook_line, find_hook, clone, hints, fb_text)
     found = []
     if state.done("script", script_sig) and script_path.is_file() and not fresh:
         log(f"reusing the script from {time.strftime('%d %b %H:%M', time.localtime(script_path.stat().st_mtime))}")
@@ -572,7 +610,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
                 found = hk.find_for_topic(query, niche, language, facts=facts_notes(data)[:3000], model=model if writer == "claude" else None)
         with ac.stage("script"):
             res = sw.write_script(data.get("title_idea") or topic, str(folder / name), niche=niche, seconds=seconds, language=language, tone=tone,
-                                  notes=(hints_block(hints).strip() + "\n\n" if hints else "") + facts_notes(data), style=style, backend=writer, model=model if writer == "claude" else None, pace_voice=clone,
+                                  notes=(hints_block(hints).strip() + "\n\n" if hints else "") + feedback_block(fb_text, script_path) + facts_notes(data), style=style, backend=writer, model=model if writer == "claude" else None, pace_voice=clone,
                                   hook_line=hook_line, found_hooks=found)
         script_path = Path(res["script"])
         state.mark("script", script_sig)
@@ -675,6 +713,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--fresh", action="store_true", help="research again even if this folder has research for the topic")
     p.add_argument("--hook-line", help="your own first line, spoken word for word (the rest of the script follows from it)")
     p.add_argument("--find-hook", action="store_true", help="look online for hooks that work for this exact topic first")
+    p.add_argument("--feedback", default="", help="what did not come out right last time (kept in the folder; every retry follows all of it)")
     p.add_argument("--hints", default="", help="what you are looking for: angles, facts to find, what to leave out, how it should come out (one per line)")
     import score
 
@@ -691,7 +730,7 @@ def run_args(a) -> dict:
                 writer=a.writer, model=a.model, tone=a.tone, niche=a.niche, sources=a.sources, footage=footage, music=a.music,
                 captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, fresh=a.fresh,
                 sound=__import__("score").options(a), resolution=a.resolution, hook_line=a.hook_line, find_hook=a.find_hook,
-                hints=a.hints or "")
+                hints=a.hints or "", feedback=a.feedback or "")
 
 
 def main(argv: list[str] | None = None) -> int:
