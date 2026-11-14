@@ -233,3 +233,24 @@ def test_subtitles_are_real_and_clean():
     text = yd.sentences_by_pauses(cues)
     assert text == "Hey guys welcome back & today. I think this is it." and yd.is_punctuated(text) is False or True
     assert not yd.is_punctuated("so right away you can see the m50s are a sleek high quality pair of headphones and they feature a really solid build of mostly metal and a little bit of plastic but for the price point")
+
+
+def test_hindi_numbers_are_said_in_english():
+    import voice as v
+
+    assert v.english_numbers("GTA 6 सिर्फ 30 FPS पर चलेगा") == "GTA सिक्स सिर्फ थर्टी FPS पर चलेगा"
+    assert v.english_numbers("2026 में 212 GB") == "ट्वेंटी ट्वेंटी सिक्स में टू हंड्रेड ट्वेल्व GB"
+    assert v.english_numbers("15% ज़्यादा, 79.99 डॉलर") == "फ़िफ़्टीन परसेंट ज़्यादा, सेवेंटी नाइन पॉइंट नाइन नाइन डॉलर"
+    assert v.english_numbers("PS5 और 4K और 1080p") == "PS5 और 4K और 1080p"  # (names and units stay)
+    assert v.english_numbers("1,500,000 लोग") == "वन मिलियन फ़ाइव हंड्रेड थाउज़ेंड लोग"
+    assert v.english_numbers("in 2005 and 1999", devanagari=False) == "in two thousand five and nineteen ninety nine"
+    assert v.year_words(2100) == "twenty one hundred" and v.year_words(1905) == "nineteen oh five"
+
+
+def test_topic_hints_reach_research_and_script():
+    import topic_video as tv
+
+    p = tv.research_prompt("GTA 6 Lucia voice actor", 60, "en", None, "focus on the NDA, not rumours about her life\nkeep it respectful")
+    assert "creator's hints" in p and "- focus on the NDA" in p and "- keep it respectful" in p
+    assert "hints" not in tv.research_prompt("x", 60, "en", None, "")
+    assert tv.hints_block("") == ""

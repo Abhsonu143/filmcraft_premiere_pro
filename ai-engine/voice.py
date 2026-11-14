@@ -709,6 +709,62 @@ def _speak_worker(jobs: list[dict], engine: str, repo: str) -> list[dict]:
     return out
 
 
+_ONES = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split()
+_TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+# English number words as a Hindi speaker says them, in Devanagari (what the Hindi voice reads best)
+DEVA_NUMBERS = {
+    "zero": "ज़ीरो", "one": "वन", "two": "टू", "three": "थ्री", "four": "फ़ोर", "five": "फ़ाइव", "six": "सिक्स", "seven": "सेवन", "eight": "एट",
+    "nine": "नाइन", "ten": "टेन", "eleven": "इलेवन", "twelve": "ट्वेल्व", "thirteen": "थर्टीन", "fourteen": "फ़ोर्टीन", "fifteen": "फ़िफ़्टीन",
+    "sixteen": "सिक्सटीन", "seventeen": "सेवनटीन", "eighteen": "एटीन", "nineteen": "नाइनटीन", "twenty": "ट्वेंटी", "thirty": "थर्टी",
+    "forty": "फ़ोर्टी", "fifty": "फ़िफ़्टी", "sixty": "सिक्सटी", "seventy": "सेवेंटी", "eighty": "एटी", "ninety": "नाइंटी", "hundred": "हंड्रेड",
+    "thousand": "थाउज़ेंड", "million": "मिलियन", "billion": "बिलियन", "point": "पॉइंट", "percent": "परसेंट",
+}
+
+
+def number_words(n: int) -> str:
+    """An integer in English words ("two hundred twelve", "one million five hundred thousand")."""
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        return _TENS[n // 10] + ("" if n % 10 == 0 else " " + _ONES[n % 10])
+    if n < 1000:
+        return _ONES[n // 100] + " hundred" + ("" if n % 100 == 0 else " " + number_words(n % 100))
+    for size, name in ((10**9, "billion"), (10**6, "million"), (1000, "thousand")):
+        if n >= size:
+            rest = n % size
+            return number_words(n // size) + " " + name + ("" if rest == 0 else " " + number_words(rest))
+    return str(n)
+
+
+def year_words(n: int) -> str:
+    """A year as it is said: 2026 "twenty twenty-six", 2005 "two thousand five", 1999 "nineteen ninety-nine"."""
+    if 2000 <= n <= 2009:
+        return number_words(n)
+    hi_, lo = divmod(n, 100)
+    return number_words(hi_) + " " + ("hundred" if lo == 0 else ("oh " + _ONES[lo] if lo < 10 else number_words(lo)))
+
+
+def english_numbers(text: str, devanagari: bool = True) -> str:
+    """Digits as English number words, even in a Hindi line (the creator wants numbers said in
+    English): in Devanagari letters for the Hindi voice, or plain English."""
+    def say(m: re.Match) -> str:
+        whole, frac, pct = m.group(1), m.group(2), m.group(3)
+        digits = whole.replace(",", "")
+        if not digits.isdigit() or len(digits) > 12:
+            return m.group(0)
+        n = int(digits)
+        words = year_words(n) if (len(digits) == 4 and "," not in whole and 1100 <= n <= 2099 and not frac and not pct) else number_words(n)
+        if frac:
+            words += " point " + " ".join(_ONES[int(c)] for c in frac[:4])
+        if pct:
+            words += " percent"
+        if devanagari:
+            words = " ".join(DEVA_NUMBERS.get(w, w) for w in words.split())
+        return words
+
+    return re.sub(r"(?<![\w.])(\d[\d,]*\d|\d)(?:\.(\d+))?(?:\s*(%))?(?![A-Za-z0-9])", say, text)
+
+
 def script_segments(script: str) -> tuple[list[dict], str]:
     """Segments from a script_writer JSON, or plain text (one line/sentence per segment)."""
     p = Path(script)
@@ -801,6 +857,9 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
     segs, default_lang = script_segments(script)
     if not segs:
         raise AutocutError("the script is empty")
+    for sg in segs:  # numbers in a Hindi line are said in English ("थर्टी एफ़पीएस", never "तीस")
+        if (language or ("hi" if detect_lang(sg["text"]) == "hi" else default_lang)) == "hi" and re.search(r"\d", sg["text"]):
+            sg["text"] = english_numbers(sg["text"], devanagari=True)
     takes = int(np.clip(takes, 1, 4))
     outp = Path(out)
     if outp.suffix.lower() != ".wav":

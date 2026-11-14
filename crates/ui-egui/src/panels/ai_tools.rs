@@ -240,6 +240,8 @@ struct Draft {
     src_cards: bool,
     src_youtube: bool,
     fresh: bool,
+    /// Video from Topic: what the creator is looking for (research and script follow it).
+    hints: String,
     // TV light sync
     tv_folder: String,
     relight: f64,
@@ -431,6 +433,7 @@ impl Draft {
             src_cards: true,
             src_youtube: false,
             fresh: false,
+            hints: String::new(),
             tv_folder: setting_str("tv_recordings").unwrap_or_default(),
             relight: 1.0,
             tv_bezel: false,
@@ -559,6 +562,9 @@ impl Draft {
         d.src_cards = flag("cards", d.src_cards);
         d.src_youtube = flag("youtube", d.src_youtube);
         d.fresh = flag("fresh", d.fresh);
+        if let Some(v) = s("hints") {
+            d.hints = v;
+        }
         if let Some(v) = p.get("recordings").and_then(Value::as_str) {
             d.tv_folder = v.to_string();
         }
@@ -694,6 +700,7 @@ impl Draft {
         m.insert("cards".into(), json!(self.src_cards));
         m.insert("youtube".into(), json!(self.src_youtube));
         m.insert("fresh".into(), json!(self.fresh));
+        m.insert("hints".into(), json!(self.hints));
         m.insert("recordings".into(), json!(self.tv_folder));
         m.insert("relight".into(), json!(self.relight));
         m.insert("bezel".into(), json!(self.tv_bezel));
@@ -998,6 +1005,9 @@ impl Draft {
                 }
                 if self.fresh {
                     a.push("--fresh".into());
+                }
+                if !self.hints.trim().is_empty() {
+                    push(&mut a, "--hints", self.hints.trim());
                 }
                 if !self.hook_line.trim().is_empty() {
                     push(&mut a, "--hook-line", self.hook_line.trim()); // yours wins over a search
@@ -2036,6 +2046,8 @@ struct Job {
     paused_total: Duration,
     /// Started from the queue (the next queued job waits for it).
     queued: bool,
+    /// The dialog's settings it was started with (Edit & Retry reopens them).
+    params: Option<Value>,
 }
 
 impl Job {
@@ -2128,6 +2140,7 @@ fn start_job_ex(title: String, kind: Option<Kind>, steps: Vec<Vec<String>>, impo
             paused_since: None,
             paused_total: Duration::ZERO,
             queued,
+            params: None,
         });
     }
     let spawned = std::thread::Builder::new().name(format!("ei-ai-job-{id}")).spawn(move || {
@@ -2361,8 +2374,8 @@ fn push_log_locked(j: &mut Job, line: String) {
 /// script, voice takes, media, rendered shots), so a retry continues where the job stopped.
 /// `redo` (downloads only): Some(true) downloads everything again, Some(false) skips what is there.
 fn retry_job(id: u64, redo: Option<bool>) -> Option<u64> {
-    let (title, kind, steps, import, cwd) =
-        with_job(id, |j| (j.status != Status::Running).then(|| (j.title.clone(), j.kind, j.steps.clone(), j.import, j.cwd.clone())))??;
+    let (title, kind, steps, import, cwd, params) =
+        with_job(id, |j| (j.status != Status::Running).then(|| (j.title.clone(), j.kind, j.steps.clone(), j.import, j.cwd.clone(), j.params.clone())))??;
     if steps.is_empty() {
         return None;
     }
@@ -2371,7 +2384,9 @@ fn retry_job(id: u64, redo: Option<bool>) -> Option<u64> {
         _ => steps,
     };
     let title = if title.ends_with(" (retry)") { title } else { format!("{title} (retry)") };
-    Some(start_job(title, kind, steps, import, cwd))
+    let new = start_job(title, kind, steps, import, cwd);
+    with_job(new, |j| j.params = params);
+    Some(new)
 }
 
 /// Whether these steps download from YouTube.
@@ -2511,6 +2526,7 @@ fn params_from_args(kind: &str, args: &[String]) -> Option<Value> {
             "--style" => ("style", json!(val), 2),
             "--out-dir" => ("out", json!(val), 2),
             "--hook-line" => ("hookLine", json!(val), 2),
+            "--hints" => ("hints", json!(val), 2),
             "--voice" => ("voice", json!(val), 2),
             "--pace" => ("pace", json!(val), 2),
             "--music" => ("music", json!(val), 2),
@@ -2651,7 +2667,9 @@ fn tick_queue() {
         it
     };
     let kind = Kind::from_command(&format!("ai.{}", next.kind));
-    let _ = start_job_ex(next.title, kind, next.steps, next.import, next.cwd.map(PathBuf::from), true);
+    let params = next.params.clone();
+    let id = start_job_ex(next.title, kind, next.steps, next.import, next.cwd.map(PathBuf::from), true);
+    with_job(id, |j| j.params = params);
 }
 
 /// Cancel what the queue is running and everything waiting in it.
@@ -2740,7 +2758,27 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
 /// Run a draft: returns the job id.
 fn run_draft(d: &mut Draft) -> Result<u64, String> {
     let (title, steps, engine) = draft_job(d)?;
-    Ok(start_job(title, Some(d.kind), steps, d.import, Some(engine)))
+    let id = start_job(title, Some(d.kind), steps, d.import, Some(engine));
+    let params = d.to_params();
+    with_job(id, |j| j.params = Some(params));
+    Ok(id)
+}
+
+/// Open a finished, failed or cancelled job's dialog with the settings it ran with: change what
+/// did not come out right and run it again (what is still valid is reused: research, script,
+/// voice and media are redone only when the settings they depend on changed).
+fn edit_job(ctx: &egui::Context, id: u64) -> Result<(), String> {
+    let (kind, params, steps) = with_job(id, |j| (j.status != Status::Running).then(|| (j.kind, j.params.clone(), j.steps.clone())))
+        .flatten()
+        .ok_or("That job is still running, or no longer listed.")?;
+    let kind = kind.ok_or("This job has no settings to edit.")?;
+    let params = params
+        .or_else(|| params_from_args(kind.id(), steps.first().and_then(|s| s.get(2..)).unwrap_or_default()))
+        .ok_or("EI did not keep this job's settings (it ran before Edit & Retry existed): start it again from the AI menu.")?;
+    let mut d = Draft::from_params(kind, &params);
+    d.fresh = false; // (continue from what is still right)
+    ctx.data_mut(|m| m.insert_temp(draft_id(), Some(d)));
+    Ok(())
 }
 
 /// Put a draft in the queue instead of running it now. Returns the number waiting.
@@ -2829,6 +2867,10 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
         "ai.pause" | "ai.resume" => match params.get("job").and_then(Value::as_u64) {
             Some(j) => Ok(json!({"changed": pause_job(j, id == "ai.pause")})),
             None => Err(format!("{id} needs {{job}}")),
+        },
+        "ai.editJob" => match params.get("job").and_then(Value::as_u64) {
+            Some(j) => edit_job(ctx, j).map(|()| json!({"editing": j})),
+            None => Err("ai.editJob needs {job}".into()),
         },
         "ai.retry" => match params.get("job").and_then(Value::as_u64) {
             Some(j) => retry_job(j, params.get("redo").and_then(Value::as_bool))
@@ -3540,6 +3582,22 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                                     .desired_width(380.0),
                             );
                             elems.push((format!("{p}.topic"), r.rect, d.topic.clone()));
+                            ui.end_row();
+                            ui.label("Hints (optional)");
+                            ui.vertical(|ui| {
+                                let r = ui.add(
+                                    egui::TextEdit::multiline(&mut d.hints)
+                                        .hint_text("what you are looking for, one per line, e.g.\nfocus on the NDA, not her personal life\ncompare with GTA 5's launch\nend on what fans should do now")
+                                        .desired_rows(3)
+                                        .desired_width(380.0),
+                                );
+                                elems.push((format!("{p}.hints"), r.rect, d.hints.clone()));
+                                ui.label(
+                                    egui::RichText::new("The research looks for this and the script is written to it: angles, facts to find, what to leave out, how it should come out.")
+                                        .small()
+                                        .weak(),
+                                );
+                            });
                             ui.end_row();
                             ui.label("Length (seconds)");
                             ui.horizontal(|ui| {
@@ -4757,6 +4815,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         queued: bool,
         retry: bool,
         download: bool,
+        editable: bool,
         outputs: Vec<String>,
         out_dir: Option<String>,
         importable: bool,
@@ -4785,6 +4844,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
             queued: j.queued,
             retry: j.status != Status::Running && !j.steps.is_empty(),
             download: is_download(&j.steps),
+            editable: j.status != Status::Running && j.kind.is_some() && (j.params.is_some() || j.kind == Some(Kind::Topic)),
             outputs: j
                 .result
                 .get("outputs")
@@ -4805,6 +4865,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut cancel: Option<u64> = None;
     let mut pause: Option<(u64, bool)> = None;
     let mut retry: Option<(u64, Option<bool>)> = None;
+    let mut edit_retry: Option<u64> = None;
     let mut reveal: Option<String> = None;
     let mut open_file: Option<String> = None;
     let mut import: Option<u64> = None;
@@ -4989,6 +5050,13 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             retry = Some((r.id, None));
                         }
                     }
+                    if r.editable {
+                        let b = ui.button("Edit & Retry").on_hover_text("Open its settings, change what did not come out right, and run it again");
+                        elems.push((format!("{pid}.edit"), b.rect, "Edit & Retry".into()));
+                        if b.clicked() {
+                            edit_retry = Some(r.id);
+                        }
+                    }
                     if let Some(first) = r.outputs.first() {
                         let o = ui.button(if r.outputs.len() == 1 { "Play" } else { "Open First" });
                         elems.push((format!("{pid}.open"), o.rect, "Open".into()));
@@ -5050,6 +5118,11 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     }
     if let Some((j, p)) = pause {
         pause_job(j, p);
+    }
+    if let Some(j) = edit_retry
+        && let Err(e) = edit_job(ctx, j)
+    {
+        app.ui.status = e;
     }
     if let Some((j, redo)) = retry
         && retry_job(j, redo).is_some()
@@ -5433,7 +5506,9 @@ mod tests {
         assert!(Draft::from_params(Kind::Speak, &json!({"voice": "test1"})).engine_args().is_err());
         assert!(Draft::from_params(Kind::Speak, &json!({"script": sp})).engine_args().is_err());
         // a music folder must exist; a music edit only gets effects; no music needs effects
-        assert!(Draft::from_params(Kind::Speak, &json!({"script": sp, "voice": "v", "soundDesign": true, "musicSource": "folder"})).engine_args().is_err());
+        // (a folder that is not there: the saved default may be a real one on this Mac)
+        let gone = json!({"script": sp, "voice": "v", "soundDesign": true, "musicSource": "folder", "musicFolder": "/no/such/music/folder"});
+        assert!(Draft::from_params(Kind::Speak, &gone).engine_args().is_err());
         let mut f = Draft::from_params(
             Kind::Speak,
             &json!({"script": sp, "voice": "v", "soundDesign": true, "musicSource": "folder", "musicFolder": dir.to_string_lossy()}),
@@ -5549,7 +5624,7 @@ mod tests {
             (
                 Kind::Topic,
                 json!({"topic": "GTA 6 map", "voice": "nxstory-a1", "seconds": 45, "language": "hinglish", "aspect": "vertical", "hookLine": "Big news.",
-                "youtube": true, "soundDesign": true, "musicSource": "ai", "resolution": "4k", "takes": 3}),
+                "hints": "focus on the map size\nno rumours", "youtube": true, "soundDesign": true, "musicSource": "ai", "resolution": "4k", "takes": 3}),
             ),
             (Kind::Clips, json!({"input": vs, "clipType": "sections", "count": 3, "aspect": "same", "hook": false, "captionMode": "off"})),
             (Kind::Clips, json!({"input": vs, "count": 7, "pace": "fast", "titleMode": "intro", "llm": "none"})),
@@ -5597,6 +5672,8 @@ mod tests {
             "--writer",
             "claude",
             "--fresh",
+            "--hints",
+            "focus on the record numbers\ncompare with GTA 5",
             "--hook-line",
             "GTA 6 just broke a record no game has ever touched",
             "--voice",

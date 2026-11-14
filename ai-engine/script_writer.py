@@ -392,7 +392,10 @@ def build_prompt(topic: str, *, niche: str, seconds: float, language: str, tone:
 - Structure: a hook in the first 3 seconds (a surprising fact, a question, a bold claim, or the payoff teased), then build, the core, a peak moment, and a short ending (with a call to action only if it fits the style).
 - Write for the ear: short spoken sentences, contractions, rhythm. Vary sentence length. Real emotion, not marketing.
 - Depth: concrete details, numbers, sensory words, one small story or personal moment. No filler sentences.
-- For the speech model: write numbers, dates, units and symbols as words in the script's language (e.g. "दो हज़ार", "fifteen percent"); no emojis, hashtags, brackets, stage directions or abbreviations inside "text".
+- For the speech model: write numbers, dates, units and symbols as spoken words; no digits, emojis, hashtags, brackets, stage directions or abbreviations inside "text".
+  Numbers are ALWAYS said in English, also in Hindi and Hinglish scripts (the creator's rule): in Hindi write the English number words in
+  Devanagari letters ("ट्वेंटी ट्वेंटी-सिक्स" for 2026, "थर्टी एफ़पीएस" for 30 FPS, "फ़िफ़्टीन परसेंट", "टू हंड्रेड ट्वेल्व जीबी"), never Hindi number
+  words like "तीस" or "दो हज़ार"; in Hinglish the same in English letters ("thirty FPS"); in English: "twenty twenty-six", "fifteen percent".
 - One segment = one breath / one idea, 4 to 25 words. Mark the delivery of every segment.
 - Emotion: give every segment the one emotion the listener should feel, from this list (grouped by mood): {em.prompt_list()}.
   Give the script an emotional arc, like a trailer: open on a strong hook emotion (Surprise, Curiosity, Awe, Thrill, Mystery…),

@@ -444,3 +444,21 @@ Full description: `docs/voice-and-voiceover.md`.
 - "Simple" (the earlier frame + words) stays as a choice (`--style simple`, dialog ▸ Style).
 - A full run (3 concepts × 2 platforms × 2 languages) takes ~3 minutes: Claude's planning and
   critique ~1.5 min, backgrounds ~45 s.
+
+## 2026-11-14: topic hints, Edit & Retry, numbers in English in Hindi voiceovers
+
+- Video from Topic ▸ Hints (optional, `--hints`, one per line): what the creator is looking for.
+  The research prompt gets them as "the creator's hints (follow them)", the script writer gets them
+  first in its notes; saved research is reused only with the same hints, and the script's
+  signature includes them (a retry with new hints researches and writes again, keeping what does
+  not depend on them).
+- AI Jobs ▸ Edit & Retry on finished, failed or cancelled jobs: every job now keeps the dialog
+  settings it started with (Run, the queue and Retry all carry them; older topic jobs are rebuilt
+  from their command line). It opens the dialog with them ("research again" off), the change is
+  run as a new job, and the engine reuses what is still valid. Control: `ai.editJob {job}`.
+- Hindi (and Hinglish) voiceovers say numbers in English: the script rule asks for English number
+  words in Devanagari ("ट्वेंटी ट्वेंटी-सिक्स", "थर्टी एफ़पीएस", "फ़िफ़्टीन परसेंट"), and the voice step turns
+  any digits left in a Hindi line into them (years as said: twenty twenty-six; decimals, percent;
+  names and units like PS5, 4K, 1080p stay).
+- A UI test assumed no saved music folder (`sound_design_and_speak_arguments`); it now names a
+  missing folder explicitly.

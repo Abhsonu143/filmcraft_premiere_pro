@@ -90,13 +90,21 @@ def page_text(url: str, limit: int = 12000) -> tuple[str, str]:
 # ---------------------------------------------------------------------------------------------
 
 
-def research_prompt(topic: str, seconds: float, language: str, page: tuple[str, str] | None) -> str:
+def hints_block(hints: str) -> str:
+    """The creator's hints: what they are looking for and how the video should come out."""
+    h = re.sub(r"[ \t]+", " ", hints or "").strip()
+    if not h:
+        return ""
+    return ("\n\n## The creator's hints (follow them: they say what this video should focus on, what to find out and how it should come out)\n"
+            + "\n".join(f"- {l.strip(' -•')}" for l in h.splitlines() if l.strip()) + "\n")
+
+
+def research_prompt(topic: str, seconds: float, language: str, page: tuple[str, str] | None, hints: str = "") -> str:
     ref = ""
     if page:
         ref = f"\n\nThe creator gave this reference post/article. Read it (fetch the link for more if useful):\nTitle: {page[0]}\n{page[1][:6000]}\n"
     return f"""Research this topic for a {seconds:.0f}-second video voiceover (language of the video: {language}). Today is {time.strftime('%d %B %Y')}.
-Topic: {topic}{ref}
-
+Topic: {topic}{ref}{hints_block(hints)}
 Use web search to get current, accurate information from reliable sources (official sites, major news, primary sources).
 Prefer the latest facts; note dates. Never invent facts.
 
@@ -111,7 +119,7 @@ Reply with only a JSON object:
 Give 6-12 facts, up to 5 articles, up to 4 YouTube videos (official channels first), 6-10 image queries."""
 
 
-def research(topic: str, seconds: float, language: str, writer: str = "claude", model: str | None = None) -> dict:
+def research(topic: str, seconds: float, language: str, writer: str = "claude", model: str | None = None, hints: str = "") -> dict:
     page = None
     url = topic.strip() if re.match(r"https?://", topic.strip()) else None
     if url:
@@ -125,7 +133,7 @@ def research(topic: str, seconds: float, language: str, writer: str = "claude", 
         import script_writer as sw
 
         log("Claude is researching the topic on the web")
-        raw = ask_claude_research(research_prompt(topic, seconds, language, page), model)
+        raw = ask_claude_research(research_prompt(topic, seconds, language, page, hints), model)
         try:
             data = sw.extract_json(raw)
         except AutocutError:
@@ -503,9 +511,10 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
          script_only: bool = False, style: str | None = None, writer: str = "claude", model: str | None = None, tone: str = "", niche: str = "",
          sources: list[str] | None = None, footage: list[str] | None = None, music: str | None = None, captions: bool = True,
          caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False, sound: dict | None = None,
-         resolution: str = "1080p", hook_line: str | None = None, find_hook: bool = False) -> dict:
+         resolution: str = "1080p", hook_line: str | None = None, find_hook: bool = False, hints: str = "") -> dict:
     import script_writer as sw
 
+    hints = (hints or "").strip()
     ac.require_tools()
     if not topic.strip():
         raise AutocutError("give a topic or a link")
@@ -528,20 +537,24 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
     if rj.is_file() and not fresh:
         try:
             old = json.loads(rj.read_text(encoding="utf-8"))
-            if old.get("topic") == topic and old.get("facts"):
+            if old.get("topic") == topic and old.get("facts") and (old.get("hints") or "") == hints:
                 data = old
                 log(f"reusing the research from {time.strftime('%d %b %H:%M', time.localtime(rj.stat().st_mtime))} (fresh research: --fresh)")
         except ValueError:
             data = None
     with ac.stage("research"):
         if data is None:
-            data = research(topic, seconds, language, writer, model)
+            if hints:
+                log(f"your hints: {hints[:160]}")
+            data = research(topic, seconds, language, writer, model, hints)
+            data["hints"] = hints
+            data.setdefault("topic", topic)
             rj.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     # 2. script (sized to the voice's pace when there is one)
     clone = voice if (voice and not voice.startswith("mac") and not script_only) else None
     # 2. script: kept when it was written with these same settings (a retry does not rewrite it)
     script_path = folder / f"{name}.script.json"
-    script_sig = state.sig(rj.read_bytes(), seconds, language, tone, niche, style, writer, hook_line, find_hook, clone)
+    script_sig = state.sig(rj.read_bytes(), seconds, language, tone, niche, style, writer, hook_line, find_hook, clone, hints)
     found = []
     if state.done("script", script_sig) and script_path.is_file() and not fresh:
         log(f"reusing the script from {time.strftime('%d %b %H:%M', time.localtime(script_path.stat().st_mtime))}")
@@ -559,7 +572,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
                 found = hk.find_for_topic(query, niche, language, facts=facts_notes(data)[:3000], model=model if writer == "claude" else None)
         with ac.stage("script"):
             res = sw.write_script(data.get("title_idea") or topic, str(folder / name), niche=niche, seconds=seconds, language=language, tone=tone,
-                                  notes=facts_notes(data), style=style, backend=writer, model=model if writer == "claude" else None, pace_voice=clone,
+                                  notes=(hints_block(hints).strip() + "\n\n" if hints else "") + facts_notes(data), style=style, backend=writer, model=model if writer == "claude" else None, pace_voice=clone,
                                   hook_line=hook_line, found_hooks=found)
         script_path = Path(res["script"])
         state.mark("script", script_sig)
@@ -662,6 +675,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--fresh", action="store_true", help="research again even if this folder has research for the topic")
     p.add_argument("--hook-line", help="your own first line, spoken word for word (the rest of the script follows from it)")
     p.add_argument("--find-hook", action="store_true", help="look online for hooks that work for this exact topic first")
+    p.add_argument("--hints", default="", help="what you are looking for: angles, facts to find, what to leave out, how it should come out (one per line)")
     import score
 
     score.add_sound_args(p)
@@ -676,7 +690,8 @@ def run_args(a) -> dict:
     return make(a.topic, a.out_dir, seconds=a.seconds, language=a.language, aspect=a.aspect, voice=a.voice, script_only=a.script_only, style=a.style,
                 writer=a.writer, model=a.model, tone=a.tone, niche=a.niche, sources=a.sources, footage=footage, music=a.music,
                 captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, fresh=a.fresh,
-                sound=__import__("score").options(a), resolution=a.resolution, hook_line=a.hook_line, find_hook=a.find_hook)
+                sound=__import__("score").options(a), resolution=a.resolution, hook_line=a.hook_line, find_hook=a.find_hook,
+                hints=a.hints or "")
 
 
 def main(argv: list[str] | None = None) -> int:

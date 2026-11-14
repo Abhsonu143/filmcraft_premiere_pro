@@ -388,6 +388,13 @@ fn ai_jobs_run_the_engine_and_import_results() {
     assert_eq!(j["status"], json!("done"), "{j}");
     let outputs = j["result"]["outputs"].as_array().cloned().unwrap_or_default();
     assert_eq!(outputs.len(), 3, "{j}");
+    // Edit & Retry: the finished job's dialog opens with the settings it ran with
+    d.run("ai.editJob", json!({"job": job}));
+    d.frames(3);
+    let el = d.ok("ui.elements", json!({"prefix": "ai.split.clipLength"}));
+    assert!(el.to_string().contains("\"5"), "the clip length it ran with: {el}");
+    d.ok("ui.click", json!({"id": "ai.split.cancel"}));
+    d.frames(2);
     d.frames(3);
     let items_split = d.harness.state().session.project.items.len();
     assert!(items_split >= items_before + 3, "split clips imported: {items_before} -> {items_split}");
