@@ -143,6 +143,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("ai.voiceover", "Voiceover Edit…", ["AI"], None),
     uic!("ai.clips", "Make Short Clips from Long Video…", ["AI"], None),
     uic!("ai.audio", "Extract Audio from Video…", ["AI"], None),
+    uic!("ai.download", "Download from YouTube…", ["AI"], None),
     uic!("ai.jobs", "AI Jobs", ["AI"], None),
     uic!("ai.setup", "AI Engine Setup…", ["AI"], None),
     uic!("ai.cancel", "Cancel AI Job", [], None),

@@ -105,10 +105,23 @@ impl Driver {
 fn ai_menu_and_dialogs() {
     let mut d = Driver::demo();
     let menu = d.ok("ui.menu.list", json!({})).to_string();
-    for id in ["ai.split", "ai.music", "ai.reference", "ai.talk", "ai.voiceover", "ai.clips", "ai.audio", "ai.speak", "ai.hooks", "ai.jobs", "ai.setup"] {
+    for id in [
+        "ai.split",
+        "ai.music",
+        "ai.reference",
+        "ai.talk",
+        "ai.voiceover",
+        "ai.clips",
+        "ai.audio",
+        "ai.speak",
+        "ai.hooks",
+        "ai.download",
+        "ai.jobs",
+        "ai.setup",
+    ] {
         assert!(menu.contains(id), "{id} in the menus");
     }
-    let expect: [(&str, &[&str]); 13] = [
+    let expect: [(&str, &[&str]); 14] = [
         ("split", &["input", "clipLength", "quality.same", "quality.exact", "out", "import", "run"]),
         (
             "music",
@@ -195,6 +208,7 @@ fn ai_menu_and_dialogs() {
         ("voice", &["name", "lang.hi", "lang.mix", "lang.en", "source.record", "source.files", "run"]),
         ("speak", &["script", "text", "voice", "sound", "out", "run"]),
         ("hooks", &["niches", "countries", "claude", "run"]),
+        ("download", &["url", "audioOnly", "container", "items", "out", "queue", "run"]),
         (
             "clips",
             &[

@@ -147,3 +147,26 @@ def test_topic_hook_search_is_kept(monkeypatch, tmp_path):
     monkeypatch.setattr(tv, "ask_claude_research", lambda prompt, model: (_ for _ in ()).throw(sw.AutocutError("offline")))
     found = hk.find_for_topic("GTA 6 release", "gaming", "en", lib=tmp_path)
     assert found[0]["text"] == "I Waited 12 Years For This"  # without Claude: the topic's most-viewed titles
+
+
+def test_download_commands():
+    from pathlib import Path
+
+    import yt_download as yd
+
+    pl = "https://youtube.com/playlist?list=PLabc&si=x"
+    cmd = yd.build_cmd(pl, Path("/tmp/bgm"), audio_only=True, items="1-3")
+    s = " ".join(cmd)
+    assert "--yes-playlist" in cmd and "/tmp/bgm/%(playlist_title)s/%(playlist_index)03d - %(title)s.%(ext)s" in s
+    assert "-x" in cmd and "--audio-format" not in cmd and "--playlist-items" in cmd and "--download-archive" in cmd
+    assert cmd[-1] == pl
+    v = yd.build_cmd("https://youtu.be/abc", Path("/tmp/bgm"), audio_only=False, container="mkv")
+    assert "--no-playlist" in v and "/tmp/bgm/%(title)s.%(ext)s" in " ".join(v) and "bv*+ba/b" in v and "mkv" in v
+    mp3 = yd.build_cmd(pl, Path("/tmp/bgm"), audio_only=True, audio_format="mp3")
+    assert "--audio-format" in mp3 and "mp3" in mp3
+    for bad in ({"audio_format": "aac"}, {"container": "avi"}, {"items": "1; rm -rf"}):
+        try:
+            yd.build_cmd(pl, Path("/tmp/x"), audio_only=True, **bad)
+            raise AssertionError(bad)
+        except yd.AutocutError:
+            pass
