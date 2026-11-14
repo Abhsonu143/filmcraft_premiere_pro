@@ -513,7 +513,79 @@ pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
             return f.id;
         }
     }
-    prefer
+    system_fallback(c, &p).unwrap_or(prefer)
+}
+
+/// Fallback order among installed fonts: faces made for the script first, broad ones last.
+fn fallback_rank(family: &str) -> u8 {
+    let f = family.to_ascii_lowercase();
+    if f.starts_with('.') || f.contains("last resort") {
+        3 // (macOS private UI faces)
+    } else if [
+        "devanagari",
+        "bangla",
+        "gurmukhi",
+        "gujarati",
+        "tamil",
+        "telugu",
+        "kannada",
+        "malayalam",
+        "kohinoor",
+        "hiragino",
+        "pingfang",
+        "heiti",
+        "songti",
+        "arabic",
+        "geeza",
+        "hebrew",
+        "thai",
+        "noto sans",
+        "emoji",
+    ]
+    .iter()
+    .any(|k| f.contains(k))
+    {
+        0
+    } else if f.contains("arial unicode") {
+        2
+    } else {
+        1
+    }
+}
+
+/// An installed font for a character no loaded face has. The search reads each font file once
+/// and keeps only the face it picks (keeping every installed font cost 3 GB); the answer, also
+/// "none", is remembered per character.
+fn system_fallback(c: char, like: &Face) -> Option<FaceId> {
+    static FOUND: OnceLock<Mutex<HashMap<char, Option<FaceId>>>> = OnceLock::new();
+    let found = FOUND.get_or_init(Default::default);
+    if let Some(r) = found.lock().unwrap_or_else(PoisonError::into_inner).get(&c) {
+        return *r;
+    }
+    if cfg!(target_arch = "wasm32") || c.is_whitespace() {
+        return None;
+    }
+    scan_system();
+    let faces = all_faces();
+    let mut cands: Vec<&Arc<Face>> = faces.iter().filter(|f| f.info.origin == "system" && !f.is_loaded()).collect();
+    cands.sort_by_key(|f| (fallback_rank(&f.info.family), f.info.italic != like.info.italic, f.info.weight.abs_diff(like.info.weight)));
+    // one read per file, whatever its number of faces
+    let mut seen: HashMap<PathBuf, Option<Vec<u32>>> = HashMap::new();
+    let mut pick = None;
+    for f in cands {
+        let FaceData::File(path) = &f.info.data else { continue };
+        let covering = seen.entry(path.clone()).or_insert_with(|| {
+            let bytes = std::fs::read(path).ok()?;
+            let n = skrifa::FontRef::fonts(&bytes).count().min(256) as u32;
+            Some((0..n).filter(|i| FontRef::from_index(&bytes, *i).is_ok_and(|font| font.charmap().map(c).is_some_and(|g| g.to_u32() != 0))).collect())
+        });
+        if covering.as_ref().is_some_and(|v| v.contains(&f.info.index)) {
+            pick = Some(f.id);
+            break;
+        }
+    }
+    found.lock().unwrap_or_else(PoisonError::into_inner).insert(c, pick);
+    pick
 }
 
 #[cfg(test)]
@@ -539,6 +611,23 @@ mod tests {
         // Inter Bold Italic: nearest is Italic (400) → synth bold
         let bi = resolve("Inter", "Bold Italic");
         assert!(face(bi.face).info.italic && bi.synth_bold && !bi.synth_italic);
+    }
+
+    /// Regression: titles found a font for Hindi, Chinese or Arabic only among fonts already in
+    /// memory, which held only while every installed font was (the 3 GB leak). Now the installed
+    /// fonts are searched when needed and only the chosen one stays loaded.
+    #[test]
+    fn missing_characters_find_an_installed_font() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let inter = resolve("Inter", "Regular").face;
+        for c in ['क', '中', 'ع'] {
+            let f = face(fallback_for(c, inter));
+            assert!(f.has_char(c), "{c} fell back to {} without it", f.info.family);
+        }
+        let loaded = all_faces().iter().filter(|f| f.info.origin == "system" && f.is_loaded()).count();
+        assert!(loaded <= 12, "{loaded} system faces kept in memory");
     }
 
     #[test]

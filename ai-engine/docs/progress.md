@@ -351,3 +351,9 @@ Full description: `docs/voice-and-voiceover.md`.
   Measured: a fresh EI with the demo project went from 3.25 GB to 172 MB. Regression test
   `cjk::tests::finding_the_chinese_font_keeps_no_font_files` (fails on the old search).
 - `chrome_ui` header test: EI's menu bar lives in the header row; the test now counts it as header.
+- Follow-up: titles and text layers found a font for characters their font lacks (Hindi in an
+  Inter title, Chinese, Arabic, emoji) only among fonts already in memory, which worked only
+  because of the leak. `fallback_for` now searches the installed fonts when needed (each file read
+  once, script fonts first), keeps only the face it picks and remembers the answer per character.
+  Measured: Hindi → Kohinoor Devanagari 27 ms, Chinese → Heiti 42 ms, Arabic → Geeza Pro 0.47 s
+  (first time only; then µs). Test `missing_characters_find_an_installed_font`.
