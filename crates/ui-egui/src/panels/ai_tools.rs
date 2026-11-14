@@ -1556,6 +1556,201 @@ fn setup_open_id() -> egui::Id {
     egui::Id::new("ei-ai-setup-open")
 }
 
+fn health_open_id() -> egui::Id {
+    egui::Id::new("ei-ai-health-open")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Health check (ai-engine/health.py): memory, jobs and their processes, progress, leftovers
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Default)]
+struct HealthState {
+    running: bool,
+    report: Option<Value>,
+    error: String,
+    last: Option<Instant>,
+    auto: bool,
+}
+
+fn health() -> &'static Mutex<HealthState> {
+    static H: OnceLock<Mutex<HealthState>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(HealthState::default()))
+}
+
+/// Run the health check in the background (`clean`: also stop leftover model workers, never a
+/// running job). The report appears in the AI Health window when it is done.
+fn start_health(clean: bool) {
+    {
+        let mut h = health().lock().unwrap_or_else(PoisonError::into_inner);
+        if h.running {
+            return;
+        }
+        h.running = true;
+    }
+    let spawned = std::thread::Builder::new().name("ei-ai-health".into()).spawn(move || {
+        let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<Value, String> {
+            let engine = engine_dir().ok_or("The AI engine folder was not found.")?;
+            let mut cmd = Command::new(python(Some(&engine)));
+            cmd.arg(engine.join("health.py")).arg("--json").current_dir(&engine).env("PATH", child_path()).stdin(Stdio::null()).stderr(Stdio::null());
+            if clean {
+                cmd.arg("--clean");
+            }
+            let out = cmd.output().map_err(|e| format!("could not run the health check: {e}"))?;
+            serde_json::from_slice::<Value>(&out.stdout).map_err(|_| "the health check gave no report".to_string())
+        }));
+        let mut h = health().lock().unwrap_or_else(PoisonError::into_inner);
+        h.running = false;
+        h.last = Some(Instant::now());
+        match outcome {
+            Ok(Ok(v)) => {
+                h.report = Some(v);
+                h.error.clear();
+            }
+            Ok(Err(e)) => h.error = e,
+            Err(_) => h.error = "the health check stopped unexpectedly".into(),
+        }
+    });
+    if spawned.is_err() {
+        health().lock().unwrap_or_else(PoisonError::into_inner).running = false;
+    }
+}
+
+fn show_health(app: &mut FilmcraftApp, ctx: &egui::Context) {
+    let mut open = ctx.data(|m| m.get_temp::<bool>(health_open_id())).unwrap_or(false);
+    if !open {
+        return;
+    }
+    let (running, report, error, auto, due) = {
+        let h = health().lock().unwrap_or_else(PoisonError::into_inner);
+        (h.running, h.report.clone(), h.error.clone(), h.auto, h.last.is_none_or(|t| t.elapsed() > Duration::from_secs(30)))
+    };
+    if auto && due && !running {
+        start_health(false);
+    }
+    if running || auto {
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+    let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
+    let (mut again, mut clean, mut close) = (false, false, false);
+    let mut auto_now = auto;
+    let warn_c = egui::Color32::from_rgb(0xE5, 0x9B, 0x4B);
+    let ok_c = egui::Color32::from_rgb(0x5C, 0xC0, 0x7A);
+    egui::Window::new("AI Health").id(egui::Id::new("ei-ai-health")).open(&mut open).default_width(560.0).resizable(true).show(ctx, |ui| {
+        let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        ui.horizontal(|ui| {
+            let b = ui.add_enabled(!running, egui::Button::new(if running { "Checking…" } else { "Check Again" }));
+            elems.push(("ai.health.again".into(), b.rect, "Check Again".into()));
+            again = b.clicked();
+            let r = ui.checkbox(&mut auto_now, "Refresh every 30 s");
+            elems.push(("ai.health.auto".into(), r.rect, auto_now.to_string()));
+            let c = ui.button("Close");
+            elems.push(("ai.health.close".into(), c.rect, "Close".into()));
+            close = c.clicked();
+            if let Some(r) = &report {
+                ui.weak(format!("checked at {}", s(r, "time")));
+            }
+        });
+        if !error.is_empty() {
+            ui.colored_label(egui::Color32::from_rgb(0xE5, 0x6B, 0x6B), &error);
+        }
+        let Some(r) = report.as_ref() else {
+            ui.label(if running { "Checking…" } else { "No report yet." });
+            return;
+        };
+        ui.separator();
+        let m = r.get("memory").cloned().unwrap_or(Value::Null);
+        let swap = n(&m, "swap_gb");
+        let free = m.get("free_pct").and_then(Value::as_f64).map(|f| format!(", {f:.0}% free")).unwrap_or_default();
+        ui.colored_label(if swap > 4.0 { warn_c } else { ok_c }, format!("Memory: {:.0} GB{free} · swap in use {swap:.1} GB", n(&m, "ram_gb")));
+        let warnings: Vec<String> =
+            r.get("warnings").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+        if warnings.is_empty() {
+            ui.colored_label(ok_c, "✔ Nothing looks wrong");
+        }
+        for w in &warnings {
+            ui.colored_label(warn_c, format!("⚠ {w}"));
+        }
+        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            let jobs = r.get("jobs").and_then(Value::as_array).cloned().unwrap_or_default();
+            ui.add_space(4.0);
+            ui.strong(if jobs.is_empty() { "AI jobs: none running".to_string() } else { format!("AI jobs running: {}", jobs.len()) });
+            for j in &jobs {
+                ui.label(format!("{} (running {})", s(j, "what"), s(j, "up")));
+                egui::Grid::new(("ei-health-job", j.get("pid").and_then(Value::as_u64).unwrap_or(0))).striped(true).show(ui, |ui| {
+                    for p in j.get("processes").and_then(Value::as_array).into_iter().flatten() {
+                        ui.weak(s(p, "role"));
+                        ui.weak(format!("cpu {:.0}%", n(p, "cpu")));
+                        ui.weak(format!("{:.0} MB", n(p, "memory_mb")));
+                        ui.weak(format!("up {}", s(p, "up")));
+                        ui.end_row();
+                    }
+                });
+            }
+            let work = r.get("work").and_then(Value::as_array).cloned().unwrap_or_default();
+            if !work.is_empty() {
+                ui.add_space(4.0);
+                ui.strong("Work in progress");
+                for w in &work {
+                    let rate = w.get("per_item_s").and_then(Value::as_f64).map(|x| format!(", one every {x:.0} s")).unwrap_or_default();
+                    let ago = n(w, "last_ago_s");
+                    let line = format!("{}: {:.0} {}{rate}, last saved {} ago", s(w, "folder"), n(w, "count"), s(w, "kind"), fmt_duration(ago));
+                    if ago > 600.0 {
+                        ui.colored_label(warn_c, line)
+                    } else {
+                        ui.label(line)
+                    };
+                }
+            }
+            let left = r.get("leftovers").and_then(Value::as_array).cloned().unwrap_or_default();
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.strong(if left.is_empty() { "Leftovers: none".to_string() } else { format!("Leftovers from finished jobs: {}", left.len()) });
+                let c = ui
+                    .add_enabled(!left.is_empty() && !running, egui::Button::new("Clean Leftovers"))
+                    .on_hover_text("Stops model processes whose job is gone (never a running job)");
+                elems.push(("ai.health.clean".into(), c.rect, "Clean Leftovers".into()));
+                clean = c.clicked();
+            });
+            for x in &left {
+                ui.weak(format!("{} pid {} · {:.0} MB · up {}", s(x, "role"), n(x, "pid"), n(x, "memory_mb"), s(x, "up")));
+            }
+            let cleaned = r.get("cleaned").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+            if cleaned > 0 {
+                ui.colored_label(ok_c, format!("Stopped {cleaned} leftover process(es)"));
+            }
+            let others: Vec<String> = r
+                .get("others")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().map(|o| format!("{} {:.0} MB", s(o, "name"), n(o, "memory_mb"))).collect())
+                .unwrap_or_default();
+            if !others.is_empty() {
+                ui.add_space(4.0);
+                ui.strong("Heaviest other apps");
+                ui.weak(others.join(" · "));
+            }
+        });
+    });
+    for (id, r, l) in elems {
+        app.auto.add(&id, r, &l);
+    }
+    if auto_now != auto {
+        health().lock().unwrap_or_else(PoisonError::into_inner).auto = auto_now;
+    }
+    if again {
+        start_health(false);
+    }
+    if clean {
+        start_health(true);
+    }
+    if close {
+        open = false;
+        health().lock().unwrap_or_else(PoisonError::into_inner).auto = false;
+    }
+    ctx.data_mut(|m| m.insert_temp(health_open_id(), open));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Engine discovery
 // ---------------------------------------------------------------------------------------------
@@ -2505,6 +2700,12 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             }
             Ok(json!({"waiting": q.items.iter().map(|i| i.title.clone()).collect::<Vec<_>>(), "paused": q.paused}))
         }
+        "ai.health" => {
+            ctx.data_mut(|m| m.insert_temp(health_open_id(), true));
+            start_health(params.get("clean").and_then(Value::as_bool).unwrap_or(false));
+            let h = health().lock().unwrap_or_else(PoisonError::into_inner);
+            Ok(json!({"report": h.report, "running": h.running, "error": h.error}))
+        }
         "ai.queueImport" => {
             let v = match params.get("path").and_then(Value::as_str) {
                 Some(path) => {
@@ -2597,6 +2798,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     tick_queue();
     show_draft(app, ctx);
     show_jobs(app, ctx);
+    show_health(app, ctx);
     show_setup(app, ctx);
     import_finished(app);
     if jobs().lock().unwrap_or_else(PoisonError::into_inner).iter().any(|j| j.status == Status::Running) {
@@ -4379,6 +4581,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut import_file = false;
     let mut export_file = false;
     let mut clear = false;
+    let mut check_health = false;
     egui::Window::new("AI Jobs").id(egui::Id::new("ei-ai-jobs")).open(&mut open).default_width(600.0).resizable(true).show(ctx, |ui| {
         // the queue: what waits (in the order it will run), and its controls
         ui.horizontal(|ui| {
@@ -4575,9 +4778,14 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 ui.separator();
             }
         });
-        let c = ui.button("Clear Finished");
-        elems.push(("ai.jobs.clearFinished".into(), c.rect, "Clear Finished".into()));
-        clear = c.clicked();
+        ui.horizontal(|ui| {
+            let c = ui.button("Clear Finished");
+            elems.push(("ai.jobs.clearFinished".into(), c.rect, "Clear Finished".into()));
+            clear = c.clicked();
+            let h = ui.button("Check Health").on_hover_text("Memory, each job's processes, progress on disk, leftovers");
+            elems.push(("ai.jobs.health".into(), h.rect, "Check Health".into()));
+            check_health = h.clicked();
+        });
     });
     for (id, r, l) in elems {
         app.auto.add(&id, r, &l);
@@ -4585,6 +4793,10 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if let Some(t) = copy {
         ctx.copy_text(t);
         app.ui.status = "Log copied".into();
+    }
+    if check_health {
+        ctx.data_mut(|m| m.insert_temp(health_open_id(), true));
+        start_health(false);
     }
     if let Some(j) = cancel {
         cancel_job(j);

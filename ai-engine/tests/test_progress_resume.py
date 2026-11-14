@@ -129,3 +129,13 @@ def test_runaway_take_limits():
     assert 8.0 <= audio < 20 and secs >= 120
     long_audio, _ = vo.take_limits("x" * 260)
     assert long_audio > 50
+
+
+def test_health_report_has_everything_the_app_shows():
+    import health
+
+    r = health.check(clean=False)
+    assert set(r) >= {"memory", "jobs", "work", "leftovers", "others", "warnings", "cleaned", "time"}
+    assert r["memory"]["ram_gb"] > 0 and r["cleaned"] == []
+    json.dumps(r)  # (the app reads it as JSON)
+    assert health.describe("/x/python /a/ei_engine.py topic gta 6 news --voice v --seconds 60") == "topic: gta 6 news"

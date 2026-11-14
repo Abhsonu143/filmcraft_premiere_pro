@@ -259,6 +259,26 @@ fn ai_menu_and_dialogs() {
         d.frames(3);
         assert!(d.ids(&format!("ai.{kind}.")).is_empty(), "{kind}: Escape closes the dialog");
     }
+    // The health check: a report in its own window (it runs in the background).
+    let r = d.run("ai.health", json!({}));
+    assert!(r.get("running").is_some(), "{r}");
+    let mut ready = false;
+    for _ in 0..200 {
+        d.frames(1);
+        if !d.ids("ai.health.clean").is_empty() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ready, "the health report appears");
+    for id in ["ai.health.again", "ai.health.auto", "ai.health.clean"] {
+        assert!(!d.ids(id).is_empty(), "{id}");
+    }
+    d.snapshot("health");
+    d.ok("ui.click", json!({"id": "ai.health.close"}));
+    d.frames(3);
+    assert!(d.ids("ai.health.").is_empty(), "Close closes the health window");
     // Hostile parameters are errors, not crashes.
     let bad = d.call("engine.execute", json!({"command": "ai.split", "params": {"input": "/no/such.mp4", "clipLength": -1}}));
     assert_eq!(bad["ok"], json!(false));

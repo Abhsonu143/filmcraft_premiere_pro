@@ -47,7 +47,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/ai-engine"
 cp "$BIN" "$APP/Contents/MacOS/EI"
 
 # AI engine: the Python sources and requirements only (no venv, fixtures or caches).
-( cd "$ROOT/ai-engine" && cp ./*.py requirements.txt README.md "$APP/Contents/Resources/ai-engine/" )
+( cd "$ROOT/ai-engine" && cp ./*.py requirements.txt README.md "$APP/Contents/Resources/ai-engine/" && mkdir -p "$APP/Contents/Resources/ai-engine/tools" && cp tools/*.py "$APP/Contents/Resources/ai-engine/tools/" )
 
 # Icon
 PY=""
