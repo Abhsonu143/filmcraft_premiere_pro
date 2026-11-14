@@ -420,3 +420,27 @@ Full description: `docs/voice-and-voiceover.md`.
   protocol against a stand-in (order, Threads gets the video link, failures kept and retried alone,
   scheduling sends YouTube/Facebook ahead and the rest when due); the window has a UI test
   (social_posting_window) that fills the words from a real package and checks the tabs.
+
+## 2026-11-14: Studio thumbnails (designed from scratch), now the default style
+
+- Feedback: the thumbnails looked flat (a frame with words). Now (`thumb_studio.py`): an art
+  director (Claude Code with the Read tool, looking at a numbered sheet of the best frames) plans
+  different concepts — layout (hero left/right, versus, reaction + object with an arrow, big
+  number), subject frame, 1–3 words + highlight + kicker per language, palette, a background prompt,
+  a prop, ring/arrow/badge. Each concept is built in layers: a background generated from scratch by
+  LCM Dreamshaper v7 (MIT; diffusers on MPS, 6 steps, ~5–7 s an image on the M3 once loaded, in the
+  one-heavy-model worker), light rays and a glow behind the subject; the subject cut out of the clip
+  with Apple Vision's foreground mask (burned-in text removed; dark subjects lifted), white outline,
+  coloured glow, rim light; a prop from Wikimedia Commons / Openverse (openly licensed, must match
+  the query — numbers included — credited in credits.txt), cut out and tilted, arrow or ring; pro
+  lettering: Anton / Mukta ExtraBold (OFL, downloaded once to the cache), libass for shaping, then a
+  gradient fill, thick stroke, 3-D extrusion, soft shadow and a slight tilt, the line split that
+  makes the words biggest (balanced when equal), a kicker slab with readable ink. A critic (Claude,
+  looking at the concepts at feed size) ranks them; variant 1 is its pick.
+- Iterated five times on the GTA 6 clips, looking at each result: fixed fonts not downloading
+  (certifi), white-on-white kickers and badges, tiny one-line words in narrow boxes, a backlit
+  silhouette, a PS3 found for "PlayStation 5" (caught by the critic), props/arrows off the 4:5 edge,
+  a badge over the kicker. Each try kept in ~/Movies/EI/Thumbnails/studio.
+- "Simple" (the earlier frame + words) stays as a choice (`--style simple`, dialog ▸ Style).
+- A full run (3 concepts × 2 platforms × 2 languages) takes ~3 minutes: Claude's planning and
+  critique ~1.5 min, backgrounds ~45 s.

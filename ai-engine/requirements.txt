@@ -25,3 +25,6 @@ opencv-python-headless>=4.9
 # weights CC BY-NC 4.0: personal use); both through Hugging Face transformers (Apache-2.0).
 transformers>=4.45
 soundfile>=0.12
+# thumbnails designed from scratch: backgrounds by a local image model (LCM Dreamshaper v7, MIT)
+diffusers>=0.32
+accelerate

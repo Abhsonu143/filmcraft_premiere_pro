@@ -568,6 +568,14 @@ def compose(frame: dict, platform: str, text: str, highlight: str, lang: str, st
     return notes
 
 
+class _nothing:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 def preview_sheet(items: list[tuple[str, Path]], out: Path) -> None:
     """Every thumbnail at the size people see it: landscape at YouTube's home-feed size, vertical at
     a phone's grid size."""
@@ -782,7 +790,7 @@ def txt_for(platform: str, lang: str, c: dict) -> str:
 
 def make(clips: list[str], topic: str, *, hook: str = "", find_hook: bool = False, platforms: list[str] | None = None, langs: list[str] | None = None,
          variants: int = 3, out_dir: str | None = None, niche: str = "", notes: str = "", writer: str = "claude", model: str | None = None,
-         fresh_words: bool = False) -> dict:
+         fresh_words: bool = False, style: str = "studio") -> dict:
     ac.require_tools()
     platforms = [p for p in (platforms or ["youtube"]) if p in PLATFORMS] or ["youtube"]
     langs = [l for l in (langs or ["en"]) if l in LANGUAGES] or ["en"]
@@ -808,19 +816,28 @@ def make(clips: list[str], topic: str, *, hook: str = "", find_hook: bool = Fals
     with tempfile.TemporaryDirectory(prefix="ei-thumbs-") as tmp:
         work = Path(tmp)
         with ac.stage("frames"):
-            frames = pick_frames(paths, f"{topic}. {hook}".strip(". "), variants, work)
-        with ac.stage("thumbnails"):
+            # the studio's art director chooses among more frames than it needs
+            frames = pick_frames(paths, f"{topic}. {hook}".strip(". "), max(8, 3 * variants) if style == "studio" else variants, work)
+        credits: list[str] = []
+        if style == "studio":
+            import thumb_studio as ts
+
+            with ac.stage("thumbnails"):
+                made, credits, concepts = ts.make(frames, topic, hook, copy, {p: PLATFORMS[p]["size"] for p in platforms}, langs, variants, folder, work,
+                                                  niche=niche, writer=writer, model=model)
+            sheet = [(f"{PLATFORMS[m['platform']]['label']} · {LANGUAGES[m['language']]} · {m['variant']}", Path(m["path"])) for m in made]
+        with ac.stage("thumbnails") if style != "studio" else _nothing():
             total = len(platforms) * len(langs) * variants
             k = 0
-            for p in platforms:
+            for p in (platforms if style != "studio" else []):
                 for l in langs:
                     words_ = copy[l]["thumbnail"] or [{"text": hook or topic, "highlight": ""}]
                     for v in range(variants):
                         frame = frames[v % len(frames)]
                         w = words_[v % len(words_)]
-                        style = STYLES[v % len(STYLES)]
+                        look = STYLES[v % len(STYLES)]
                         out = folder / "thumbnails" / f"{p}-{l}-{v + 1}.jpg"
-                        notes_ = compose(frame, p, w["text"], w.get("highlight", ""), l, style, out, work)
+                        notes_ = compose(frame, p, w["text"], w.get("highlight", ""), l, look, out, work)
                         made.append({"platform": p, "language": l, "variant": v + 1, "path": str(out), **{k_: v_ for k_, v_ in notes_.items() if k_ != "text_box"}})
                         sheet.append((f"{PLATFORMS[p]['label']} · {LANGUAGES[l]} · {v + 1}", out))
                         k += 1
@@ -840,7 +857,10 @@ def make(clips: list[str], topic: str, *, hook: str = "", find_hook: bool = Fals
     issues = [f"{Path(m['path']).name}: the words cover part of the subject" for m in made if m.get("covers_subject", 0) > 0.15]
     issues += [f"{Path(m['path']).name}: the words reach the platform's badge area" for m in made if m.get("under_badge")]
     issues += [f"{Path(m['path']).name}: the frame was enlarged (the source is small; a sharper clip looks better)" for m in made if m.get("upscaled")]
-    package = {"version": 1, "topic": topic, "hook": hook, "platforms": platforms, "languages": langs, "copy": copy, "thumbnails": made,
+    if credits:
+        (folder / "credits.txt").write_text("Pictures used in the thumbnails (openly licensed; credit them where the licence asks):\n"
+                                            + "\n".join(f"- {c}" for c in dict.fromkeys(credits)) + "\n", encoding="utf-8")
+    package = {"version": 1, "style": style, "credits": list(dict.fromkeys(credits)), "topic": topic, "hook": hook, "platforms": platforms, "languages": langs, "copy": copy, "thumbnails": made,
                "frames": [{"src": f["src"], "t": round(f["t"], 2), "score": round(float(f["score"]), 2)} for f in frames], "issues": issues,
                "made": time.strftime("%Y-%m-%d %H:%M")}
     (folder / "package.json").write_text(json.dumps(package, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -865,12 +885,14 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--writer", default="claude", choices=["claude", "rules"])
     p.add_argument("--model", default=None)
     p.add_argument("--fresh-words", action="store_true", help="write new words even if this topic was done earlier today")
+    p.add_argument("--style", default="studio", choices=["studio", "simple"],
+                   help="studio: designed from scratch (art director, generated backgrounds, cut-outs, props, pro lettering); simple: a frame with words")
     p.add_argument("--out-dir", default=None)
 
 
 def run_args(a) -> dict:
     return make(a.clips, a.topic, hook=a.hook, find_hook=a.find_hook, platforms=a.platforms, langs=a.languages, variants=a.variants,
-                out_dir=a.out_dir, niche=a.niche, notes=a.notes, writer=a.writer, model=a.model, fresh_words=a.fresh_words)
+                out_dir=a.out_dir, niche=a.niche, notes=a.notes, writer=a.writer, model=a.model, fresh_words=a.fresh_words, style=a.style)
 
 
 def main(argv: list[str] | None = None) -> int:

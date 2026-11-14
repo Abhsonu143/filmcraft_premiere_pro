@@ -224,6 +224,8 @@ fn ai_menu_and_dialogs() {
                 "platform.reels",
                 "lang.en",
                 "lang.hi",
+                "style.studio",
+                "style.simple",
                 "variants",
                 "niche",
                 "out",
