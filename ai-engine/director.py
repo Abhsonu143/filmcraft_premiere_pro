@@ -323,7 +323,7 @@ def unary(slot: dict, c: dict, f: dict, speed: float, progress: float, opts: dic
     return s
 
 
-def candidates(slot: dict, clips: list[dict], fps: float, progress: float, opts: dict, k: int = 28, ref_sims=None) -> list[dict]:
+def candidates(slot: dict, clips: list[dict], fps: float, progress: float, opts: dict, k: int | None = 28, ref_sims=None) -> list[dict]:
     d = slot["frames"] / fps
     out = []
     for ci, c in enumerate(clips):
@@ -350,7 +350,7 @@ def candidates(slot: dict, clips: list[dict], fps: float, progress: float, opts:
         if best:
             out.append(best)
     out.sort(key=lambda x: -x["score"])
-    return out[:k]
+    return out if k is None else out[:k]
 
 
 def peak_offset(c: dict, start: float, src: float) -> float:
@@ -396,12 +396,17 @@ def recent_subject_penalty(seq: list[dict], cur: dict, clips: list[dict], window
     return -0.45 if main in recent else 0.0
 
 
+CANDIDATES_PER_SHOT = 28
+
+
 def sequence(slots: list[dict], clips: list[dict], fps: float, opts: dict, beam: int = 14, ref_sims=None) -> list[dict]:
     n = len(slots)
     cands = []
     t0 = time.time()
     for i, sl in enumerate(slots):
-        cs = candidates(sl, clips, fps, i / max(1, n - 1), opts, ref_sims=(lambda ci, st, src, i=i: ref_sims(i, ci, st, src)) if ref_sims else None)
+        # every clip, best first: the search takes the best ones not used yet (only the top 28 ran
+        # out when a long edit kept wanting the same kind of shot, and the best one then repeated)
+        cs = candidates(sl, clips, fps, i / max(1, n - 1), opts, k=None, ref_sims=(lambda ci, st, src, i=i: ref_sims(i, ci, st, src)) if ref_sims else None)
         if not cs:
             raise AutocutError(f"no clip can fill shot {i + 1} ({sl['frames'] / fps:.1f}s)")
         cands.append(cs)
@@ -410,12 +415,20 @@ def sequence(slots: list[dict], clips: list[dict], fps: float, opts: dict, beam:
     for i in range(n):
         nxt = []
         for score, seq, used, embs in states:
+            tried = 0
             for c in cands[i]:
+                if tried >= CANDIDATES_PER_SHOT:
+                    break
                 pen = 0.0
                 if c["clip"] in used:
                     if len(used) < len(clips):
                         continue
                     pen -= 1.5
+                    # every clip shown: repeat the one seen longest ago, never a recent one
+                    last = max((k for k, x in enumerate(seq) if x["clip"] == c["clip"]), default=-99)
+                    if len(seq) - last <= min(8, len(clips) - 1):
+                        continue
+                tried += 1
                 if seq:
                     pen += pair_cost(seq[-1], c, clips, slots[i], embs)
                     pen += recent_subject_penalty(seq + [c], c, clips)
@@ -425,9 +438,10 @@ def sequence(slots: list[dict], clips: list[dict], fps: float, opts: dict, beam:
                             pen -= 0.15
                 e = emb_at(clips[c["clip"]], c["in"] + c["src"] / 2)
                 nxt.append((score + c["score"] + pen, seq + [c], used | {c["clip"]}, embs + ([e] if e is not None else [])))
-        if not nxt:  # every clip used: allow repeats
+        if not nxt:  # (only a clip shown a moment ago fits): the one seen longest ago
             for score, seq, used, embs in states:
-                c = cands[i][0]
+                ago = {x["clip"]: k for k, x in enumerate(seq)}
+                c = min(cands[i], key=lambda c: (ago.get(c["clip"], -99), -c["score"]))
                 nxt.append((score + c["score"] - 1.5, seq + [c], used, embs))
         nxt.sort(key=lambda x: -x[0])
         states = nxt[:beam]
@@ -655,10 +669,15 @@ def song_effects(video: Path, plan: dict, opts: dict) -> None:
         mixed = Path(tmp) / "mixed.wav"
         sp = score.render(str(song), song_lines(plan.get("sections") or []), total, mixed, duck_db=0.0, cuts=cuts,
                           plan_path=video.with_suffix(".score.json"), **{**opts, "music": False})
-        out = Path(tmp) / "out.mp4"
-        ac.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(mixed), "-map", "0:v", "-map", "1:a",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)])
-        out.replace(video)
+        # written next to the video, then swapped in: a rename only works within one drive (the
+        # temporary folder is on the Mac's disk, the edit may be on an external one)
+        out = video.with_name(video.stem + ".sound.part.mp4")
+        try:
+            ac.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(mixed), "-map", "0:v", "-map", "1:a",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)])
+            out.replace(video)
+        finally:
+            out.unlink(missing_ok=True)
     log(f"sound design: {len(sp['events'])} effects on the song")
 
 

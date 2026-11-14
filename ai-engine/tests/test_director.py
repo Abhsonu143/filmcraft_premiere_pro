@@ -107,3 +107,30 @@ def test_music_edit_from_a_video_soundtrack(song, clips, tmp_path, capsys):
     used = [s["clip"] for s in plan["shots"]]
     assert len(set(used)) == len(used) or len(used) > 6  # no clip twice while unused ones remain
     assert plan["shots"][-1].get("fade_out")
+
+
+def test_long_edit_does_not_repeat_one_clip(monkeypatch):
+    """Regression: only each shot's 28 best clips were searched; when a long section kept wanting
+    the same kind of shot they ran out, and the single best clip filled every remaining shot."""
+    import director as dr
+
+    n_clips, n_slots = 57, 38
+    clips = [{"dur": 10.0} for _ in range(n_clips)]
+
+    def cands(slot, clips_, fps, progress, opts, k=28, ref_sims=None):
+        out = [{"clip": ci, "in": 0.5, "speed": 1.0, "src": 1.0, "score": 1.0 - ci / 100, "f": {}} for ci in range(n_clips)]
+        return out if k is None else out[:k]
+
+    monkeypatch.setattr(dr, "candidates", cands)
+    monkeypatch.setattr(dr, "pair_cost", lambda *a: 0.0)
+    monkeypatch.setattr(dr, "recent_subject_penalty", lambda *a: 0.0)
+    monkeypatch.setattr(dr, "at_second", lambda *a: None)
+    monkeypatch.setattr(dr, "emb_at", lambda *a: None)
+    slots = [{"frames": 24} for _ in range(n_slots)]
+    seq = dr.sequence(slots, clips, 24.0, {})
+    used = [s["clip"] for s in seq]
+    assert len(set(used)) == n_slots, f"repeats: {used}"
+    # more shots than clips: repeats only of clips not seen within the last few shots
+    seq = dr.sequence([{"frames": 24} for _ in range(70)], clips, 24.0, {})
+    used = [s["clip"] for s in seq]
+    assert all(used[i] not in used[max(0, i - 8):i] for i in range(len(used)))

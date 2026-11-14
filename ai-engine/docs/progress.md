@@ -357,3 +357,11 @@ Full description: `docs/voice-and-voiceover.md`.
   once, script fonts first), keeps only the face it picks and remembers the answer per character.
   Measured: Hindi → Kohinoor Devanagari 27 ms, Chinese → Heiti 42 ms, Arabic → Geeza Pro 0.47 s
   (first time only; then µs). Test `missing_characters_find_an_installed_font`.
+- Auto Edit Clips to Music on an external drive failed at the very end with "Cross-device link":
+  sound design wrote the new file in the Mac's temporary folder and renamed it onto the edit, and a
+  rename cannot cross drives. It is now written next to the edit and swapped in. Same edit also
+  repeated one clip for shots 29–37: each shot only searched its 28 best clips, which a long
+  high-energy section used up, and the fallback took the best clip every time. The search now
+  takes the best unused clips from all of them, and repeats (only once every clip is shown) the
+  one seen longest ago. Rerun of the user's 37 s GTA edit: 38 different clips in 38 shots.
+  Test `test_long_edit_does_not_repeat_one_clip` (fails on the old search).
