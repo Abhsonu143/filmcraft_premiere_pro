@@ -92,3 +92,12 @@ def test_planner_inputs_moments_and_plans(tmp_path):
                             {"title": "Bad", "parts": [{"recording": "R9", "start": "0:00:00", "end": "0:00:10"}]},
                             {"title": "Past the end", "parts": [{"recording": "R1", "start": "0:09:00", "end": "0:10:00"}]}], [a])
     assert [p["title"] for p in plans] == ["Boss fight"] and plans[0]["parts"][0]["start"] == 100.0 and plans[0]["total_s"] == 30.0
+
+
+def test_model_workers_keep_mlx_cache_small(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ac, "_mlx_tidy", lambda start: calls.append(start))
+    assert ac._isolated_call(lambda a, b: a + b, 2, 3) == 5
+    with pytest.raises(ValueError):
+        ac._isolated_call(lambda: (_ for _ in ()).throw(ValueError("x")))
+    assert calls == [True, False, True, False]  # capped before, emptied after, even when the model fails

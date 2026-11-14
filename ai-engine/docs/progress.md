@@ -515,7 +515,9 @@ Full description: `docs/voice-and-voiceover.md`.
 - Long-video sound (`clip_edit.signals`, `highlights` loudness, `montage` loudest window and motion): read in 10-minute blocks.
 - Music analysis: reads only the first 30 minutes of a long video's sound.
 
-Measured on the M3 with 8 GB: a 30-minute PS5 recording's clip analysis peaked at 161 MB. Transcribing 86 minutes took 206 s (9 pieces), and the whole job peaked at 1.2 GB.
+Measured on the M3 with 8 GB: a 30-minute PS5 recording's clip analysis peaked at 161 MB. That transcription figure (1.2 GB for 86 minutes) counted only normal process memory and missed GPU memory.
+
+**MLX's GPU cache.** In a real talk job, the Whisper worker's full footprint reached 5.4 GB, 5.2 GB of it GPU buffers. MLX keeps every buffer it frees for reuse and never returns it. Every model worker (Whisper, the local LLM, voice) now caps that cache at 256 MB before each call and empties it afterwards (`autocut._isolated_call`). Measured by full footprint, including GPU, transcribing 86 minutes now stays at 1.1–1.6 GB across all 9 pieces (176 s).
 
 **Gameplay plans** (`gameplay-plan`; Talking Head Auto-Cut ▸ "Plan videos"). The input is a list of recordings in playing order. They are analysed one at a time:
 - the speech, saved as `<name>.ei.srt`;

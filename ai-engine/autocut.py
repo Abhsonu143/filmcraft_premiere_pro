@@ -586,6 +586,35 @@ def _worker_init(parent: int) -> None:
     _threading.Thread(target=watch, name="ei-parent-watch", daemon=True).start()
 
 
+MLX_CACHE_LIMIT = 256 << 20  # bytes of freed GPU buffers MLX may keep for reuse
+
+
+def _mlx_tidy(start: bool) -> None:
+    """MLX (Whisper, the local LLM, voice cloning) keeps every GPU buffer it ever freed for reuse and
+    never gives it back: over a long transcription that grew to 5 GB on an 8 GB Mac. Cap that cache
+    before a call and empty it after."""
+    try:
+        import mlx.core as mx
+    except Exception:  # (no MLX: nothing to tidy)
+        return
+    try:
+        if start:
+            mx.set_cache_limit(MLX_CACHE_LIMIT)
+        else:
+            mx.clear_cache()
+    except Exception:
+        pass
+
+
+def _isolated_call(fn, *args):
+    """What a model worker runs: `fn`, with MLX's buffer cache kept small."""
+    _mlx_tidy(True)
+    try:
+        return fn(*args)
+    finally:
+        _mlx_tidy(False)
+
+
 class Isolated:
     """A model worker in its own process. `run` may be called several times (the model a function
     loads stays loaded in the worker between calls); `close` (or the end of a `with` block) frees it.
@@ -628,7 +657,7 @@ class Isolated:
     def run(self, fn, *args):
         if self.ex is None:
             self._start()
-        fut = self.ex.submit(fn, *args)
+        fut = self.ex.submit(_isolated_call, fn, *args)
         seen, last = "", time.time()
         while True:
             try:
