@@ -142,19 +142,22 @@ def assign_shots(
 # ---------------------------------------------------------------------------------------------
 
 
-def _frames_rgb(path: str, every: float, size: int = 224):
-    import numpy as np
+def iter_frames_rgb(path: str, every: float, size: int = 224):
+    """One frame every `every` seconds, one at a time (never the whole clip in memory)."""
+    import footage as fo
 
-    proc = subprocess.run(
+    yield from fo.iter_frames(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-hwaccel", "videotoolbox", "-i", path, "-an",
          "-vf", f"fps=1/{every:g},scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}",
-         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        return np.zeros((0, size, size, 3), dtype=np.uint8)
-    n = len(proc.stdout) // (size * size * 3)
-    return np.frombuffer(proc.stdout[: n * size * size * 3], dtype=np.uint8).reshape(n, size, size, 3)
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], size, size)
+
+
+def _frames_rgb(path: str, every: float, size: int = 224):
+    """All of them at once (short clips; long ones go through iter_frames_rgb)."""
+    import numpy as np
+
+    fr = [f.copy() for f in iter_frames_rgb(path, every, size)]
+    return np.stack(fr) if fr else np.zeros((0, size, size, 3), dtype=np.uint8)
 
 
 def _clip_worker(to_index: list[str], texts: list[str], every: float) -> dict:
@@ -170,13 +173,10 @@ def _clip_worker(to_index: list[str], texts: list[str], every: float) -> dict:
     tokenizer = open_clip.get_tokenizer(CLIP_MODEL[0])
     images: dict[str, list] = {}
     with torch.no_grad():
+        import footage as fo
+
         for path in to_index:
-            frames = _frames_rgb(path, every)
-            embs = []
-            for i in range(0, len(frames), 16):
-                batch = torch.stack([preprocess(Image.fromarray(f)) for f in frames[i : i + 16]]).to(device)
-                e = model.encode_image(batch)
-                embs.append((e / e.norm(dim=-1, keepdim=True)).float().cpu().numpy())
+            embs = fo.embed_stream(iter_frames_rgb(path, every), model, preprocess, device)
             images[path] = (np.concatenate(embs) if embs else np.zeros((0, EMBED_DIM), np.float32)).tolist()
         text_embs = []
         if texts:

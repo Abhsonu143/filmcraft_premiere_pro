@@ -298,13 +298,13 @@ def merge_close(pieces: list[tuple[float, float]], gap: float = 0.12) -> list[tu
 def loudness_per_sentence(src: str, sents: list[dict]) -> list[float]:
     import montage as mt
 
-    y = mt.decode_mono(src, 8000)
-    if len(y) == 0:
+    rms = mt.rms_blocks(src, 8000, 400)  # 50 ms blocks, read in pieces
+    if len(rms) == 0:
         return [0.0] * len(sents)
     db = []
     for s in sents:
-        a, b = int(s["start"] * 8000), int(s["end"] * 8000)
-        seg = y[a:b]
+        a, b = int(s["start"] * 20), int(s["end"] * 20)
+        seg = rms[a:b]
         db.append(20 * math.log10(max(1e-5, float(np.sqrt(np.mean(seg**2))))) if len(seg) else -60.0)
     arr = np.asarray(db)
     mu_, sd = float(np.median(arr)), float(arr.std() + 1e-6)

@@ -21,6 +21,8 @@ import autocut as ac
 import montage as mt
 from autocut import AutocutError, log
 
+MAX_SECONDS = 1800.0  # the longest stretch of audio analysed for music
+
 VERSION = "music-v2"
 
 
@@ -54,7 +56,12 @@ def analyse(path: str) -> dict:
     cache = ac.CACHE_DIR / "music" / f"{key}.json"
     if cache.is_file():
         return json.loads(cache.read_text())
-    y = mt.decode_mono(path)
+    # a song, or the sound of any video: a long video is analysed for its first 30 minutes only
+    # (enough to choose a stretch; the whole of a 4-hour file at 22 kHz would need gigabytes)
+    total = ac.probe(path).duration
+    y = mt.decode_mono(path, mt.SR, 0.0, MAX_SECONDS if total > MAX_SECONDS else None)
+    if total > MAX_SECONDS:
+        log(f"the audio is {total / 60:.0f} min long: the music is read from its first {MAX_SECONDS / 60:.0f} min")
     if len(y) < mt.SR:
         raise AutocutError("the audio is shorter than one second")
     duration = len(y) / mt.SR

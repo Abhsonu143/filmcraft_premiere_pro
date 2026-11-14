@@ -80,12 +80,19 @@ def signals(src: str, duration: float) -> dict[str, np.ndarray]:
         i = int(round(j / fo.FPS * HZ))
         if 0 <= i < n:
             cut[i] = 1.0
-    y = mt.decode_mono(src, 8000)
     hop = 400  # 50 ms
-    m = len(y) // hop
-    rms = np.sqrt((y[: m * hop].reshape(m, hop) ** 2).mean(axis=1)) if m else np.zeros(0)
+    # the sound in 10-minute pieces (a 4-hour file at once was ~0.5 GB plus its spectrum)
+    rms_parts, fl_parts, carry = [], [], np.zeros(0, np.float32)
+    for y in fo.iter_audio(src, 8000):
+        y = np.concatenate([carry, y])
+        m = len(y) // hop
+        if m:
+            rms_parts.append(np.sqrt((y[: m * hop].reshape(m, hop) ** 2).mean(axis=1)))
+            fl_parts.append(_flux(y[: m * hop], hop))
+        carry = y[m * hop:]
+    rms = np.concatenate(rms_parts) if rms_parts else np.zeros(0, np.float32)
     db = 20 * np.log10(np.maximum(rms, 1e-5))
-    fl = _flux(y, hop)
+    fl = np.concatenate(fl_parts) if fl_parts else np.zeros(0, np.float32)
 
     def per10(v: np.ndarray, how) -> np.ndarray:
         out = np.full(n, float(v.min()) if len(v) else 0.0, np.float32)

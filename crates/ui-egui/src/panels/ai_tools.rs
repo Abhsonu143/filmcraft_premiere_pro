@@ -264,6 +264,12 @@ struct Draft {
     find_hook: bool,
     /// Editing this waiting queue item (its id) instead of starting a new job.
     queue_edit: Option<u64>,
+    /// Talking Head Auto-Cut: "cut" (the pauses of one video) or "plan" (videos from a list of gameplay recordings).
+    talk_mode: &'static str,
+    /// Plan mode: the game (researched online), how many plans, only analyse.
+    game: String,
+    plan_count: f64,
+    analyse_only: bool,
     /// Opened from AI Jobs ▸ Edit & Retry: the dialog asks what should be better.
     retrying: bool,
     /// What did not come out right last time (music edits, Video from Topic): kept with the result.
@@ -457,6 +463,10 @@ impl Draft {
             hook_line: String::new(),
             find_hook: false,
             queue_edit: None,
+            talk_mode: "cut",
+            game: String::new(),
+            plan_count: 12.0,
+            analyse_only: false,
             retrying: false,
             feedback: String::new(),
             url: String::new(),
@@ -631,6 +641,14 @@ impl Draft {
             d.pk_variants = n.round().clamp(1.0, 6.0);
         }
         d.pk_style = pick("thumbStyle", &THUMB_STYLES.map(|a| a.0), d.pk_style);
+        d.talk_mode = pick("talkMode", &TALK_MODES.map(|a| a.0), d.talk_mode);
+        if let Some(v) = s("game") {
+            d.game = v;
+        }
+        if let Some(n) = p.get("planCount").and_then(Value::as_f64).filter(|n| n.is_finite()) {
+            d.plan_count = n.round().clamp(1.0, 40.0);
+        }
+        d.analyse_only = flag("analyseOnly", d.analyse_only);
         if let Some(v) = s("hookLine") {
             d.hook_line = v;
         }
@@ -758,6 +776,10 @@ impl Draft {
         p["platforms"] = json!(self.platform_ids());
         p["variants"] = json!(self.pk_variants);
         p["thumbStyle"] = json!(self.pk_style);
+        p["talkMode"] = json!(self.talk_mode);
+        p["game"] = json!(self.game);
+        p["planCount"] = json!(self.plan_count);
+        p["analyseOnly"] = json!(self.analyse_only);
         // "hook" is the teaser checkbox for short clips, and the opening style for a voiceover edit
         p["hook"] = if self.kind == Kind::Clips { json!(self.hook) } else { json!(self.vo_hook) };
         p
@@ -810,7 +832,7 @@ impl Draft {
 
     fn engine_args(&mut self) -> Result<Vec<String>, String> {
         let exists = |p: &str| !p.trim().is_empty() && Path::new(p.trim()).exists();
-        if self.kind.needs_input() && !exists(&self.input) {
+        if self.kind.needs_input() && !(self.kind == Kind::Talk && self.talk_mode == "plan") && !exists(&self.input) {
             return Err(format!("Choose the {} (the file was not found).", self.kind.input_label().to_lowercase()));
         }
         if self.kind.needs_clips() && self.clips.is_empty() {
@@ -932,6 +954,34 @@ impl Draft {
                 }
                 if self.normalize {
                     a.push("--normalize".into());
+                }
+            }
+            Kind::Talk if self.talk_mode == "plan" => {
+                if self.clips.is_empty() {
+                    return Err("Add the recordings (in playing order), or their .ei-analysis.json / .srt files.".into());
+                }
+                let platforms = self.platform_ids();
+                if platforms.is_empty() && !self.analyse_only {
+                    return Err("Choose at least one platform to plan for.".into());
+                }
+                a = vec!["gameplay-plan".into()];
+                a.extend(self.clips.iter().cloned());
+                if !self.game.trim().is_empty() {
+                    push(&mut a, "--game", self.game.trim());
+                }
+                if !platforms.is_empty() {
+                    a.push("--platforms".into());
+                    a.extend(platforms.iter().map(|p| p.to_string()));
+                }
+                push(&mut a, "--count", &(self.plan_count.round().clamp(1.0, 40.0) as u32).to_string());
+                if !self.notes.trim().is_empty() {
+                    push(&mut a, "--focus", self.notes.trim());
+                }
+                if self.analyse_only {
+                    a.push("--analyse-only".into());
+                }
+                if !self.out.trim().is_empty() && !self.out.trim().to_lowercase().ends_with(".mp4") {
+                    push(&mut a, "--out-dir", self.out.trim());
                 }
             }
             Kind::Talk => {
@@ -1558,6 +1608,8 @@ const PLATFORMS: [(&str, &str); 4] = [
     ("instagram", "Instagram video, feed (1080×1350)"),
     ("reels", "Instagram Reels (1080×1920)"),
 ];
+/// Talking Head Auto-Cut: one video, or plans from a list of recordings.
+const TALK_MODES: [(&str, &str); 2] = [("cut", "Cut the pauses (one video)"), ("plan", "Plan videos from recordings (a list, in playing order)")];
 /// Thumbnails: designed from scratch, or a frame with words.
 const THUMB_STYLES: [(&str, &str); 2] = [
     ("studio", "Studio: designed from scratch (art director, generated background, cut-outs, props, pro lettering)"),
@@ -2777,6 +2829,9 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
     let title = match d.kind {
         Kind::Music => format!("{}: {}", d.kind.title(), file_stem(&d.music)),
         Kind::Audio => format!("{}: {} file(s)", d.kind.title(), d.clips.len()),
+        Kind::Talk if d.talk_mode == "plan" => {
+            format!("Plan Videos: {} ({} recording(s))", if d.game.trim().is_empty() { "gameplay" } else { d.game.trim() }, d.clips.len())
+        }
         Kind::Split | Kind::Reference | Kind::Talk | Kind::Voiceover | Kind::Clips => format!("{}: {}", d.kind.title(), file_stem(&d.input)),
         Kind::Script => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Voice => format!("{}: {}", d.kind.title(), d.voice_name.trim()),
@@ -2804,7 +2859,8 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
 /// Run a draft: returns the job id.
 fn run_draft(d: &mut Draft) -> Result<u64, String> {
     let (title, steps, engine) = draft_job(d)?;
-    let id = start_job(title, Some(d.kind), steps, d.import, Some(engine));
+    let import = d.import && !(d.kind == Kind::Talk && d.talk_mode == "plan"); // (plans are text, not media)
+    let id = start_job(title, Some(d.kind), steps, import, Some(engine));
     let params = d.to_params();
     with_job(id, |j| j.params = Some(params));
     Ok(id)
@@ -2835,7 +2891,8 @@ fn queue_draft(d: &mut Draft) -> Result<usize, String> {
         return Err("Voice Clone records with you there, so it cannot wait in the queue.".into());
     }
     let (title, steps, engine) = draft_job(d)?;
-    Ok(enqueue(title, d.kind, steps, d.import, Some(engine), Some(d.to_params())))
+    let import = d.import && !(d.kind == Kind::Talk && d.talk_mode == "plan");
+    Ok(enqueue(title, d.kind, steps, import, Some(engine), Some(d.to_params())))
 }
 
 /// Save an edited waiting task back into its place in the queue.
@@ -3294,7 +3351,13 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         });
                         ui.end_row();
                     }
-                    if d.kind.needs_input() {
+                    if d.kind == Kind::Talk {
+                        ui.label("What to do");
+                        radio_row(ui, &mut d.talk_mode, &TALK_MODES, &format!("{p}.mode"), &mut elems);
+                        ui.end_row();
+                    }
+                    let planning = d.kind == Kind::Talk && d.talk_mode == "plan";
+                    if d.kind.needs_input() && !planning {
                         ui.label(d.kind.input_label());
                         if path_row(ui, &mut d.input, &format!("{p}.input"), "a file", &mut elems) {
                             pick = Some(Pick::Input);
@@ -3302,6 +3365,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         ui.end_row();
                     }
                     if d.kind.needs_clips()
+                        || planning
                         || d.kind == Kind::Script
                         || (d.kind == Kind::Voice && d.source == "files")
                         || (d.kind == Kind::Topic && d.make_video)
@@ -3313,6 +3377,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             Kind::Voiceover => "Footage",
                             Kind::Tv => "Your clips",
                             Kind::Package => "Clips or images",
+                            Kind::Talk => "Recordings (in order)",
                             _ => "Clips",
                         });
                         ui.vertical(|ui| {
@@ -3343,7 +3408,8 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         ui.end_row();
                     }
                     let scored = d.sound && d.kind != Kind::Music; // the sound design brings its own music
-                    if matches!(d.kind, Kind::Music | Kind::Talk | Kind::Reference)
+                    if matches!(d.kind, Kind::Music | Kind::Reference)
+                        || (d.kind == Kind::Talk && !planning)
                         || (d.kind == Kind::Voiceover && !scored)
                         || (d.kind == Kind::Clips && d.clip_type != "sections" && !scored)
                         || (d.kind == Kind::Topic && d.make_video && !scored)
@@ -3987,6 +4053,49 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                                 ui.end_row();
                             }
                         }
+                        Kind::Talk if planning => {
+                            ui.label("Game");
+                            let r = ui.add(egui::TextEdit::singleline(&mut d.game).hint_text("e.g. Ghost of Yotei (researched online)").desired_width(330.0));
+                            elems.push((format!("{p}.game"), r.rect, d.game.clone()));
+                            ui.end_row();
+                            ui.label("Plan for");
+                            ui.horizontal_wrapped(|ui| {
+                                for (k, (id, label)) in PLATFORMS.iter().enumerate() {
+                                    if let Some(on) = d.pk_platforms.get_mut(k) {
+                                        let r = ui.checkbox(on, label.split(" (").next().unwrap_or(label));
+                                        elems.push((format!("{p}.platform.{id}"), r.rect, on.to_string()));
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Plans");
+                            let r = ui.add(egui::Slider::new(&mut d.plan_count, 1.0..=40.0).step_by(1.0).suffix(" new videos"));
+                            elems.push((format!("{p}.count"), r.rect, d.plan_count.to_string()));
+                            ui.end_row();
+                            ui.label("Focus (optional)");
+                            let r = ui.add(
+                                egui::TextEdit::multiline(&mut d.notes)
+                                    .hint_text("e.g. story episodes in order, boss fights, Hindi audience; names to know: Hana, Ina")
+                                    .desired_rows(2)
+                                    .desired_width(380.0),
+                            );
+                            elems.push((format!("{p}.focus"), r.rect, d.notes.clone()));
+                            ui.end_row();
+                            ui.label("");
+                            ui.vertical(|ui| {
+                                let r = ui.checkbox(&mut d.analyse_only, "Only analyse now (plans later, from the saved analysis)");
+                                elems.push((format!("{p}.analyseOnly"), r.rect, d.analyse_only.to_string()));
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Each recording is analysed once, one at a time, 10 minutes at a time (speech to .srt, what happens on screen), and the results \
+                                         are kept next to it: later you can give those files instead and get more plans in a minute.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            });
+                            ui.end_row();
+                        }
                         Kind::Talk => {
                             ui.label("Format");
                             radio_row(ui, &mut d.preset, &PRESETS, &format!("{p}.preset"), &mut elems);
@@ -4000,7 +4109,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     if matches!(d.kind, Kind::Speak | Kind::Voiceover) {
                         emotion_rows(ui, &mut d, &p, &mut elems);
                     }
-                    if d.kind.has_resolution() && !(d.kind == Kind::Topic && !d.make_video) {
+                    if d.kind.has_resolution() && !(d.kind == Kind::Topic && !d.make_video) && !planning {
                         ui.label("Resolution");
                         radio_row(ui, &mut d.resolution, &RESOLUTIONS, &format!("{p}.resolution"), &mut elems);
                         ui.end_row();
@@ -4009,7 +4118,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         pick = Some(Pick::MusicFolder);
                     }
                     if !matches!(d.kind, Kind::Voice | Kind::Hooks) {
-                        let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package);
+                        let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package) || planning;
                         ui.label(if folder_out { "Output folder" } else { "Save as" });
                         let hint = match d.kind {
                             Kind::Script => "automatic (Movies/EI/Scripts)",
@@ -4017,6 +4126,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             Kind::Tv => "automatic (“EI on TV” next to the clips)",
                             Kind::Download => "a playlist gets a folder named after it in here",
                             Kind::Package => "a folder “<topic> - package” in here",
+                            Kind::Talk if planning => "automatic (“<game> - plans” next to the recordings)",
                             _ => "automatic (next to the source)",
                         };
                         if path_row(ui, &mut d.out, &format!("{p}.out"), hint, &mut elems) {
@@ -4024,7 +4134,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         }
                         ui.end_row();
                     }
-                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic | Kind::Hooks | Kind::Package) {
+                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic | Kind::Hooks | Kind::Package) && !planning {
                         ui.label("");
                         let label = match d.kind {
                             Kind::Split | Kind::Clips | Kind::Tv | Kind::Download => "Import the files into the project",
@@ -4134,7 +4244,13 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 }
             }
             Pick::ClipsAdd => {
-                let media: Vec<&str> = if d.kind == Kind::Voice { AUDIO_EXT.iter().chain(VIDEO_EXT.iter()).copied().collect() } else { video.clone() };
+                let media: Vec<&str> = if d.kind == Kind::Voice {
+                    AUDIO_EXT.iter().chain(VIDEO_EXT.iter()).copied().collect()
+                } else if d.kind == Kind::Talk && d.talk_mode == "plan" {
+                    video.iter().copied().chain(["json", "srt"]).collect() // (the recordings, or their saved analysis and .srt)
+                } else {
+                    video.clone()
+                };
                 if let Some(f) = app.hooks.pick_files.as_mut() {
                     for c in f(&media) {
                         if !d.clips.contains(&c) {
@@ -4862,7 +4978,9 @@ fn description(kind: Kind) -> &'static str {
         Kind::Reference => {
             "Copies the reference's style, not its content: its cut timing, transitions, flashes, zoom punches and (optionally) colour, filled with your best matching moments. Keeps its soundtrack unless you choose another (any audio or video file)."
         }
-        Kind::Talk => "Removes the pauses from a talking video (jump cuts), with optional captions and music that ducks under your voice.",
+        Kind::Talk => {
+            "Removes the pauses from a talking video (jump cuts), with optional captions and music that ducks under your voice. Or plan videos from a list of gameplay recordings: each is analysed once (speech to .srt, what happens on screen; 10 minutes at a time, light on memory), the game is researched online, and Claude plans YouTube videos, Shorts and Reels with the exact parts to use."
+        }
         Kind::Voiceover => {
             "Cuts your footage to a voiceover like an editor: every line gets the shot that shows what is being said (works for Hindi and English), the best-looking moment of it, camera energy that fits the delivery, no repeats, varied shot sizes, cuts just before the words. Use a cloned-voice narration (its .narration.json is found automatically) or any recording."
         }
@@ -5645,6 +5763,33 @@ mod tests {
         assert!(ta.windows(2).any(|w| w == ["--feedback", "the hook is boring"]), "{ta:?}");
         let mut back = Draft::from_params(Kind::Topic, &t.to_params());
         assert_eq!(back.engine_args().unwrap(), ta, "feedback survives the queue");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gameplay_plan_arguments() {
+        let dir = std::env::temp_dir().join(format!("ei-gp-args-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (r1, r2) = (dir.join("1.mov"), dir.join("2.ei-analysis.json"));
+        std::fs::write(&r1, b"x").unwrap();
+        std::fs::write(&r2, b"{}").unwrap();
+        let (r1, r2) = (r1.to_string_lossy().to_string(), r2.to_string_lossy().to_string());
+        let mut d = Draft::from_params(
+            Kind::Talk,
+            &json!({"talkMode": "plan", "clips": [r1, r2], "game": "Ghost of Yotei", "platforms": ["youtube", "shorts"],
+                    "planCount": 8, "notes": "boss fights", "out": "/x/a - EI cut.mp4"}),
+        );
+        let a = d.engine_args().unwrap();
+        assert_eq!(a.get(..3), Some(&["gameplay-plan".to_string(), r1.clone(), r2.clone()][..]));
+        for pair in [["--game", "Ghost of Yotei"], ["--count", "8"], ["--focus", "boss fights"]] {
+            assert!(a.windows(2).any(|w| w == pair), "{pair:?} in {a:?}");
+        }
+        assert!(a.windows(3).any(|w| w == ["--platforms", "youtube", "shorts"]) && !a.contains(&"--out-dir".to_string()), "{a:?}");
+        let mut back = Draft::from_params(Kind::Talk, &d.to_params());
+        assert_eq!(back.engine_args().unwrap(), a, "plan mode survives the queue");
+        assert!(Draft::from_params(Kind::Talk, &json!({"talkMode": "plan"})).engine_args().is_err(), "needs recordings");
+        let mut only = Draft::from_params(Kind::Talk, &json!({"talkMode": "plan", "clips": [r1], "analyseOnly": true}));
+        assert!(only.engine_args().unwrap().contains(&"--analyse-only".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

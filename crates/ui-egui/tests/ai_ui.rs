@@ -145,7 +145,7 @@ fn ai_menu_and_dialogs() {
             ],
         ),
         ("reference", &["input", "clips.add", "music", "aspect.same", "aspect.square", "look", "effects", "order", "run"]),
-        ("talk", &["input", "preset.short", "captions", "music", "run"]),
+        ("talk", &["mode.cut", "mode.plan", "input", "preset.short", "captions", "music", "run"]),
         (
             "voiceover",
             &[
@@ -263,6 +263,19 @@ fn ai_menu_and_dialogs() {
         ),
         ("audio", &["clips.add", "clips.addFolder", "format", "quality", "start", "end", "mono", "normalize", "out", "run"]),
     ];
+    // Talking Head Auto-Cut ▸ plan videos from recordings
+    d.run("ai.talk", json!({}));
+    d.frames(8); // (the centred dialog settles its size before a click lands where it should)
+    d.ok("ui.click", json!({"id": "ai.talk.mode.plan"}));
+    d.frames(4);
+    d.snapshot("talk-plan");
+    let ids = d.ids("ai.talk.");
+    for want in ["ai.talk.clips.add", "ai.talk.game", "ai.talk.platform.youtube", "ai.talk.count", "ai.talk.focus", "ai.talk.analyseOnly"] {
+        assert!(ids.iter().any(|i| i == want), "{want} in {ids:?}");
+    }
+    assert!(!ids.iter().any(|i| i == "ai.talk.input"), "no single video in plan mode");
+    d.ok("ui.click", json!({"id": "ai.talk.cancel"}));
+    d.frames(2);
     // TV Light Sync, horizontal: the vertical frame and its background opacity
     d.run("ai.tv", json!({}));
     d.frames(3);

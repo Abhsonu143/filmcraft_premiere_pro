@@ -117,6 +117,40 @@ def creation_time(path: str) -> float:
     return Path(path).stat().st_mtime
 
 
+def iter_frames(cmd: list[str], w: int, h: int, channels: int = 3):
+    """Frames from an ffmpeg command writing raw video to stdout, one at a time (never the whole
+    video in memory, however long it is)."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    n = w * h * channels
+    try:
+        while True:
+            buf = proc.stdout.read(n) if proc.stdout else b""
+            if len(buf) < n:
+                break
+            yield np.frombuffer(buf, np.uint8).reshape((h, w, channels) if channels > 1 else (h, w))
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def iter_audio(path: str, sr: int, block_s: float = 600.0):
+    """Mono float32 audio in blocks of `block_s` seconds, read as ffmpeg decodes it."""
+    proc = subprocess.Popen(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", path, "-vn", "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    n = int(sr * block_s) * 4
+    try:
+        while True:
+            buf = proc.stdout.read(n) if proc.stdout else b""
+            if not buf:
+                break
+            yield np.frombuffer(buf[: len(buf) // 4 * 4], dtype=np.float32)
+            if len(buf) < n:
+                break
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 def analyse(path: str) -> dict:
     """Signals for one clip (cached by file identity)."""
     key = ac.file_key(path, VERSION)
@@ -129,21 +163,25 @@ def analyse(path: str) -> dict:
         dw, dh = 16, 9
     w = 160 if dw >= dh else 90
     h = max(2, int(round(w * dh / dw / 2)) * 2)
-    proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-hwaccel", "videotoolbox", "-i", path, "-an",
-         "-vf", f"fps={FPS:g},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-        capture_output=True,
-    )
-    n = len(proc.stdout) // (w * h * 3)
-    frames = np.frombuffer(proc.stdout[: n * w * h * 3], dtype=np.uint8).reshape(n, h, w, 3) if n else np.zeros((0, h, w, 3), np.uint8)
-    stats = [frame_stats(f) for f in frames]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-hwaccel", "videotoolbox", "-i", path, "-an",
+           "-vf", f"fps={FPS:g},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    # one frame at a time: only the previous frame's grey picture is kept (a 4-hour recording held
+    # every frame before: about 3 GB)
+    stats: list[dict] = []
     motion, dx, dy, conf = [0.0], [0.0], [0.0], [1.0]
-    for a, b in zip(stats, stats[1:]):
-        motion.append(float(np.abs(b["gray"] - a["gray"]).mean()))
-        x, y, p = phase_shift(a["gray"], b["gray"])
-        dx.append(x)
-        dy.append(y)
-        conf.append(p)
+    prev_gray = None
+    for f in iter_frames(cmd, w, h):
+        st = frame_stats(f)
+        g = st.pop("gray")
+        if prev_gray is not None:
+            motion.append(float(np.abs(g - prev_gray).mean()))
+            x, y, pp = phase_shift(prev_gray, g)
+            dx.append(x)
+            dy.append(y)
+            conf.append(pp)
+        prev_gray = g
+        stats.append(st)
+    n = len(stats)
     if n > 1:
         motion[0], dx[0], dy[0] = motion[1], dx[1], dy[1]
     motion, dx, dy = motion[:n], dx[:n], dy[:n]
@@ -182,30 +220,65 @@ def analyse(path: str) -> dict:
 # ---------------------------------------------------------------------------------------------
 
 
-def keyframes_rgb(path: str, every: float, size: int = 224) -> np.ndarray:
-    """One frame per `every` seconds, taken from keyframes only (no full 4K decode): each
-    sample is the nearest keyframe. Falls back to a full decode when the file has none."""
-    pr = subprocess.run(["ffprobe", "-v", "error", "-skip_frame", "nokey", "-select_streams", "v:0", "-show_entries", "frame=pts_time", "-of", "csv=p=0", path], capture_output=True, text=True)
+def iter_keyframes_rgb(path: str, every: float, size: int = 224):
+    """One frame per `every` seconds, from keyframes only (no full 4K decode), yielded one at a
+    time: each sample is the nearest keyframe. Falls back to decoding at that rate when the file
+    has no keyframe times."""
+    pr = subprocess.run(["ffprobe", "-v", "error", "-skip_frame", "nokey", "-select_streams", "v:0", "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
+                        capture_output=True, text=True)
     times = []
     for line in pr.stdout.split():
         try:
             times.append(float(line.strip(",")))
         except ValueError:
             pass
-    proc = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-skip_frame", "nokey", "-i", path, "-an",
-                           "-vf", f"scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}",
-                           "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True)
-    n = len(proc.stdout) // (size * size * 3)
-    if n == 0 or not times:
+    if not times:
         import voiceover_cut as vc
 
-        return vc._frames_rgb(path, every)
-    frames = np.frombuffer(proc.stdout[: n * size * size * 3], dtype=np.uint8).reshape(n, size, size, 3)
-    times = np.asarray(times[:n]) - (times[0] if times else 0.0)
-    dur = float(times[-1]) + every
-    want = np.arange(0, max(dur, every), every)
-    idx = [int(np.argmin(np.abs(times - t))) for t in want]
-    return frames[idx]
+        yield from vc.iter_frames_rgb(path, every, size)
+        return
+    t0 = times[0]
+    times = [t - t0 for t in times]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-skip_frame", "nokey", "-i", path, "-an",
+           "-vf", f"scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}",
+           "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    want = 0.0
+    prev = None  # (time, frame)
+    for k, f in enumerate(iter_frames(cmd, size, size)):
+        t = times[k] if k < len(times) else (times[-1] + (k - len(times) + 1) * every)
+        while t >= want:  # the sample time is passed: the nearer of the previous and this keyframe
+            if prev is not None and abs(prev[0] - want) <= abs(t - want):
+                yield prev[1]
+            else:
+                yield f.copy()
+            want += every
+        prev = (t, f.copy())
+    if prev is not None and prev[0] > want - every / 2:
+        yield prev[1]
+
+
+def keyframes_rgb(path: str, every: float, size: int = 224) -> np.ndarray:
+    """All samples at once (short clips only; long ones go through iter_keyframes_rgb)."""
+    fr = list(iter_keyframes_rgb(path, every, size))
+    return np.stack(fr) if fr else np.zeros((0, size, size, 3), np.uint8)
+
+
+def embed_stream(frames, model, preprocess, device, batch: int = 16) -> list:
+    """CLIP embeddings of frames as they come (a batch in memory at a time)."""
+    import torch
+    from PIL import Image
+
+    out, buf = [], []
+    for f in frames:
+        buf.append(f)
+        if len(buf) >= batch:
+            e = model.encode_image(torch.stack([preprocess(Image.fromarray(x)) for x in buf]).to(device))
+            out.append((e / e.norm(dim=-1, keepdim=True)).float().cpu().numpy())
+            buf = []
+    if buf:
+        e = model.encode_image(torch.stack([preprocess(Image.fromarray(x)) for x in buf]).to(device))
+        out.append((e / e.norm(dim=-1, keepdim=True)).float().cpu().numpy())
+    return out
 
 
 def _semantic_worker(paths: list[str], every: float, prompts: list[str]) -> dict:
@@ -222,12 +295,7 @@ def _semantic_worker(paths: list[str], every: float, prompts: list[str]) -> dict
     out = {}
     with torch.no_grad():
         for p in paths:
-            frames = keyframes_rgb(p, every)
-            embs = []
-            for i in range(0, len(frames), 16):
-                batch = torch.stack([preprocess(Image.fromarray(f)) for f in frames[i : i + 16]]).to(device)
-                e = model.encode_image(batch)
-                embs.append((e / e.norm(dim=-1, keepdim=True)).float().cpu().numpy())
+            embs = embed_stream(iter_keyframes_rgb(p, every), model, preprocess, device)
             out[p] = np.concatenate(embs).tolist() if embs else []
         t = model.encode_text(tok(prompts).to(device))
         text = (t / t.norm(dim=-1, keepdim=True)).float().cpu().numpy().tolist()

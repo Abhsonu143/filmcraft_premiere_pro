@@ -68,6 +68,22 @@ def decode_mono(path: str, sr: int = SR, start: float = 0.0, duration: float | N
     return np.frombuffer(proc.stdout, dtype=np.float32)
 
 
+def rms_blocks(path: str, sr: int, block: int):
+    """RMS per `block` samples of the whole file, read in pieces (never the whole sound in memory)."""
+    import numpy as np
+
+    import footage as fo
+
+    out, carry = [], np.zeros(0, np.float32)
+    for y in fo.iter_audio(path, sr):
+        y = np.concatenate([carry, y])
+        nb = len(y) // block
+        if nb:
+            out.append(np.sqrt((y[: nb * block].reshape(nb, block) ** 2).mean(axis=1)))
+        carry = y[nb * block:]
+    return np.concatenate(out) if out else np.zeros(0, np.float32)
+
+
 def onset_envelope(y, sr: int = SR, hop: int = HOP):
     """Spectral flux: how much new energy appears in each ~23 ms frame."""
     import numpy as np
@@ -170,12 +186,10 @@ def loudest_window(path: str, length: float, total: float) -> float:
 
     if total <= length + 0.5:
         return 0.0
-    y = decode_mono(path, 8000)
-    block = 4000
-    nb = len(y) // block
+    rms = rms_blocks(path, 8000, 4000)
+    nb = len(rms)
     if nb == 0:
         return 0.0
-    rms = np.sqrt((y[: nb * block].reshape(nb, block) ** 2).mean(axis=1))
     w = max(1, int(length / 0.5))
     if nb <= w:
         return 0.0
@@ -241,21 +255,20 @@ def analyse_clip(path: str) -> dict:
     cache = ac.CACHE_DIR / "motion" / f"{key}.json"
     if cache.is_file():
         return json.loads(cache.read_text())
+    import footage as fo
+
     w, h = 64, 36
-    proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-hwaccel", "videotoolbox", "-i", path, "-an",
-         "-vf", f"fps={ANALYSIS_FPS:g},scale={w}:{h},format=gray", "-f", "rawvideo", "-"],
-        capture_output=True,
-    )
-    n = len(proc.stdout) // (w * h)
-    if proc.returncode != 0 or n == 0:
-        res = {"motion": [], "brightness": []}
-    else:
-        f = np.frombuffer(proc.stdout[: n * w * h], dtype=np.uint8).reshape(n, h, w).astype(np.float32)
-        motion = np.concatenate([[0.0], np.abs(np.diff(f, axis=0)).mean(axis=(1, 2))])
-        if n > 1:
-            motion[0] = motion[1]
-        res = {"motion": [round(float(x), 3) for x in motion], "brightness": [round(float(x), 2) for x in f.mean(axis=(1, 2))]}
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-hwaccel", "videotoolbox", "-i", path, "-an",
+           "-vf", f"fps={ANALYSIS_FPS:g},scale={w}:{h},format=gray", "-f", "rawvideo", "-"]
+    motion, bright, prev = [], [], None
+    for g in fo.iter_frames(cmd, w, h, channels=1):  # (one frame at a time)
+        g = g.astype(np.float32)
+        motion.append(float(np.abs(g - prev).mean()) if prev is not None else 0.0)
+        bright.append(float(g.mean()))
+        prev = g
+    if len(motion) > 1:
+        motion[0] = motion[1]
+    res = {"motion": [round(x, 3) for x in motion], "brightness": [round(x, 2) for x in bright]}
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(res))
     return res
@@ -407,7 +420,13 @@ def _embed_worker(frame_requests: list[tuple[str, float]], to_index: list[str], 
             singles.append(np.frombuffer(proc.stdout[: 224 * 224 * 3], dtype=np.uint8).reshape(224, 224, 3))
         else:
             singles.append(np.zeros((224, 224, 3), dtype=np.uint8))
-    clips = {p: embed(vc._frames_rgb(p, every)) for p in to_index}
+    import footage as fo
+
+    with torch.no_grad():  # (clips stream through CLIP a batch at a time)
+        clips = {}
+        for p in to_index:
+            parts = fo.embed_stream(vc.iter_frames_rgb(p, every), model, preprocess, device)
+            clips[p] = np.concatenate(parts).tolist() if parts else []
     return {"frames": embed(singles), "clips": clips}
 
 

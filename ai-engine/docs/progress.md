@@ -505,3 +505,21 @@ Full description: `docs/voice-and-voiceover.md`.
   1.14/1.02/0.85), whites at the camera's screen white, soft highlight shoulder, slight panel black,
   saturation 0.9, lens softness 0.8 px, panel falloff, bloom 0.07. New: horizontal in a vertical
   frame with an adjustable background opacity (dialog ▸ tick + slider).
+
+## 2026-11-15: long recordings light on memory, gameplay video plans
+
+**Memory.** Several tools read a whole video or its whole soundtrack into memory at once, so a 4-hour, 15 GB recording could use up all the RAM. They now read it in pieces:
+- Speech to text (Talk captions, Clips, Sections, Voiceover, Highlights): files longer than 15 minutes are transcribed in 10-minute pieces with Whisper loaded once, and the word times are joined. The cache key is the same, so earlier transcripts are still used.
+- Clip analysis (`footage.analyse`): frames are read one at a time, keeping only the previous one.
+- CLIP (`footage` semantic, `voiceover_cut`, `montage`): frames are streamed into CLIP in batches of 16.
+- Long-video sound (`clip_edit.signals`, `highlights` loudness, `montage` loudest window and motion): read in 10-minute blocks.
+- Music analysis: reads only the first 30 minutes of a long video's sound.
+
+Measured on the M3 with 8 GB: a 30-minute PS5 recording's clip analysis peaked at 161 MB. Transcribing 86 minutes took 206 s (9 pieces), and the whole job peaked at 1.2 GB.
+
+**Gameplay plans** (`gameplay-plan`; Talking Head Auto-Cut ▸ "Plan videos"). The input is a list of recordings in playing order. They are analysed one at a time:
+- the speech, saved as `<name>.ei.srt`;
+- what happens on screen (keyframes only, 10 minutes at a time);
+- the analysis, saved next to each recording as `<name>.ei-analysis.json`.
+
+The analysis files are reused later, and they can also be given instead of the recordings. The game is researched online (cached for a week), and its names help Whisper spell characters and places. Claude then plans YouTube videos, Shorts and Reels with exact parts, hook, thumbnail idea and hashtags, written to `plans.md` and `plans.json`. Later runs add new plans and don't repeat old titles. Run on 2 Ghost of Yōtei recordings (2 min and 30 min): analysis took about 1.5 min, and the whole job peaked at 1.05 GB.

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -673,6 +674,9 @@ def run_isolated(fn, *args):
         return iso.run(fn, *args)
 
 
+TRANSCRIBE_PIECE = 600.0  # seconds: longer files are transcribed in pieces this long
+
+
 def transcribe(src: str, *, model: str = DEFAULT_WHISPER, prompt: str | None = None, language: str | None = None) -> dict:
     """Word-level transcript of `src`, cached by file identity + model + prompt."""
     key = file_key(src, model, prompt or "", language or "")
@@ -684,12 +688,31 @@ def transcribe(src: str, *, model: str = DEFAULT_WHISPER, prompt: str | None = N
         import mlx_whisper  # noqa: F401
     except ImportError as e:
         raise AutocutError("mlx-whisper is not installed: pip install -r requirements.txt") from e
+    duration = probe(src).duration
     with tempfile.TemporaryDirectory(prefix="autocut-") as tmp:
         wav = os.path.join(tmp, "audio.wav")
-        extract_audio(src, wav)
-        log(f"transcribing with {model} (the first use downloads it)")
         t0 = time.time()
-        result = run_isolated(_transcribe_worker, wav, model, prompt, language)
+        if duration <= TRANSCRIBE_PIECE * 1.5:
+            extract_audio(src, wav)
+            log(f"transcribing with {model} (the first use downloads it)")
+            result = run_isolated(_transcribe_worker, wav, model, prompt, language)
+        else:
+            # a long file in 10-minute pieces: Whisper reads a whole file into memory (and its
+            # spectrum), which for hours of sound is gigabytes; a piece is a few tens of MB
+            n = int(math.ceil(duration / TRANSCRIBE_PIECE))
+            log(f"transcribing {duration / 60:.0f} min with {model} in {n} pieces of {TRANSCRIBE_PIECE / 60:.0f} min")
+            result = {"language": language, "segments": [], "words": []}
+            with Isolated("whisper") as iso:
+                for k in range(n):
+                    a0 = k * TRANSCRIBE_PIECE
+                    b0 = min(duration, a0 + TRANSCRIBE_PIECE)
+                    extract_audio(src, wav, start=a0, end=b0)
+                    r = iso.run(_transcribe_worker, wav, model, prompt, result["language"])
+                    result["language"] = result["language"] or r.get("language")  # (the first piece decides)
+                    result["segments"] += [{**x, "start": x["start"] + a0, "end": x["end"] + a0} for x in r["segments"]]
+                    result["words"] += [{**w, "start": w["start"] + a0, "end": w["end"] + a0} for w in r["words"]]
+                    stage_progress((k + 1) / n, f"transcribed {b0 / 60:.0f} of {duration / 60:.0f} min")
+                    log(f"progress {k + 1}/{n} pieces transcribed")
         log(f"transcribed in {time.time() - t0:.1f}s, {len(result['words'])} words")
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(result))
