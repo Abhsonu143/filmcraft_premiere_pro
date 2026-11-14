@@ -139,3 +139,17 @@ def test_health_report_has_everything_the_app_shows():
     assert r["memory"]["ram_gb"] > 0 and r["cleaned"] == []
     json.dumps(r)  # (the app reads it as JSON)
     assert health.describe("/x/python /a/ei_engine.py topic gta 6 news --voice v --seconds 60") == "topic: gta 6 news"
+
+
+def test_picture_search_survives_null_fields(monkeypatch):
+    """Regression: Openverse sends a missing title as null; `title[:100]` stopped the whole video."""
+    import json
+
+    import topic_video as tv
+
+    reply = {"results": [{"url": "https://x/a.jpg", "title": None, "foreign_landing_url": None, "license": None, "license_version": None,
+                          "creator": None, "source": None, "width": 1200},
+                         {"url": None, "title": "no link", "width": 1200}]}
+    monkeypatch.setattr(tv, "http_get", lambda url, timeout=20: json.dumps(reply).encode())
+    got = tv.openverse_search("gta 6", 5)
+    assert len(got) == 1 and got[0]["title"] == "" and got[0]["page"] == "" and got[0]["url"] == "https://x/a.jpg"

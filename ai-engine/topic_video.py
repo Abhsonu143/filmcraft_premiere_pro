@@ -211,7 +211,7 @@ def commons_search(query: str, limit: int = 6, video: bool = False) -> list[dict
         if not video and w < 900:
             continue
         out.append({"kind": "video" if video else "image", "url": ii.get("url") if video else (ii.get("thumburl") or ii.get("url")),
-                    "page": ii.get("descriptionurl", ""), "title": p.get("title", "").replace("File:", ""), "license": lic,
+                    "page": ii.get("descriptionurl", ""), "title": (p.get("title") or "").replace("File:", ""), "license": lic,
                     "author": strip_tags((m.get("Artist", {}) or {}).get("value", ""))[:80], "provider": "Wikimedia Commons", "width": w})
     return out
 
@@ -227,8 +227,11 @@ def openverse_search(query: str, limit: int = 6) -> list[dict]:
     for r in d.get("results", []):
         if (r.get("width") or 0) and r["width"] < 900:
             continue
-        out.append({"kind": "image", "url": r.get("url"), "page": r.get("foreign_landing_url", ""), "title": r.get("title", "")[:100],
-                    "license": f"CC {r.get('license', '').upper()} {r.get('license_version', '')}".strip(), "author": r.get("creator") or "",
+        if not r.get("url"):
+            continue
+        # (Openverse sends missing fields as null: every one may be empty)
+        out.append({"kind": "image", "url": r["url"], "page": r.get("foreign_landing_url") or "", "title": (r.get("title") or "")[:100],
+                    "license": f"CC {(r.get('license') or '').upper()} {r.get('license_version') or ''}".strip(), "author": r.get("creator") or "",
                     "provider": r.get("source") or "Openverse", "width": r.get("width") or 0})
     return out
 
@@ -364,7 +367,13 @@ def collect_media(script: dict, data: dict, folder: Path, sources: list[str], W:
         queries = [(i, " ".join(q.split()[:6])) for i, q in queries if q.strip()]
 
         def search(q: str) -> list[dict]:
-            return commons_search(q, 5) + openverse_search(q, 5)
+            out: list[dict] = []
+            for fn in (commons_search, openverse_search):  # (one odd answer never stops the video)
+                try:
+                    out += fn(q, 5)
+                except Exception as e:
+                    log(f"picture search “{q[:40]}” ({fn.__name__.split('_')[0]}): skipped ({e.__class__.__name__})")
+            return out
 
         # all searches at once (the picture sites answer slowly, not heavily)
         from concurrent.futures import ThreadPoolExecutor

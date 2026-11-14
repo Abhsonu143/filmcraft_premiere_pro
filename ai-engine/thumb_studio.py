@@ -207,7 +207,7 @@ def search_images(query: str, n: int = 6) -> list[dict]:
             if not ii.get("thumburl") or not re.search(r"CC0|Public domain|CC BY", lic, re.I) or re.search(r"\bNC\b|ND", lic):
                 continue
             creator = re.sub(r"<[^>]+>", "", (meta.get("Artist") or {}).get("value", "")).strip()[:80]
-            out.append({"url": ii["thumburl"], "title": p.get("title", "").removeprefix("File:"), "creator": creator, "licence": lic,
+            out.append({"url": ii["thumburl"], "title": (p.get("title") or "").removeprefix("File:"), "creator": creator, "licence": lic,
                         "page": ii.get("descriptionurl", "")})
     except (OSError, ValueError) as e:
         log(f"Wikimedia Commons search failed ({e})")
