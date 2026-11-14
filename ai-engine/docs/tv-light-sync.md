@@ -69,6 +69,22 @@ Add as many clips as you like. They run one after another in one background job 
 
 The best recording of the chosen shape is picked automatically (lowest light difference).
 
+## Steady picture, framing and a bright screen (November 2026)
+
+- **Steady.** The TV is now found in every frame, not 10 times a second: the room's motion from frame
+  to frame (optical flow on the room, never on screens or lamps), held to the accurate 10-a-second
+  track. The camera path is smoothed (0.6 s) and every frame is moved onto it, so handheld shake goes
+  and the clip stays locked to the TV. This also removes the judder of the 50 fps recordings being
+  shown at 30 fps (each output frame stepped one or two recorded frames, unevenly).
+- **Framing.** The video shows the part of the recording around the TV: vertical videos let the TV
+  fill about 95% of the width with its centre half way down (the lit wall above it, less of the dark
+  floor), horizontal ones about 68%. The TV is never cut: when it is at the edge of the recording,
+  the framing stops there. The crop also hides the edges the stabilisation moves.
+- **Screen.** The clip keeps its own blacks and contrast; only its mid-tones move part of the way to
+  how the camera saw this screen, then it is made as bright as a screen in a dark room, with a soft
+  bloom onto what is around the TV. Softening is minimal, and grain (fresh every frame) is only on the
+  screen; the room keeps the camera's own noise (the old repeating grain made the picture shimmer).
+
 ## Measured (M3 8 GB)
 
 | Run | Result |

@@ -485,3 +485,18 @@ Full description: `docs/voice-and-voiceover.md`.
   19 with faces, 8 with roads. Video from Topic keeps it in the folder's feedback.json; the script
   writer gets all of it first, with the earlier script; feedback about facts redoes the research
   with it.
+
+## 2026-11-14: TV Light Sync: steady, framed on the TV, bright screen
+
+- Feedback: the videos vibrate, the TV picture looks dull and over-processed, the vertical videos
+  show too much dark floor. Causes found: 50 fps recordings shown at 30 fps by uneven frame dropping
+  (judder), the TV position known only 10 times a second, a repeating 6-frame grain, the clip's
+  levels fully matched to the camera's dim, grey view of the screen (lifted blacks), blur.
+- Now: per-frame tracking (LK optical flow on the room, complementary filter with the 10 Hz SIFT
+  track), path smoothing (0.6 s) with a similarity warp per frame, framing crop (vertical: TV 95% of
+  the width, centre at half height; whole TV always), screen look (own blacks, mid-tones 45% towards
+  the camera's, p95 brightness 0.8 linear, saturation +8%, bloom), grain only on the screen.
+- Measured on "GTA 6 section 23" (GX011573, vertical): wall shake 0.063 -> 0.038 px/frame at
+  540 px; TV movement per frame 0.16 -> 0.04 ‰; flicker 1.04 -> 1.16 levels (the raw recording:
+  1.31); TV 74% -> 94% of the width; dark bottom ~45% -> ~30%. Render ~140 s for 20 s (was ~135 s).
+  Tests: tests/test_tv_framing.py.

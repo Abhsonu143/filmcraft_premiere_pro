@@ -494,10 +494,127 @@ def add_bezel(img: np.ndarray, side: float, bottom_factor: float = 2.0) -> np.nd
     return out
 
 
-def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], out: str, W: int, H: int, fps: float = 30.0,
-           relight: float = 1.0, bezel: float = 0.0) -> None:
-    """Background = the chosen recording moments; glow relit to the clip; the clip on the TV."""
+FRAMING = {  # how much of the picture the TV fills, and where its centre sits (fractions of the output)
+    "vertical": {"tv_width": 0.95, "tv_y": 0.50},
+    "horizontal": {"tv_width": 0.68, "tv_y": 0.47},
+}
+STAB_SIGMA = 0.6  # seconds: the camera path is smoothed this much (handheld shake and vibration go)
+
+
+def segments_of(path: np.ndarray, fps: float) -> list[tuple[float, int]]:
+    """The recording stretches the edit plays: (start time in the recording, frames to show)."""
+    T = len(path)
+    segs: list[tuple[float, int]] = []
+    s0 = 0
+    for t in range(1, T + 1):
+        if t == T or path[t] != path[t - 1] + 1:
+            segs.append((float(path[s0]) / HZ, max(1, int(round((t - s0) / HZ * fps)))))
+            s0 = t
+    return segs
+
+
+def interp_quads(Q: np.ndarray, times: np.ndarray) -> np.ndarray:
+    qi = np.clip(times * HZ, 0, len(Q) - 1)
+    lo = np.floor(qi).astype(int)
+    hi = np.minimum(len(Q) - 1, lo + 1)
+    f = (qi - lo)[:, None, None]
+    return Q[lo] * (1 - f) + Q[hi] * f
+
+
+def track_frames(rec: str, t0: float, n: int, fps: float, q_slow: np.ndarray, w_long: int = 640) -> np.ndarray:
+    """The TV's corners in every frame of a stretch (normalised): the room's motion from frame to
+    frame (optical flow on the room, never on screens) for the fast shake, pulled to the accurate
+    10-a-second track for the slow drift (a complementary filter)."""
     import cv2
+    from scipy.ndimage import gaussian_filter1d
+
+    quads = np.zeros((n, 4, 2), np.float32)
+    C = np.eye(3)  # frame i -> first frame
+    prev, pts = None, None
+    size = None
+    i = -1
+    for i, f in enumerate(decode(rec, t0, n / fps + 0.3, fps, w_long)):
+        if i >= n:
+            break
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        h, w = g.shape
+        size = np.float32([w, h])
+        if prev is not None and pts is not None and len(pts) >= 8:
+            nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev, g, pts, None, winSize=(21, 21), maxLevel=3)
+            ok = st.reshape(-1) == 1
+            if ok.sum() >= 12:
+                Hs, inl = cv2.findHomography(nxt[ok], pts[ok], cv2.RANSAC, 2.0)  # this frame -> previous
+                if Hs is not None:
+                    C = C @ Hs
+                pts = nxt[ok].reshape(-1, 1, 2)
+            else:
+                pts = None
+        q0 = q_slow[0] * size
+        quads[i] = cv2.perspectiveTransform(q0[None], np.linalg.inv(C))[0] / size
+        if pts is None or len(pts) < 80 or i % 8 == 0:
+            m = np.full(g.shape, 255, np.uint8)
+            m[_quad_mask(g.shape, quads[i] * size, grow=0.12) > 0] = 0  # not the TV (its picture moves)
+            m[cv2.dilate((g > 235).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0] = 0  # nor other screens and lamps
+            p = cv2.goodFeaturesToTrack(g, 400, 0.01, 8, mask=m)
+            pts = p.astype(np.float32) if p is not None else None
+        prev = g
+    got = max(0, min(n, i + 1))
+    if got < n:  # (the end of the recording: hold)
+        quads[got:] = quads[got - 1] if got else q_slow[got:]
+    # fast motion from the flow, slow position from the accurate track
+    corr = gaussian_filter1d(q_slow - quads, sigma=max(1.0, 0.7 * fps), axis=0, mode="nearest")
+    return quads + corr
+
+
+def framing_rect(Qs: np.ndarray, src_w: int, src_h: int, W: int, H: int, orientation: str, margin: float = 0.02) -> tuple[float, float, float, float]:
+    """The part of the recording the video shows (normalised x0, y0, w, h): the TV large and whole
+    (never cut off), placed so the lit wall shows above it and little of the dark floor below,
+    inside the picture."""
+    f = FRAMING.get(orientation, FRAMING["horizontal"])
+    xs, ys = Qs[..., 0], Qs[..., 1]
+    tx0, tx1 = float(np.percentile(xs.min(axis=1), 2)), float(np.percentile(xs.max(axis=1), 98))  # (with the shake)
+    ty0, ty1 = float(np.percentile(ys.min(axis=1), 2)), float(np.percentile(ys.max(axis=1), 98))
+    tv_w, tv_h = tx1 - tx0, ty1 - ty0
+    ratio = (W / H) * src_h / src_w  # crop width / crop height, in normalised units
+    pad = 0.015  # room around the TV (of the crop)
+    cw = max(tv_w / f["tv_width"], (tv_w + 2 * pad) , (tv_h + 2 * pad) * ratio)
+    cw = min(cw, 1.0, ratio)  # (never larger than the recording)
+    ch = cw / ratio
+    # the whole TV inside; as centred as the recording allows; its centre near tv_y of the height
+    lo_x, hi_x = max(0.0, tx1 + pad * cw - cw), min(1.0 - cw, tx0 - pad * cw)
+    x0 = float(np.clip((tx0 + tx1) / 2 - cw / 2, min(lo_x, hi_x), max(lo_x, hi_x)))
+    x0 = float(np.clip(x0, 0.0, 1.0 - cw))
+    lo_y, hi_y = max(0.0, ty1 + pad * ch - ch), min(1.0 - ch, ty0 - pad * ch)
+    y0 = float(np.clip((ty0 + ty1) / 2 - f["tv_y"] * ch, min(lo_y, hi_y), max(lo_y, hi_y)))
+    y0 = float(np.clip(y0, 0.0, 1.0 - ch))
+    return x0, y0, cw, ch
+
+
+def screen_look(clip_lin: np.ndarray, a: dict, match: float = 0.45) -> np.ndarray:
+    """The clip as a bright, clean TV picture: its mid-tones moved part of the way towards how the
+    camera saw this screen (so it belongs in the room), its own blacks and contrast kept (no grey
+    haze), and bright like a screen in a dark room."""
+    lum = clip_lin @ np.float32([0.2126, 0.7152, 0.0722])
+    c05, c50, c95 = (float(x) for x in np.percentile(lum, [5, 50, 95]))
+    s_ = a["screen"]
+    mid = c50 * (1 - match) + float(s_["p50"]) * match
+    hi = c95 * (1 - match) + float(s_["p95"]) * match
+    xs = np.maximum.accumulate(np.float32([0.0, c05, c50, c95, 1.0]) + np.arange(5) * 1e-4)
+    ys = np.maximum.accumulate(np.float32([0.0, c05, mid, hi, max(hi, 1.0)]))
+    target = np.interp(lum, xs, ys)
+    out = clip_lin * (target / np.maximum(lum, 1e-4))[..., None]
+    p95 = float(np.percentile(out @ np.float32([0.2126, 0.7152, 0.0722]), 95))
+    out = out * float(np.clip(0.8 / max(p95, 1e-3), 1.0, 1.7))  # a screen is the brightest thing in the room
+    grey = (out @ np.float32([0.2126, 0.7152, 0.0722]))[..., None]
+    return np.clip(grey + (out - grey) * 1.08, 0, 1)
+
+
+def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], out: str, W: int, H: int, fps: float = 30.0,
+           relight: float = 1.0, bezel: float = 0.0, orientation: str = "horizontal", stabilize: bool = True) -> dict:
+    """Background = the chosen recording moments, stabilised and framed on the TV; glow relit to
+    the clip; the clip locked onto the TV in every frame."""
+    import cv2
+    from scipy.ndimage import gaussian_filter1d
 
     rec = a["path"]
     T = len(path)
@@ -512,30 +629,37 @@ def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], 
     k /= k.sum()
     gains = np.stack([np.stack([np.convolve(np.pad(gains[:, z, ch], 3, mode="edge"), k, mode="valid") for ch in range(3)], axis=1) for z in range(4)], axis=1)
     gains = 1 + (gains - 1) * relight
-    # background: decode each continuous stretch of the path once, in order
-    segs: list[tuple[int, int]] = []  # (start step, end step) where path increases by 1
-    s0 = 0
-    for t in range(1, T + 1):
-        if t == T or path[t] != path[t - 1] + 1:
-            segs.append((s0, t))
-            s0 = t
-
-    def background():
-        for a0, b0 in segs:
-            t_rec = path[a0] / HZ
-            need = int(round((b0 - a0) / HZ * fps))
-            got = 0
-            if b0 - a0 == 1 and a0 + 1 < T and path[a0 + 1] == path[a0]:
-                need = int(round(1 / HZ * fps))  # a held frame
-            for f in decode(rec, t_rec, (b0 - a0) / HZ + 0.2, fps, max(W, H)):
-                if got >= need:
-                    break
-                yield f, t_rec + got / fps, a0 + got / fps * HZ
-                got += 1
-            while got < need:  # end of the recording: hold the last frame
-                yield f, t_rec + got / fps, a0 + got / fps * HZ
-                got += 1
-
+    segs = segments_of(path, fps)
+    # 1. where the TV is in every frame, and the smoothed camera path (per stretch: a jump is a cut)
+    t0 = time.time()
+    raw, smooth, rec_t, steps = [], [], [], []
+    done = 0
+    for si, (ts, n) in enumerate(segs):
+        n = min(n, n_out - done)
+        if n <= 0:
+            break
+        times = ts + np.arange(n) / fps
+        q_slow = interp_quads(Qrec, times)
+        q = track_frames(rec, ts, n, fps, q_slow) if stabilize else q_slow
+        raw.append(q)
+        smooth.append(gaussian_filter1d(q, sigma=max(1.0, STAB_SIGMA * fps), axis=0, mode="nearest") if stabilize else q)
+        rec_t += list(times)
+        a0 = int(sum(int(round(x[1] / fps * HZ)) for x in segs[:si]))
+        steps += [min(T - 1, a0 + j / fps * HZ) for j in range(n)]
+        done += n
+    raw_q, smooth_q = np.concatenate(raw), np.concatenate(smooth)
+    shake = float(np.abs(np.diff(raw_q, axis=0)).mean() * 1000) if len(raw_q) > 1 else 0.0
+    left = float(np.abs(np.diff(smooth_q, axis=0)).mean() * 1000) if len(smooth_q) > 1 else 0.0
+    if stabilize:
+        log(f"stabilised: the TV moved {shake:.2f} ‰ of the frame per frame, now {left:.2f} ‰ (tracked in every frame in {time.time() - t0:.0f}s)")
+    # 2. framing: the TV large, little of the dark floor
+    info = probe_rec(rec)
+    sw0, sh0 = (info["width"], info["height"]) if info["width"] >= info["height"] else (info["width"], info["height"])
+    x0, y0, cwn, chn = framing_rect(smooth_q, sw0, sh0, W, H, orientation)
+    long_need = int(max(W / cwn, H / chn) * 1.0)
+    w_long = int(min(max(sw0, sh0), max(max(W, H), long_need)) // 2 * 2)
+    tvw = float(np.median(smooth_q[..., 0].max(axis=1) - smooth_q[..., 0].min(axis=1)))
+    log(f"framing: the TV fills {100 * tvw / cwn:.0f}% of the width; showing {cwn * 100:.0f}% × {chn * 100:.0f}% of the recording")
     k = max(1.0, max(W, H) / 1920)  # the clip is sharper on a 4K frame
     cw, ch = int(1280 * k) // 2 * 2, int(720 * k) // 2 * 2
     clip_proc = subprocess.Popen(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", clip, "-an", "-vf",
@@ -545,45 +669,75 @@ def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], 
                             "-s", f"{W}x{H}", "-r", f"{fps:g}", "-i", "-", "-i", clip, "-map", "0:v", "-map", "1:a?", "-shortest",
                             "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(W, H, 16.0), "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out],
                            stdin=subprocess.PIPE)
-    rng = np.random.default_rng(1)
-    grain = [rng.normal(0, 1.6, (H, W, 3)).astype(np.int16) for _ in range(6)]  # camera grain, reused
+    rng = np.random.default_rng(1)  # grain on the clip only (the room already has the camera's own noise), new every frame
     cw, ch = 1280, 720
     src_quad = np.float32([[0, 0], [cw, 0], [cw, ch], [0, ch]])
-    t0 = time.time()
+    full = np.full((ch, cw), 255, np.uint8)
+    t1 = time.time()
+    i = 0
     try:
-        for i, (bg, t_rec, step) in enumerate(background()):
-            if i >= n_out:
+        def frames():
+            for ts, n in segs:
+                got = 0
+                last = None
+                for f in decode(rec, ts, n / fps + 0.3, fps, w_long):
+                    if got >= n:
+                        break
+                    last = f
+                    yield f
+                    got += 1
+                while got < n and last is not None:  # end of the recording: hold the last frame
+                    yield last
+                    got += 1
+
+        for bg in frames():
+            if i >= min(n_out, len(raw_q)):
                 break
             buf = clip_proc.stdout.read(cw * ch * 3) if clip_proc.stdout else b""
             if len(buf) < cw * ch * 3:
                 break
-            frame = cv2.resize(bg, (W, H), interpolation=cv2.INTER_AREA) if bg.shape[:2] != (H, W) else bg
-            qi = min(len(Qrec) - 1, t_rec * HZ)
-            lo = int(qi)
-            hi = min(len(Qrec) - 1, lo + 1)
-            quad = (Qrec[lo] * (1 - (qi - lo)) + Qrec[hi] * (qi - lo)) * [W, H]
-            ts = min(T - 1, int(step))
+            sh_, sw_ = bg.shape[:2]
+            sz = np.float32([sw_, sh_])
+            rq, sq = raw_q[i] * sz, smooth_q[i] * sz
+            S = np.eye(3)
+            if stabilize:  # the frame moved so the TV sits on the smoothed path (rotation, scale, shift)
+                A, _ = cv2.estimateAffinePartial2D(rq, sq)
+                if A is not None:
+                    S = np.vstack([A, [0, 0, 1]])
+            sc = W / (cwn * sw_)
+            Cm = np.array([[sc, 0, -x0 * sw_ * sc], [0, sc, -y0 * sh_ * sc], [0, 0, 1]])
+            M = Cm @ S
+            frame = cv2.warpPerspective(bg, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+            quad = cv2.perspectiveTransform(rq[None], M)[0]  # where the TV is in this output frame
+            ts_ = min(T - 1, int(steps[i]))
             # relight the room: gain = 1 + Σ zone weight × (zone gain − 1), in linear light
             Hm = unit_to_quad(quad)
             wmap = cv2.warpPerspective(weights, Hm, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-            gain = wmap.reshape(-1, 4) @ (gains[ts] - 1).astype(np.float32)
+            gain = wmap.reshape(-1, 4) @ (gains[ts_] - 1).astype(np.float32)
             img = lin(frame) * (1 + gain.reshape(H, W, 3))
-            # the clip on the TV
+            # the clip on the TV: bright and clean, locked to the TV
             c = np.frombuffer(buf, np.uint8).reshape(ch, cw, 3)
-            c = srgb(screen_match(lin(c), a))
+            c = srgb(screen_look(lin(c), a))
             if bezel > 0:  # the corners sit on the TV's outer edge: draw the bezel inside them
                 c = add_bezel(c, bezel)
-            c = cv2.GaussianBlur(c, (0, 0), 0.6)
-            M = cv2.getPerspectiveTransform(src_quad, np.float32(quad))
-            warped = cv2.warpPerspective(c, M, (W, H), flags=cv2.INTER_LINEAR)
-            mask = cv2.warpPerspective(np.full((ch, cw), 255, np.uint8), M, (W, H))
-            mask = cv2.GaussianBlur(mask, (0, 0), 0.8).astype(np.float32)[..., None] / 255.0
-            img = img * (1 - mask) + lin(warped) * mask
+            c = cv2.GaussianBlur(c, (0, 0), 0.35)
+            Mc = cv2.getPerspectiveTransform(src_quad, np.float32(quad))
+            warped = cv2.warpPerspective(c, Mc, (W, H), flags=cv2.INTER_LINEAR)
+            mask = cv2.warpPerspective(full, Mc, (W, H))
+            mask = cv2.GaussianBlur(mask, (0, 0), 0.7).astype(np.float32)[..., None] / 255.0
+            wl = lin(warped)
+            # the screen lights up what is right around it (a soft bloom), and the room falls off a little
+            bloom = cv2.GaussianBlur(wl * mask, (0, 0), max(W, H) * 0.012)
+            img = img + bloom * 0.18 * (1 - mask)
+            img = img * (1 - mask) + wl * mask
             outf = srgb(img)
-            outf = np.clip(outf.astype(np.int16) + grain[i % len(grain)], 0, 255).astype(np.uint8)  # camera grain
+            noise = rng.normal(0, 1.1, (H // 2, W // 2, 1)).astype(np.float32)
+            noise = cv2.resize(noise, (W, H), interpolation=cv2.INTER_NEAREST)[..., None] * mask
+            outf = np.clip(outf.astype(np.float32) + noise, 0, 255).astype(np.uint8)
             enc.stdin.write(outf.tobytes())
-            if i % (int(fps) * 5) == 0 and i:
-                log(f"progress {i}/{n_out} frames ({i / max(1e-3, time.time() - t0):.1f} fps)")
+            i += 1
+            if i % (int(fps) * 5) == 0:
+                log(f"progress {i}/{n_out} frames ({i / max(1e-3, time.time() - t1):.1f} fps)")
     finally:
         if enc.stdin:
             enc.stdin.close()
@@ -591,6 +745,7 @@ def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], 
         clip_proc.kill()
         clip_proc.wait()
     log(f"rendered {out} in {time.time() - t0:.0f}s")
+    return {"shake_before": round(shake, 3), "shake_after": round(left, 3), "framing": [round(x0, 3), round(y0, 3), round(cwn, 3), round(chn, 3)]}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -869,10 +1024,10 @@ def make(clip: str, folder: str, out: str, orientation: str = "horizontal", reli
     outp = Path(out).resolve()
     outp.parent.mkdir(parents=True, exist_ok=True)
     part = outp.with_name(outp.stem + ".part.mp4")
-    render(clip, a, path, tgt, str(part), W, H, fps, relight, bezel)
+    stats = render(clip, a, path, tgt, str(part), W, H, fps, relight, bezel, orientation)
     part.replace(outp)
     plan = {"version": 1, "clip": str(Path(clip).resolve()), "recording": r["path"], "orientation": orientation, "match": round(cost, 3),
-            "path": path.tolist(), "relight": relight}
+            "path": path.tolist(), "relight": relight, **stats}
     outp.with_suffix(".tvlight.json").write_text(json.dumps(plan))
     log(f"done in {time.time() - t0:.0f}s using {Path(r['path']).name}")
     return {"outputs": [str(outp)], "out_dir": str(outp.parent), "recording": r["path"], "match": round(cost, 3)}
