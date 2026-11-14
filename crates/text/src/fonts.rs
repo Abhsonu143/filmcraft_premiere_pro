@@ -6,8 +6,9 @@
 //! [`resolve`] maps a family + style name (as stored in projects) to a face and the synthetic
 //! bold/italic needed when the family lacks that style. Unknown families fall back to Inter.
 
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
 use skrifa::instance::{LocationRef, Size};
 use skrifa::{FontRef, MetadataProvider};
@@ -182,13 +183,27 @@ pub struct VMetrics {
     pub underline_thickness: f32,
 }
 
+/// A font file's bytes, read once however many faces of it are in use: the faces of a collection
+/// (`.ttc`) share one copy instead of each holding the whole file.
+fn read_shared(path: &Path) -> Option<Arc<Vec<u8>>> {
+    static FILES: OnceLock<Mutex<HashMap<PathBuf, Weak<Vec<u8>>>>> = OnceLock::new();
+    let mut files = FILES.get_or_init(Default::default).lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(b) = files.get(path).and_then(Weak::upgrade) {
+        return Some(b);
+    }
+    let b = Arc::new(std::fs::read(path).ok()?);
+    files.retain(|_, w| w.strong_count() > 0);
+    files.insert(path.to_path_buf(), Arc::downgrade(&b));
+    Some(b)
+}
+
 impl Face {
     fn bytes(&self) -> Option<&[u8]> {
         self.bytes
             .get_or_init(|| match &self.info.data {
                 FaceData::Static(b) => Some(FaceBytes::Static(b)),
                 FaceData::Shared(b) => Some(FaceBytes::Shared(b.clone())),
-                FaceData::File(p) => std::fs::read(p).ok().map(|v| FaceBytes::Shared(Arc::new(v))),
+                FaceData::File(p) => read_shared(p).map(FaceBytes::Shared),
             })
             .as_ref()
             .map(FaceBytes::get)
@@ -196,6 +211,29 @@ impl Face {
     /// A copy of the font file's bytes (None if it is missing or unreadable).
     pub fn data(&self) -> Option<Vec<u8>> {
         self.bytes().map(<[u8]>::to_vec)
+    }
+    /// Whether the face covers every character of `text`, without keeping a font file it had not
+    /// loaded yet in memory (for searching many installed fonts once).
+    pub fn covers_unloaded(&self, text: &str) -> bool {
+        let check = |b: &[u8]| FontRef::from_index(b, self.info.index).is_ok_and(|f| text.chars().all(|c| f.charmap().map(c).is_some_and(|g| g.to_u32() != 0)));
+        match (self.bytes.get(), &self.info.data) {
+            (Some(Some(b)), _) => check(b.get()),
+            (Some(None), _) => false,
+            (None, FaceData::File(p)) => std::fs::read(p).is_ok_and(|b| check(&b)),
+            (None, _) => self.bytes().is_some_and(check),
+        }
+    }
+    /// A copy of the font file's bytes that leaves an unloaded file unloaded (the one copy is the
+    /// caller's).
+    pub fn data_unloaded(&self) -> Option<Vec<u8>> {
+        match (self.bytes.get(), &self.info.data) {
+            (None, FaceData::File(p)) => std::fs::read(p).ok(),
+            _ => self.data(),
+        }
+    }
+    /// Whether this face's font data is in memory.
+    pub fn is_loaded(&self) -> bool {
+        self.bytes.get().is_some_and(Option::is_some)
     }
     /// The parsed font (None if the file is missing or unreadable).
     pub fn font(&self) -> Option<FontRef<'_>> {

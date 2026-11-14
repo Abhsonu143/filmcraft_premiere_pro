@@ -172,6 +172,48 @@ def test_download_commands():
             pass
 
 
+def test_download_skips_what_is_there_or_redoes_all(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    import yt_download as yd
+
+    assert yd.clamp_parallel(0) == 1 and yd.clamp_parallel(99) == yd.MAX_PARALLEL and yd.clamp_parallel("x") == 1
+    folder = tmp_path / "My list"
+    folder.mkdir()
+    (folder / "001 - Song A.opus").write_bytes(b"x")
+    (folder / "003 - Old title.opus").write_bytes(b"x")  # renamed on YouTube since; recorded in the archive
+    (folder / "004 - Song D.webm.part").write_bytes(b"x")  # half done: not present
+    (tmp_path / yd.ARCHIVE).write_text("youtube CCCCCCCCCCC\n")
+    vids = [{"id": c * 11, "url": f"https://www.youtube.com/watch?v={c * 11}", "index": i, "stem": folder / f"{i:03d} - Song {c}"}
+            for i, c in enumerate("ABCD", 1)]
+    exts = yd.wanted_exts(True, "original", "mp4")
+    arch = yd.read_archive(tmp_path)
+    assert [bool(yd.present(v, exts, arch)) for v in vids] == [True, False, True, False]
+    assert yd.present(vids[0], yd.wanted_exts(True, "mp3", "mp4"), arch) is None  # asked for mp3: the opus is not it
+    assert yd.wanted_exts(False, "original", "mkv") == (".mkv",)
+    assert yd.yt_template(Path("/x/100% hits/001 - a")) == "/x/100%% hits/001 - a.%(ext)s"
+
+    # the parallel worker, with a stand-in for yt-dlp that "downloads" by writing the file
+    import script_writer as sw
+
+    fake = tmp_path / "fake-yt-dlp"
+    fake.write_text("""#!/bin/sh
+for a; do last="$a"; prev2="$prev"; prev="$a"; done
+out=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
+case "$last" in *DDDD*) echo "ERROR: [youtube] DDDD: Video unavailable"; exit 1;; esac
+f=$(printf '%s' "$out" | sed 's/%(ext)s/opus/; s/%%/%/g')
+echo "[download]  50.0% of 3.00MiB"; printf x > "$f"; echo "EI_FILE $f"
+""")
+    fake.chmod(0o755)
+    monkeypatch.setattr(sw, "yt_dlp_cmd", lambda: [str(fake)])
+    r = yd.download_parallel(vids, tmp_path, audio_only=True, audio_format="original", container="mp4", parallel=3, redo=False)
+    assert r["already"] == 2 and r["downloaded"] == 1 and len(r["skipped"]) == 1 and "unavailable" in r["skipped"][0]
+    assert (folder / "002 - Song B.opus").is_file() and (folder / "skipped.txt").is_file()
+    assert "BBBBBBBBBBB" in yd.read_archive(tmp_path)
+    r = yd.download_parallel(vids, tmp_path, audio_only=True, audio_format="original", container="mp4", parallel=2, redo=True)
+    assert r["already"] == 0 and r["downloaded"] == 3  # everything again (D is still unavailable)
+
+
 def test_subtitles_are_real_and_clean():
     import yt_download as yd
 

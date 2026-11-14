@@ -331,3 +331,23 @@ Full description: `docs/voice-and-voiceover.md`.
 - **Results and limits:** `docs/tv-light-sync.md`.
 - **Other changes:** `docs/tasks.md` holds the voice-training plan for later. `opencv-python-headless` was
   added to the requirements.
+
+## 2026-11-14: parallel YouTube downloads, skip or redo, EI idle memory 3.3 GB → 0.17 GB
+
+- Download from YouTube downloads several videos at once (dialog ▸ At the same time, 1–8, remembered;
+  `--parallel N`, default 3). The playlist is listed first (names exactly as yt-dlp gives them), then
+  one yt-dlp per video in a worker pool; progress adds up the parts. Measured: 5 NCS tracks in 19 s
+  at 3 at a time; a second run skipped all 5 in 1 s.
+- Files already in the folder are skipped (same name; or, for a video recorded in
+  `.downloaded.txt` whose title changed, the same playlist number and the right kind of file:
+  audio for audio, the chosen container for video). "Download everything again" (`--redo`)
+  replaces them. AI Jobs offers Retry (skip what is there) and Redo All on download jobs, also
+  after they finished (a sync). Subtitles use the same workers and the same choice.
+- EI idle memory: the Chinese fallback-font search at startup tested every installed font with
+  `has_char`, which loaded each file and kept it (678 faces, every face of a .ttc reading the whole
+  file again): 3.2 GB for as long as the app ran. Now the macOS Chinese fonts are looked up by name
+  first (Hiragino Sans GB, Heiti, Songti, Arial Unicode), a font search checks files without keeping
+  them (`Face::covers_unloaded`), and the faces of one file share one copy (`read_shared`).
+  Measured: a fresh EI with the demo project went from 3.25 GB to 172 MB. Regression test
+  `cjk::tests::finding_the_chinese_font_keeps_no_font_files` (fails on the old search).
+- `chrome_ui` header test: EI's menu bar lives in the header row; the test now counts it as header.

@@ -9,9 +9,13 @@
     (mp3 320k, m4a, flac, wav).
   - A playlist goes into a folder named after it (`<out>/<playlist name>/001 - <title>.<ext>`); one
     video goes straight into the output folder.
-  - Running it again downloads only what is new or missing (`.downloaded.txt` in the folder), so a
-    stopped download continues and a playlist can be kept in sync. Unavailable videos (deleted,
-    private, blocked here) are skipped and listed; the rest still download.
+  - Several videos at once (`--parallel N`, 1 to 8; 3 is a good default on an 8 GB Mac: downloads
+    wait on the network, not the CPU, and each one takes about 100 MB). Converting (mp3, m4a, flac,
+    wav) and merging video use ffmpeg, so those take some CPU per download.
+  - Running it again skips what is already in the folder (the same file name, or a file of this
+    video recorded in `.downloaded.txt`), so a stopped download continues and a playlist can be kept
+    in sync. `--redo` downloads everything again and replaces the files. Unavailable videos
+    (deleted, private, blocked here) are skipped and listed; the rest still download.
   - Uses EI's own yt-dlp (kept current with pip) and ffmpeg.
 
 Subtitles only (`--subs --sub-langs en hi`): the captions of every video, cleaned into text you can
@@ -38,7 +42,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import autocut as ac
@@ -49,6 +55,18 @@ CONTAINERS = ("mp4", "mkv")
 ITEM_RE = re.compile(r"\[download\] Downloading (?:item|video) (\d+) of (\d+)")
 PCT_RE = re.compile(r"\[download\]\s+([\d.]+)% of")
 FILE_RE = re.compile(r"^EI_FILE (.+)$")
+MAX_PARALLEL = 8
+AUDIO_EXTS = (".opus", ".m4a", ".mp3", ".flac", ".wav", ".ogg", ".aac", ".webm")
+VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov")
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+ARCHIVE = ".downloaded.txt"
+
+
+def clamp_parallel(n) -> int:
+    try:
+        return max(1, min(MAX_PARALLEL, int(n)))
+    except (TypeError, ValueError):
+        return 1
 
 
 def js_runtime() -> list[str]:
@@ -85,35 +103,202 @@ def build_cmd(url: str, out_dir: Path, *, audio_only: bool, audio_format: str = 
     ]
     if items:
         cmd += ["--playlist-items", items.replace(" ", "")]
+    return cmd + media_args(audio_only=audio_only, audio_format=audio_format, container=container) + [url]
+
+
+def media_args(*, audio_only: bool, audio_format: str, container: str) -> list[str]:
     if audio_only:
-        cmd += ["-f", "bestaudio/best", "-x"]
+        cmd = ["-f", "bestaudio/best", "-x"]
         if audio_format == "original":
-            cmd += ["--audio-quality", "0"]  # (keeps the stream as it is: no re-encode)
-        else:
-            cmd += ["--audio-format", audio_format, "--audio-quality", "0"]
-            if audio_format in ("mp3", "m4a", "flac", "opus"):
-                cmd += ["--embed-thumbnail"]
-    else:
-        # the best video and audio, whatever their resolution; merged into the chosen container
-        cmd += ["-f", "bv*+ba/b", "--merge-output-format", container]
-        if container == "mp4":
-            cmd += ["--embed-thumbnail"]
-    return cmd + [url]
+            return cmd + ["--audio-quality", "0"]  # (keeps the stream as it is: no re-encode)
+        cmd += ["--audio-format", audio_format, "--audio-quality", "0"]
+        return cmd + (["--embed-thumbnail"] if audio_format in ("mp3", "m4a", "flac", "opus") else [])
+    # the best video and audio, whatever their resolution; merged into the chosen container
+    return ["-f", "bv*+ba/b", "--merge-output-format", container] + (["--embed-thumbnail"] if container == "mp4" else [])
+
+
+def plan_items(url: str, out: Path, items: str | None) -> list[dict] | None:
+    """The videos of a link with the exact path yt-dlp would give each (without its extension):
+    [{id, url, index, stem: Path}]. None when the link is not a plain list of videos (a channel with
+    tabs, for example), so the caller lets one yt-dlp handle it."""
+    import script_writer as sw
+
+    playlist = is_playlist(url)
+    template = "%(playlist_title)s/%(playlist_index)03d - %(title)s.%(ext)s" if playlist else "%(title)s.%(ext)s"
+    cmd = sw.yt_dlp_cmd() + ["--flat-playlist", "--ignore-errors", "--windows-filenames", "-o", template,
+                             "--print", "%(id)s\t%(playlist_index|0)s\t%(filename)s"]
+    if items:
+        cmd += ["--playlist-items", items.replace(" ", "")]
+    cmd += ["--yes-playlist" if playlist else "--no-playlist", url]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    vids = []
+    for line in res.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        vid, idx, name = parts
+        if not VIDEO_ID.fullmatch(vid):
+            return None  # (an entry that is itself a list)
+        stem = name[:-3] if name.endswith(".NA") else str(Path(name).with_suffix(""))
+        vids.append({"id": vid, "url": f"https://www.youtube.com/watch?v={vid}", "index": int(idx) if idx.isdigit() else 0,
+                     "stem": out / stem})
+    return vids or None
+
+
+def read_archive(out: Path) -> set[str]:
+    try:
+        return {l.split()[-1] for l in (out / ARCHIVE).read_text(encoding="utf-8").splitlines() if l.strip()}
+    except OSError:
+        return set()
+
+
+def wanted_exts(audio_only: bool, audio_format: str, container: str) -> tuple[str, ...]:
+    if audio_only:
+        return AUDIO_EXTS if audio_format == "original" else (f".{audio_format}",)
+    return (f".{container}",)
+
+
+def present(v: dict, exts: tuple[str, ...], archived: set[str]) -> Path | None:
+    """The file of this video already in the folder: the same name, or (for a video recorded as
+    downloaded whose title has changed since) the same playlist number."""
+    stem: Path = v["stem"]
+    for e in exts:
+        f = stem.with_name(stem.name + e)
+        if f.is_file() and f.stat().st_size > 0:
+            return f
+    if v["id"] in archived and v["index"] and stem.parent.is_dir():
+        for f in stem.parent.glob(f"{v['index']:03d} - *"):
+            if f.suffix.lower() in exts and f.stat().st_size > 0:
+                return f
+    return None
+
+
+def yt_template(stem: Path) -> str:
+    return str(stem).replace("%", "%%") + ".%(ext)s"
 
 
 def download(url: str, out_dir: str, *, audio_only: bool = False, audio_format: str = "original", container: str = "mp4",
-             items: str | None = None) -> dict:
+             items: str | None = None, parallel: int = 3, redo: bool = False) -> dict:
     if not re.match(r"https?://(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/", url.strip()):
         raise AutocutError("give a YouTube link (a playlist or a video)")
+    if audio_format not in AUDIO_FORMATS:
+        raise AutocutError(f"audio format must be one of {', '.join(AUDIO_FORMATS)}")
+    if container not in CONTAINERS:
+        raise AutocutError(f"video container must be one of {', '.join(CONTAINERS)}")
+    if items and not re.fullmatch(r"[\d,\-: ]+", items):
+        raise AutocutError("items must look like 1-20 or 1,3,5")
     out = Path(out_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
+    parallel = clamp_parallel(parallel)
+    if not js_runtime():
+        log("no JavaScript runtime found (deno or node): YouTube may hide some of the best formats; installing deno (brew install deno) fixes it")
+    vids = plan_items(url.strip(), out, items)
+    if vids is None:
+        if redo:
+            log("this link is not a plain list of videos: downloading it as one job (it cannot be redone file by file)")
+        return download_one(url, out, audio_only=audio_only, audio_format=audio_format, container=container, items=items)
+    return download_parallel(vids, out, audio_only=audio_only, audio_format=audio_format, container=container,
+                             parallel=parallel, redo=redo)
+
+
+def download_parallel(vids: list[dict], out: Path, *, audio_only: bool, audio_format: str, container: str, parallel: int,
+                      redo: bool) -> dict:
+    import script_writer as sw
+
+    t0 = time.time()
+    exts = wanted_exts(audio_only, audio_format, container)
+    archived = read_archive(out)
+    todo, already = [], []
+    for v in vids:
+        f = None if redo else present(v, exts, archived)
+        (already if f else todo).append(v)
+    what = "audio only" if audio_only else "video"
+    log(f"downloading {what} ({audio_format if audio_only else container}, highest quality) into {out}: {len(vids)} video(s), "
+        + (f"{len(already)} already there (skipped), " if already else "") + (f"{len(todo)} to download, "
+        + (f"{min(parallel, len(todo))} at a time" if todo else "")) + (" (redoing all, files are replaced)" if redo else ""))
+    base = sw.yt_dlp_cmd() + ["--ignore-errors", "--newline", "--no-colors", "--windows-filenames", "--no-playlist",
+                              "--force-overwrites" if redo else "--no-overwrites", "--print", "after_move:EI_FILE %(filepath)s",
+                              "--embed-metadata"] + media_args(audio_only=audio_only, audio_format=audio_format, container=container)
+    lock = threading.Lock()
+    files: list[str] = []
+    skipped: list[str] = []
+    part: dict[str, float] = {}
+    done = [0]
+
+    def report(detail: str) -> None:
+        frac = (done[0] + sum(part.values())) / max(1, len(todo))
+        ac.stage_progress(min(1.0, frac), detail)
+
+    def one(v: dict) -> None:
+        v["stem"].parent.mkdir(parents=True, exist_ok=True)
+        cmd = base + ["-o", yt_template(v["stem"]), v["url"]]
+        got: list[str] = []
+        errors: list[str] = []
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except OSError as e:
+            errors.append(str(e))
+            proc = None
+        if proc is not None and proc.stdout is not None:
+            for line in proc.stdout:
+                line = line.rstrip()
+                m = PCT_RE.search(line)
+                if m:
+                    try:
+                        pct = float(m.group(1)) / 100
+                    except ValueError:
+                        continue
+                    with lock:
+                        part[v["id"]] = min(0.99, pct)
+                        report(f"{done[0]} of {len(todo)} done, {len(part)} downloading")
+                    continue
+                m = FILE_RE.match(line)
+                if m:
+                    got.append(m.group(1))
+                elif line.startswith("ERROR:"):
+                    errors.append(line[6:].strip()[:160])
+            proc.wait()
+        with lock:
+            part.pop(v["id"], None)
+            done[0] += 1
+            if got:
+                files.extend(got)
+                try:
+                    with open(out / ARCHIVE, "a", encoding="utf-8") as fh:
+                        fh.write(f"youtube {v['id']}\n")
+                except OSError:
+                    pass
+                log(f"saved {Path(got[-1]).name}")
+            else:
+                why = errors[-1] if errors else "nothing was downloaded"
+                skipped.append(f"{v['stem'].name}: {why}"[:200])
+                log(f"skipped: {v['stem'].name[:80]}: {why}")
+            report(f"{done[0]} of {len(todo)} done")
+
+    if todo:
+        with ThreadPoolExecutor(max_workers=min(parallel, len(todo))) as pool:
+            list(pool.map(one, todo))
+    folder = str(vids[0]["stem"].parent) if vids else str(out)
+    if skipped:
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        (Path(folder) / "skipped.txt").write_text("\n".join(skipped) + "\n", encoding="utf-8")
+    if todo and not files and len(skipped) == len(todo) and not already:
+        raise AutocutError("yt-dlp could not download this link (see the log)")
+    log(f"done in {time.time() - t0:.0f}s: {len(files)} new file(s)" + (f", {len(already)} already there" if already else "")
+        + (f", {len(skipped)} unavailable (skipped.txt)" if skipped else ""))
+    return {"outputs": files, "out_dir": folder, "downloaded": len(files), "already": len(already), "skipped": skipped}
+
+
+def download_one(url: str, out: Path, *, audio_only: bool, audio_format: str, container: str, items: str | None) -> dict:
+    """One yt-dlp for the whole link (a channel, or when the list could not be read first)."""
     cmd = build_cmd(url.strip(), out, audio_only=audio_only, audio_format=audio_format, container=container, items=items)
     log(f"downloading {'audio only' if audio_only else 'video'} ({audio_format if audio_only else container}, highest quality) into {out}")
     t0 = time.time()
     files: list[str] = []
     skipped: list[str] = []
-    if not js_runtime():
-        log("no JavaScript runtime found (deno or node): YouTube may hide some of the best formats; installing deno (brew install deno) fixes it")
     k, n = 0, 1
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     assert proc.stdout is not None
@@ -278,7 +463,7 @@ def safe_name(t: str) -> str:
 
 
 def download_subs(url: str, out_dir: str, *, langs: list[str], items: str | None = None, polish: str = "claude",
-                  learn_style: str | None = None) -> dict:
+                  learn_style: str | None = None, parallel: int = 3, redo: bool = False) -> dict:
     import script_writer as sw
 
     langs = [l for l in langs if l in SUB_LANGS]
@@ -292,7 +477,9 @@ def download_subs(url: str, out_dir: str, *, langs: list[str], items: str | None
     playlist = vids[0]["playlist"] if is_playlist(url) and vids[0]["playlist"] else ""
     folder = Path(out_dir).expanduser().resolve() / safe_name(playlist) if playlist else Path(out_dir).expanduser().resolve()
     folder.mkdir(parents=True, exist_ok=True)
-    log(f"subtitles ({', '.join(langs)}) of {len(vids)} video(s) into {folder}")
+    parallel = clamp_parallel(parallel)
+    log(f"subtitles ({', '.join(langs)}) of {len(vids)} video(s) into {folder}, {min(parallel, len(vids))} at a time"
+        + (" (redoing all)" if redo else ""))
     t0 = time.time()
     files: list[str] = []
     missing: list[str] = []
@@ -303,59 +490,80 @@ def download_subs(url: str, out_dir: str, *, langs: list[str], items: str | None
     except (OSError, ValueError):
         manifest = {}
     this_run: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="ei-subs-") as tmp:
-        for k, v in enumerate(vids, 1):
-            log(f"progress {k - 1}/{len(vids)} videos")
-            stem = (f"{v['index']:03d} - " if playlist and v["index"] else "") + safe_name(v["title"])
-            this_run += [f"{stem}.{l}.txt" for l in langs]
-            todo = [l for l in langs if not (folder / f"{stem}.{l}.txt").is_file()]
-            if not todo:
-                continue  # (done on an earlier run)
+    lock = threading.RLock()
+    finished = [0]
+
+    def say(msg: str) -> None:
+        with lock:  # (whole lines, whichever worker writes)
+            log(msg)
+    for v in vids:
+        stem = (f"{v['index']:03d} - " if playlist and v["index"] else "") + safe_name(v["title"])
+        v["stem"] = stem
+        this_run += [f"{stem}.{l}.txt" for l in langs]
+
+    def subs_of(k: int, v: dict, tmp: str) -> None:
+        try:
+            subs_one(k, v, tmp)
+        finally:
+            with lock:
+                finished[0] += 1
+                log(f"progress {finished[0]}/{len(vids)} videos")
+
+    def subs_one(k: int, v: dict, tmp: str) -> None:
+        stem = v["stem"]
+        todo = [l for l in langs if redo or not (folder / f"{stem}.{l}.txt").is_file()]
+        if not todo:
+            return  # (done on an earlier run)
+        try:
             proc = subprocess.run(base + ["-J", "--skip-download", v["url"]], capture_output=True, text=True, timeout=180)
-            try:
-                info = json.loads(proc.stdout)
-            except ValueError:
+            info = json.loads(proc.stdout)
+        except (ValueError, OSError, subprocess.TimeoutExpired):
+            with lock:
                 missing.append(f"{v['title']}: unavailable")
-                log(f"skipped (unavailable): {v['title'][:70]}")
-                continue
-            if not (info.get("subtitles") or info.get("automatic_captions")):
+            say(f"skipped (unavailable): {v['title'][:70]}")
+            return
+        if not (info.get("subtitles") or info.get("automatic_captions")):
+            with lock:
                 missing.append(f"{v['title']}: this video has no subtitles at all")
-                log(f"no subtitles at all: {v['title'][:70]}")
-                continue
-            spoken = (info.get("language") or "").split("-")[0] or next(
-                (k_.split("-")[0] for k_ in (info.get("automatic_captions") or {}) if k_.endswith("-orig")), "")
-            for lang in todo:
-                tr = pick_lang(info, lang)
-                if tr is None:
+            say(f"no subtitles at all: {v['title'][:70]}")
+            return
+        spoken = (info.get("language") or "").split("-")[0] or next(
+            (k_.split("-")[0] for k_ in (info.get("automatic_captions") or {}) if k_.endswith("-orig")), "")
+        for lang in todo:
+            tr = pick_lang(info, lang)
+            if tr is None:
+                with lock:
                     missing.append(f"{v['title']}: no {lang} subtitles")
-                    continue
-                code, is_auto = tr
-                cues = fetch_cues(base, v["url"], code, is_auto, Path(tmp) / f"{k}-{lang}")
-                if cues and not looks_like(" ".join(c["text"] for c in cues), lang):
-                    # labelled "Hindi" but written in English (or the other way round): the real speech instead
-                    auto = info.get("automatic_captions") or {}
-                    alt = f"{lang}-orig" if f"{lang}-orig" in auto else (lang if spoken == lang and lang in auto else None)
-                    log(f"the {code} subtitles of “{v['title'][:50]}” are not in {lang}" + ("; using the automatic captions of the speech" if alt else ""))
-                    cues, code, is_auto = (fetch_cues(base, v["url"], alt, True, Path(tmp) / f"{k}-{lang}-alt"), alt, True) if alt else ([], code, is_auto)
-                if cues is None:
-                    missing.append(f"{v['title']}: {lang} subtitles could not be downloaded")
-                    continue
-                if not cues:
-                    missing.append(f"{v['title']}: no real {lang} subtitles")
-                    continue
-                raw = " ".join(c["text"] for c in cues)
-                if is_punctuated(raw):
-                    text = re.sub(r"\s+", " ", raw).strip()
-                else:
-                    text = (polish_claude(raw, lang, v["title"]) if polish == "claude" else None) or sentences_by_pauses(cues)
-                (folder / f"{stem}.{lang}.srt").write_text(ac.to_srt(cues_as_words(cues)), encoding="utf-8")
-                (folder / f"{stem}.{lang}.txt").write_text(f"{v['title']}\n{v['url']}\n\n{text.strip()}\n", encoding="utf-8")
+                continue
+            code, is_auto = tr
+            cues = fetch_cues(base, v["url"], code, is_auto, Path(tmp) / f"{k}-{lang}")
+            if cues and not looks_like(" ".join(c["text"] for c in cues), lang):
+                # labelled "Hindi" but written in English (or the other way round): the real speech instead
+                auto = info.get("automatic_captions") or {}
+                alt = f"{lang}-orig" if f"{lang}-orig" in auto else (lang if spoken == lang and lang in auto else None)
+                say(f"the {code} subtitles of “{v['title'][:50]}” are not in {lang}" + ("; using the automatic captions of the speech" if alt else ""))
+                cues, code, is_auto = (fetch_cues(base, v["url"], alt, True, Path(tmp) / f"{k}-{lang}-alt"), alt, True) if alt else ([], code, is_auto)
+            if cues is None or not cues:
+                with lock:
+                    missing.append(f"{v['title']}: " + (f"{lang} subtitles could not be downloaded" if cues is None else f"no real {lang} subtitles"))
+                continue
+            raw = " ".join(c["text"] for c in cues)
+            if is_punctuated(raw):
+                text = re.sub(r"\s+", " ", raw).strip()
+            else:
+                text = (polish_claude(raw, lang, v["title"]) if polish == "claude" else None) or sentences_by_pauses(cues)
+            (folder / f"{stem}.{lang}.srt").write_text(ac.to_srt(cues_as_words(cues)), encoding="utf-8")
+            (folder / f"{stem}.{lang}.txt").write_text(f"{v['title']}\n{v['url']}\n\n{text.strip()}\n", encoding="utf-8")
+            with lock:
                 files.append(str(folder / f"{stem}.{lang}.txt"))
                 # what this text is: the person's own words, or a translation of them
                 manifest[f"{stem}.{lang}.txt"] = {"url": v["url"], "lang": lang, "track": code, "automatic": is_auto,
                                                    "spoken": (not spoken) or spoken == lang}
-                log(f"subtitles ({lang}{', automatic, polished' if is_auto else ''}): {stem[:70]}")
-        log(f"progress {len(vids)}/{len(vids)} videos")
+            say(f"subtitles ({lang}{', automatic, polished' if is_auto else ''}): {stem[:70]}")
+
+    with tempfile.TemporaryDirectory(prefix="ei-subs-") as tmp:
+        with ThreadPoolExecutor(max_workers=min(parallel, len(vids))) as pool:
+            list(pool.map(lambda kv: subs_of(kv[0], kv[1], tmp), enumerate(vids, 1)))
     # one text per language with everything (the input for a style)
     alls = []
     for lang in langs:
@@ -418,12 +626,16 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--sub-langs", nargs="+", default=["en", "hi"], choices=list(SUB_LANGS))
     p.add_argument("--polish", default="claude", choices=["claude", "rules"], help="automatic captions: Claude adds punctuation and fixes mishearings")
     p.add_argument("--learn-style", help="also learn a talking style with this name from the subtitles")
+    p.add_argument("--parallel", type=int, default=3, help=f"videos downloaded at the same time (1 to {MAX_PARALLEL})")
+    p.add_argument("--redo", action="store_true", help="download everything again (replacing the files) instead of skipping what is already there")
 
 
 def run_args(a) -> dict:
     if a.subs:
-        return download_subs(a.url, a.out_dir, langs=a.sub_langs, items=a.items, polish=a.polish, learn_style=a.learn_style)
-    return download(a.url, a.out_dir, audio_only=a.audio_only, audio_format=a.audio_format, container=a.container, items=a.items)
+        return download_subs(a.url, a.out_dir, langs=a.sub_langs, items=a.items, polish=a.polish, learn_style=a.learn_style,
+                             parallel=a.parallel, redo=a.redo)
+    return download(a.url, a.out_dir, audio_only=a.audio_only, audio_format=a.audio_format, container=a.container, items=a.items,
+                    parallel=a.parallel, redo=a.redo)
 
 
 def main(argv: list[str] | None = None) -> int:

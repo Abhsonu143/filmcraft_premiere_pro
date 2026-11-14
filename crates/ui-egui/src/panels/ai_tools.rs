@@ -258,6 +258,10 @@ struct Draft {
     dl_format: &'static str,
     container: &'static str,
     items: String,
+    /// Videos downloaded at the same time (1 to 8; remembered as the "download_parallel" setting).
+    dl_parallel: u8,
+    /// Download everything again (replacing the files) instead of skipping what is already there.
+    dl_redo: bool,
     // optional emotional sound design (music per mood, hits, risers, pauses)
     sound: bool,
     music_source: &'static str,
@@ -433,6 +437,8 @@ impl Draft {
             dl_format: "original",
             container: "mp4",
             items: String::new(),
+            dl_parallel: default_parallel(),
+            dl_redo: false,
             sound: false,
             music_source: "internet",
             music_folder: setting_str("music_folder").unwrap_or_default(),
@@ -570,6 +576,10 @@ impl Draft {
         if let Some(v) = s("items") {
             d.items = v;
         }
+        if let Some(n) = p.get("parallel").and_then(Value::as_f64) {
+            d.dl_parallel = clamp_parallel(n);
+        }
+        d.dl_redo = flag("redo", d.dl_redo);
         if let Some(v) = s("hookLine") {
             d.hook_line = v;
         }
@@ -688,6 +698,8 @@ impl Draft {
         p["audioFormat"] = json!(self.dl_format);
         p["container"] = json!(self.container);
         p["items"] = json!(self.items);
+        p["parallel"] = json!(self.dl_parallel);
+        p["redo"] = json!(self.dl_redo);
         // "hook" is the teaser checkbox for short clips, and the opening style for a voiceover edit
         p["hook"] = if self.kind == Kind::Clips { json!(self.hook) } else { json!(self.vo_hook) };
         p
@@ -1030,6 +1042,10 @@ impl Draft {
                         }
                     }
                     _ => push(&mut a, "--container", self.container),
+                }
+                push(&mut a, "--parallel", &clamp_parallel(f64::from(self.dl_parallel)).to_string());
+                if self.dl_redo {
+                    a.push("--redo".into());
                 }
                 if !items.is_empty() {
                     push(&mut a, "--items", &items.replace(' ', ""));
@@ -1803,6 +1819,18 @@ fn default_llm_at(path: &Path) -> &'static str {
     LLMS.iter().skip(1).map(|m| m.0).find(|k| *k == key).unwrap_or("qwen3-4b")
 }
 
+/// Most downloads at the same time (more makes YouTube slow everything down).
+const MAX_PARALLEL: u8 = 8;
+
+fn clamp_parallel(n: f64) -> u8 {
+    if n.is_finite() { n.round().clamp(1.0, f64::from(MAX_PARALLEL)) as u8 } else { 3 }
+}
+
+/// How many videos download at the same time: the saved choice, 3 at first.
+fn default_parallel() -> u8 {
+    setting_str("download_parallel").and_then(|v| v.parse::<f64>().ok()).map_or(3, clamp_parallel)
+}
+
 /// A string setting from EI's settings file.
 fn setting_str(key: &str) -> Option<String> {
     let saved = std::fs::read_to_string(settings_path()).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())?;
@@ -2242,14 +2270,38 @@ fn push_log_locked(j: &mut Job, line: String) {
 
 /// Run a finished, failed or cancelled job again. The engine keeps what each stage made (research,
 /// script, voice takes, media, rendered shots), so a retry continues where the job stopped.
-fn retry_job(id: u64) -> Option<u64> {
+/// `redo` (downloads only): Some(true) downloads everything again, Some(false) skips what is there.
+fn retry_job(id: u64, redo: Option<bool>) -> Option<u64> {
     let (title, kind, steps, import, cwd) =
         with_job(id, |j| (j.status != Status::Running).then(|| (j.title.clone(), j.kind, j.steps.clone(), j.import, j.cwd.clone())))??;
     if steps.is_empty() {
         return None;
     }
+    let steps = match redo {
+        Some(r) if is_download(&steps) => with_redo(&steps, r),
+        _ => steps,
+    };
     let title = if title.ends_with(" (retry)") { title } else { format!("{title} (retry)") };
     Some(start_job(title, kind, steps, import, cwd))
+}
+
+/// Whether these steps download from YouTube.
+fn is_download(steps: &[Vec<String>]) -> bool {
+    steps.iter().any(|s| s.get(2).map(String::as_str) == Some("download"))
+}
+
+/// A download's steps with `--redo` added (everything again) or taken out (skip what is there).
+fn with_redo(steps: &[Vec<String>], redo: bool) -> Vec<Vec<String>> {
+    steps
+        .iter()
+        .map(|s| {
+            let mut s: Vec<String> = s.iter().filter(|a| a.as_str() != "--redo").cloned().collect();
+            if redo && s.get(2).map(String::as_str) == Some("download") {
+                s.push("--redo".into());
+            }
+            s
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2687,7 +2739,9 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             None => Err(format!("{id} needs {{job}}")),
         },
         "ai.retry" => match params.get("job").and_then(Value::as_u64) {
-            Some(j) => retry_job(j).map(|n| json!({"job": n})).ok_or_else(|| "that job cannot be run again (still running, or unknown)".to_string()),
+            Some(j) => retry_job(j, params.get("redo").and_then(Value::as_bool))
+                .map(|n| json!({"job": n}))
+                .ok_or_else(|| "that job cannot be run again (still running, or unknown)".to_string()),
             None => Err("ai.retry needs {job}".into()),
         },
         "ai.queue" => {
@@ -3572,6 +3626,27 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             ui.label("Items (optional)");
                             let r = ui.add(egui::TextEdit::singleline(&mut d.items).hint_text("all; or e.g. 1-20, 1,4,9").desired_width(200.0));
                             elems.push((format!("{p}.items"), r.rect, d.items.clone()));
+                            ui.end_row();
+                            ui.label("At the same time");
+                            ui.vertical(|ui| {
+                                let r = ui.add(egui::Slider::new(&mut d.dl_parallel, 1..=MAX_PARALLEL).suffix(" videos"));
+                                elems.push((format!("{p}.parallel"), r.rect, d.dl_parallel.to_string()));
+                                if r.changed() {
+                                    let _ = save_setting("download_parallel", &d.dl_parallel.to_string()); // the default next time
+                                }
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Downloads wait on the internet, not the Mac: 3 to 4 suits an 8 GB Mac (about 100 MB each). \
+                                         Converting audio (mp3, m4a, flac, wav) and merging video also use the CPU; use fewer while other AI jobs run.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            });
+                            ui.end_row();
+                            ui.label("");
+                            let r = ui.checkbox(&mut d.dl_redo, "Download everything again (replace the files already there)");
+                            elems.push((format!("{p}.redo"), r.rect, d.dl_redo.to_string()));
                             ui.end_row();
                         }
                         Kind::Speak => {
@@ -4523,6 +4598,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         paused: bool,
         queued: bool,
         retry: bool,
+        download: bool,
         outputs: Vec<String>,
         out_dir: Option<String>,
         importable: bool,
@@ -4550,6 +4626,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
             paused: j.paused_since.is_some(),
             queued: j.queued,
             retry: j.status != Status::Running && !j.steps.is_empty(),
+            download: is_download(&j.steps),
             outputs: j
                 .result
                 .get("outputs")
@@ -4569,7 +4646,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
     let mut cancel: Option<u64> = None;
     let mut pause: Option<(u64, bool)> = None;
-    let mut retry: Option<u64> = None;
+    let mut retry: Option<(u64, Option<bool>)> = None;
     let mut reveal: Option<String> = None;
     let mut open_file: Option<String> = None;
     let mut import: Option<u64> = None;
@@ -4735,11 +4812,23 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             cancel = Some(r.id);
                         }
                     }
-                    if r.retry && r.status != Status::Done {
+                    if r.retry && r.download {
+                        // a download can be run again even when it finished: it fetches what is new or missing
+                        let b = ui.button("Retry").on_hover_text("Download again what is missing; files already there are skipped");
+                        elems.push((format!("{pid}.retry"), b.rect, "Retry".into()));
+                        if b.clicked() {
+                            retry = Some((r.id, Some(false)));
+                        }
+                        let b = ui.button("Redo All").on_hover_text("Download everything again, replacing the files already there");
+                        elems.push((format!("{pid}.redo"), b.rect, "Redo All".into()));
+                        if b.clicked() {
+                            retry = Some((r.id, Some(true)));
+                        }
+                    } else if r.retry && r.status != Status::Done {
                         let b = ui.button("Retry").on_hover_text("Run it again: it continues from what was already made");
                         elems.push((format!("{pid}.retry"), b.rect, "Retry".into()));
                         if b.clicked() {
-                            retry = Some(r.id);
+                            retry = Some((r.id, None));
                         }
                     }
                     if let Some(first) = r.outputs.first() {
@@ -4804,10 +4893,14 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if let Some((j, p)) = pause {
         pause_job(j, p);
     }
-    if let Some(j) = retry
-        && retry_job(j).is_some()
+    if let Some((j, redo)) = retry
+        && retry_job(j, redo).is_some()
     {
-        app.ui.status = "Running it again: it continues from what was already made".into();
+        app.ui.status = match redo {
+            Some(true) => "Downloading everything again".into(),
+            Some(false) => "Downloading what is missing (files already there are skipped)".into(),
+            None => "Running it again: it continues from what was already made".into(),
+        };
     }
     if let Some((from, to)) = move_item {
         move_waiting(from, to);
@@ -5234,6 +5327,16 @@ mod tests {
         .unwrap();
         assert!(s.windows(3).any(|w| w == ["--subs", "--sub-langs", "hi"]) && s.windows(2).any(|w| w == ["--learn-style", "my style"]), "{s:?}");
         assert!(s.windows(2).any(|w| w == ["--polish", "claude"]) && !s.contains(&"--container".to_string()), "{s:?}");
+        let mut par = Draft::from_params(Kind::Download, &json!({"url": "https://youtu.be/a", "parallel": 5, "redo": true, "out": "/tmp/x"}));
+        let pa = par.engine_args().unwrap();
+        assert!(pa.windows(2).any(|w| w == ["--parallel", "5"]) && pa.contains(&"--redo".to_string()), "{pa:?}");
+        assert_eq!(par.to_params()["parallel"], json!(5));
+        let many = Draft::from_params(Kind::Download, &json!({"url": "https://youtu.be/a", "parallel": 40, "out": "/tmp/x"})).engine_args().unwrap();
+        assert!(many.windows(2).any(|w| w == ["--parallel", "8"]) && !many.contains(&"--redo".to_string()), "{many:?}");
+        let steps = vec![vec!["py".to_string(), "ei_engine.py".into(), "download".into(), "u".into(), "--redo".into()]];
+        assert!(is_download(&steps) && !with_redo(&steps, false)[0].contains(&"--redo".to_string()));
+        assert_eq!(with_redo(&with_redo(&steps, true), true)[0].iter().filter(|a| a.as_str() == "--redo").count(), 1);
+        assert!(!is_download(&[vec!["py".to_string(), "ei_engine.py".into(), "topic".into()]]));
         let old = Draft::from_params(Kind::Download, &json!({"url": "https://youtu.be/a", "audioOnly": true, "out": "/tmp/x"})).engine_args().unwrap();
         assert!(old.contains(&"--audio-only".to_string()), "older audioOnly still works");
         for bad in [
