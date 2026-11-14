@@ -79,6 +79,7 @@ pub enum Kind {
     Speak,
     Hooks,
     Download,
+    Package,
 }
 
 impl Kind {
@@ -98,6 +99,7 @@ impl Kind {
             Kind::Speak => "speak",
             Kind::Hooks => "hooks",
             Kind::Download => "download",
+            Kind::Package => "package",
         }
     }
     fn from_command(id: &str) -> Option<Kind> {
@@ -116,6 +118,7 @@ impl Kind {
             "ai.speak" => Kind::Speak,
             "ai.hooks" => Kind::Hooks,
             "ai.download" => Kind::Download,
+            "ai.package" => Kind::Package,
             _ => return None,
         })
     }
@@ -135,6 +138,7 @@ impl Kind {
             Kind::Speak => "Speak Script",
             Kind::Hooks => "Hook Library",
             Kind::Download => "Download from YouTube",
+            Kind::Package => "Thumbnails, Titles & Hashtags",
         }
     }
     fn input_label(self) -> &'static str {
@@ -147,7 +151,10 @@ impl Kind {
         }
     }
     fn needs_input(self) -> bool {
-        !matches!(self, Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Tv | Kind::Speak | Kind::Hooks | Kind::Download)
+        !matches!(
+            self,
+            Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Tv | Kind::Speak | Kind::Hooks | Kind::Download | Kind::Package
+        )
     }
     /// Tools that render a video in a chosen shape (and so offer 1080p or 4K).
     fn has_resolution(self) -> bool {
@@ -158,7 +165,7 @@ impl Kind {
         matches!(self, Kind::Speak | Kind::Voiceover | Kind::Topic | Kind::Clips | Kind::Music)
     }
     fn needs_clips(self) -> bool {
-        matches!(self, Kind::Music | Kind::Reference | Kind::Voiceover | Kind::Audio | Kind::Tv)
+        matches!(self, Kind::Music | Kind::Reference | Kind::Voiceover | Kind::Audio | Kind::Tv | Kind::Package)
     }
 }
 
@@ -262,6 +269,9 @@ struct Draft {
     dl_parallel: u8,
     /// Download everything again (replacing the files) instead of skipping what is already there.
     dl_redo: bool,
+    // thumbnails, titles & hashtags: which platforms ([`PLATFORMS`] order) and how many variants
+    pk_platforms: [bool; 4],
+    pk_variants: f64,
     // optional emotional sound design (music per mood, hits, risers, pauses)
     sound: bool,
     music_source: &'static str,
@@ -439,6 +449,8 @@ impl Draft {
             items: String::new(),
             dl_parallel: default_parallel(),
             dl_redo: false,
+            pk_platforms: [true, false, false, false],
+            pk_variants: 3.0,
             sound: false,
             music_source: "internet",
             music_folder: setting_str("music_folder").unwrap_or_default(),
@@ -580,6 +592,16 @@ impl Draft {
             d.dl_parallel = clamp_parallel(n);
         }
         d.dl_redo = flag("redo", d.dl_redo);
+        if let Some(a) = p.get("platforms").and_then(Value::as_array) {
+            for (k, (id, _)) in PLATFORMS.iter().enumerate() {
+                if let Some(on) = d.pk_platforms.get_mut(k) {
+                    *on = a.iter().any(|v| v.as_str() == Some(id));
+                }
+            }
+        }
+        if let Some(n) = p.get("variants").and_then(Value::as_f64).filter(|n| n.is_finite()) {
+            d.pk_variants = n.round().clamp(1.0, 6.0);
+        }
         if let Some(v) = s("hookLine") {
             d.hook_line = v;
         }
@@ -700,6 +722,8 @@ impl Draft {
         p["items"] = json!(self.items);
         p["parallel"] = json!(self.dl_parallel);
         p["redo"] = json!(self.dl_redo);
+        p["platforms"] = json!(self.platform_ids());
+        p["variants"] = json!(self.pk_variants);
         // "hook" is the teaser checkbox for short clips, and the opening style for a voiceover edit
         p["hook"] = if self.kind == Kind::Clips { json!(self.hook) } else { json!(self.vo_hook) };
         p
@@ -738,6 +762,11 @@ impl Draft {
         }
         a.extend(["--music-level".into(), format!("{}", self.music_level)]);
         Ok(())
+    }
+
+    /// The chosen platforms of Thumbnails, Titles & Hashtags (engine ids).
+    fn platform_ids(&self) -> Vec<&'static str> {
+        PLATFORMS.iter().zip(self.pk_platforms).filter(|(_, on)| *on).map(|((id, _), _)| *id).collect()
     }
 
     fn engine_args(&mut self) -> Result<Vec<String>, String> {
@@ -1049,6 +1078,45 @@ impl Draft {
                 }
                 if !items.is_empty() {
                     push(&mut a, "--items", &items.replace(' ', ""));
+                }
+            }
+            Kind::Package => {
+                if self.topic.trim().is_empty() {
+                    return Err("Say what the video is about (the topic).".into());
+                }
+                let platforms = self.platform_ids();
+                if platforms.is_empty() {
+                    return Err("Choose at least one platform.".into());
+                }
+                if !self.lang_en && !self.lang_hi {
+                    return Err("Choose English, Hindi or both.".into());
+                }
+                a = vec!["package".into(), "--clips".into()];
+                a.extend(self.clips.iter().cloned());
+                push(&mut a, "--topic", self.topic.trim());
+                a.push("--platforms".into());
+                a.extend(platforms.iter().map(|p| p.to_string()));
+                a.push("--languages".into());
+                for (on, c) in [(self.lang_en, "en"), (self.lang_hi, "hi")] {
+                    if on {
+                        a.push(c.into());
+                    }
+                }
+                push(&mut a, "--variants", &(self.pk_variants.round().clamp(1.0, 6.0) as u32).to_string());
+                if !self.hook_line.trim().is_empty() {
+                    push(&mut a, "--hook", self.hook_line.trim());
+                } else if self.find_hook {
+                    a.push("--find-hook".into());
+                }
+                if !self.niche.trim().is_empty() {
+                    push(&mut a, "--niche", self.niche.trim());
+                }
+                if !self.notes.trim().is_empty() {
+                    push(&mut a, "--notes", self.notes.trim());
+                }
+                push(&mut a, "--writer", if self.writer == "claude" { "claude" } else { "rules" });
+                if !self.out.trim().is_empty() {
+                    push(&mut a, "--out-dir", self.out.trim());
                 }
             }
             Kind::Speak => {
@@ -1420,6 +1488,13 @@ const DESCRIBERS: [(&str, &str); 3] = [
     ("none", "Match on the words only"),
 ];
 const SCRIPT_LANGUAGES: [(&str, &str); 3] = [("hinglish", "Hinglish (Hindi + English words)"), ("hi", "Hindi"), ("en", "English")];
+/// Thumbnails, Titles & Hashtags: where it will be posted (engine id, label).
+const PLATFORMS: [(&str, &str); 4] = [
+    ("youtube", "YouTube video (1280×720)"),
+    ("shorts", "YouTube Shorts (1080×1920)"),
+    ("instagram", "Instagram video, feed (1080×1350)"),
+    ("reels", "Instagram Reels (1080×1920)"),
+];
 const WRITERS: [(&str, &str); 2] = [("claude", "Claude (through Claude Code; best quality)"), ("local", "Local model (offline)")];
 const VOICE_SOURCES: [(&str, &str); 2] =
     [("record", "Record with the microphone (EI gives the sentences)"), ("files", "Recordings I already have (audio or video)")];
@@ -1475,6 +1550,7 @@ fn default_output(d: &Draft) -> String {
         Kind::Voice => voices_dir().join(slug(&d.voice_name)).to_string_lossy().to_string(),
         Kind::Topic => String::new(), // the engine names the folder after the topic (Movies/EI/Topics/…)
         Kind::Hooks => String::new(), // the library has one place (Application Support/EI/hooks)
+        Kind::Package => movies_dir().join("Thumbnails").to_string_lossy().to_string(),
         // the folder chosen last time (a playlist gets a folder of its own inside it)
         Kind::Download => setting_str("download_dir").unwrap_or_else(|| movies_dir().join("Downloads").to_string_lossy().to_string()),
         Kind::Speak => {
@@ -2627,7 +2703,7 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
         Kind::Split | Kind::Reference | Kind::Talk | Kind::Voiceover | Kind::Clips => format!("{}: {}", d.kind.title(), file_stem(&d.input)),
         Kind::Script => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Voice => format!("{}: {}", d.kind.title(), d.voice_name.trim()),
-        Kind::Topic => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
+        Kind::Topic | Kind::Package => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Speak => format!("{}: {}", d.kind.title(), file_stem(&d.out)),
         Kind::Hooks => format!("{}: sync {}", d.kind.title(), d.hook_niches.trim().chars().take(40).collect::<String>()),
         Kind::Download => format!(
@@ -3107,6 +3183,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             Kind::Voice => "Your recordings",
                             Kind::Voiceover => "Footage",
                             Kind::Tv => "Your clips",
+                            Kind::Package => "Clips or images",
                             _ => "Clips",
                         });
                         ui.vertical(|ui| {
@@ -3574,6 +3651,62 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             radio_row(ui, &mut d.source, &VOICE_SOURCES, &format!("{p}.source"), &mut elems);
                             ui.end_row();
                         }
+                        Kind::Package => {
+                            ui.label("Topic");
+                            let r = ui.add(egui::TextEdit::singleline(&mut d.topic).hint_text("what the video is about").desired_width(380.0));
+                            elems.push((format!("{p}.topic"), r.rect, d.topic.clone()));
+                            ui.end_row();
+                            ui.label("Hook (optional)");
+                            ui.vertical(|ui| {
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(&mut d.hook_line).hint_text("your hook: the thumbnail words and titles build on it").desired_width(380.0),
+                                );
+                                elems.push((format!("{p}.hookLine"), r.rect, d.hook_line.clone()));
+                                ui.add_enabled_ui(d.hook_line.trim().is_empty(), |ui| {
+                                    let r = ui.checkbox(&mut d.find_hook, "Search online for a hot hook and this week's hashtags (Claude with web search)");
+                                    elems.push((format!("{p}.findHook"), r.rect, d.find_hook.to_string()));
+                                });
+                            });
+                            ui.end_row();
+                            ui.label("For");
+                            ui.vertical(|ui| {
+                                for (k, (id, label)) in PLATFORMS.iter().enumerate() {
+                                    if let Some(on) = d.pk_platforms.get_mut(k) {
+                                        let r = ui.checkbox(on, *label);
+                                        elems.push((format!("{p}.platform.{id}"), r.rect, on.to_string()));
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Languages");
+                            ui.horizontal(|ui| {
+                                let r = ui.checkbox(&mut d.lang_en, "English");
+                                elems.push((format!("{p}.lang.en"), r.rect, d.lang_en.to_string()));
+                                let r = ui.checkbox(&mut d.lang_hi, "Hindi");
+                                elems.push((format!("{p}.lang.hi"), r.rect, d.lang_hi.to_string()));
+                            });
+                            ui.end_row();
+                            ui.label("Variants");
+                            let r = ui.add(egui::Slider::new(&mut d.pk_variants, 1.0..=6.0).step_by(1.0).suffix(" per platform and language"));
+                            elems.push((format!("{p}.variants"), r.rect, d.pk_variants.to_string()));
+                            ui.end_row();
+                            ui.label("Niche");
+                            let r = ui.add(egui::TextEdit::singleline(&mut d.niche).hint_text("e.g. gaming (helps the hooks and hashtags)").desired_width(330.0));
+                            elems.push((format!("{p}.niche"), r.rect, d.niche.clone()));
+                            ui.end_row();
+                            ui.label("About the video");
+                            let r = ui.add(
+                                egui::TextEdit::multiline(&mut d.notes)
+                                    .hint_text("optional: what happens in it, what it reveals (titles never promise more than this)")
+                                    .desired_rows(2)
+                                    .desired_width(380.0),
+                            );
+                            elems.push((format!("{p}.notes"), r.rect, d.notes.clone()));
+                            ui.end_row();
+                            ui.label("Written by");
+                            radio_row(ui, &mut d.writer, &WRITERS, &format!("{p}.writer"), &mut elems);
+                            ui.end_row();
+                        }
                         Kind::Download => {
                             ui.label("YouTube link");
                             let r = ui.add(egui::TextEdit::singleline(&mut d.url).hint_text("a playlist or a video link").desired_width(380.0));
@@ -3709,13 +3842,14 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         pick = Some(Pick::MusicFolder);
                     }
                     if !matches!(d.kind, Kind::Voice | Kind::Hooks) {
-                        let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download);
+                        let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package);
                         ui.label(if folder_out { "Output folder" } else { "Save as" });
                         let hint = match d.kind {
                             Kind::Script => "automatic (Movies/EI/Scripts)",
                             Kind::Topic => "automatic (Movies/EI/Topics/<topic>)",
                             Kind::Tv => "automatic (“EI on TV” next to the clips)",
                             Kind::Download => "a playlist gets a folder named after it in here",
+                            Kind::Package => "a folder “<topic> - package” in here",
                             _ => "automatic (next to the source)",
                         };
                         if path_row(ui, &mut d.out, &format!("{p}.out"), hint, &mut elems) {
@@ -3723,7 +3857,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         }
                         ui.end_row();
                     }
-                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic | Kind::Hooks) {
+                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic | Kind::Hooks | Kind::Package) {
                         ui.label("");
                         let label = match d.kind {
                             Kind::Split | Kind::Clips | Kind::Tv | Kind::Download => "Import the files into the project",
@@ -3761,6 +3895,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Hooks => "Sync Hooks",
                     Kind::Speak => "Speak",
                     Kind::Download => "Download",
+                    Kind::Package => "Make Thumbnails",
                     _ => "Run",
                 };
                 if d.queue_edit.is_some() {
@@ -3860,7 +3995,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 }
             }
             Pick::Out => {
-                if matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Download) {
+                if matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Download | Kind::Package) {
                     if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
                         if d.kind == Kind::Download {
                             let _ = save_setting("download_dir", &dir); // the default next time
@@ -4541,6 +4676,9 @@ fn poll_recorder(d: &mut Draft) {
 
 fn description(kind: Kind) -> &'static str {
     match kind {
+        Kind::Package => {
+            "Makes what gets the click: thumbnails from the best frames of your clips (a big face or the most striking moment, on topic, made to pop, with 2–4 huge words placed away from faces and the apps' badges), titles, the opening hook, the description or caption and hashtags, for YouTube and Instagram, in English and Hindi. Give your own hook or let it search online for a hot one. You get several variants of each (the first is the strongest), a preview of how they look in the feed, and .txt files to copy from."
+        }
         Kind::Download => {
             "Downloads a YouTube playlist (or one video) in the highest quality there is: the best video and the best audio, merged. Choose “Audio only” for just the sound, or “Subtitles only” for what is said, as clean English/Hindi text (the creator's own subtitles or YouTube's captions of the real speech, never a translation), optionally learned as a talking style for your scripts. A playlist gets its own folder named after it; running it again downloads only what is new (a stopped download continues), and unavailable videos are skipped and listed. For your own use: respect the creators' licences."
         }
@@ -5017,6 +5155,7 @@ fn import_finished(app: &mut FilmcraftApp) {
         };
         let one = |k: &str| result.get(k).and_then(Value::as_str).map(str::to_string);
         let paths: Vec<String> = match kind {
+            Kind::Package => Vec::new(), // (thumbnails and text files, not media for the timeline)
             Kind::Split | Kind::Clips | Kind::Audio | Kind::Speak | Kind::Download => strs("outputs"),
             _ => match one("otio") {
                 Some(o) => std::iter::once(o).chain(one("srt")).collect(),
@@ -5405,6 +5544,10 @@ mod tests {
                 json!({"url": "https://youtube.com/playlist?list=PLx", "mode": "audio", "audioFormat": "mp3", "items": "1-20", "out": "/tmp/bgm"}),
             ),
             (Kind::Download, json!({"url": "https://youtu.be/abc", "container": "mkv", "out": "/tmp/bgm"})),
+            (
+                Kind::Package,
+                json!({"clips": [vs], "topic": "GTA 6 at 30 FPS", "hookLine": "", "findHook": true, "platforms": ["youtube", "reels"], "languages": ["en", "hi"], "variants": 2}),
+            ),
             (
                 Kind::Download,
                 json!({"url": "https://youtube.com/@x", "mode": "subs", "subLangs": ["en"], "polishClaude": false, "learnStyle": "x", "out": "/tmp/s"}),

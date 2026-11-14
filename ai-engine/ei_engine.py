@@ -19,6 +19,8 @@ Subcommands (all paths absolute or relative to the current folder):
     speak     --voice N --script S --out O.wav   a script in your cloned voice (+ .narration.json); N = mac:<voice> for macOS voices
               [--sound-design --music-source internet|folder|ai|none]   also "<O> - scored.wav": music per emotion, hits, risers
     download  URL [--audio-only] [--out-dir D] [--items 1-20]   a YouTube playlist/video, highest quality (or audio only)
+    package   --clips C... --topic T [--hook H | --find-hook] [--platforms youtube shorts instagram reels] [--languages en hi]
+              thumbnails, titles, hooks and hashtags (a folder "<topic> - package")
     hooks-sync [--niches N...] [--geo IN US]   refresh the local hook library from what is hot (trends, top videos, Claude)
     hooks-list [--topic T --niche N]            the best hooks for a video (offline), or the library's state
     score     VOICE.wav --narration N.json --out O.wav   the sound design alone (or --narration X.score.json to mix an edited plan)
@@ -133,6 +135,9 @@ def run(argv: list[str]) -> dict:
     import yt_download
 
     yt_download.add_args(sub.add_parser("download", help="a YouTube playlist or video in the highest quality, or only its audio"))
+    import thumbnails
+
+    thumbnails.add_args(sub.add_parser("package", help="thumbnails, titles, hooks and hashtags for YouTube and Instagram (English, Hindi)"))
     import score
 
     score.add_args(sub.add_parser("score", help="emotional sound design under a voice: music per mood, hits, risers, pauses"))
@@ -172,6 +177,8 @@ def run(argv: list[str]) -> dict:
         return hooks.run_args(a)
     if a.cmd == "download":
         return yt_download.run_args(a)
+    if a.cmd == "package":
+        return thumbnails.run_args(a)
     if a.cmd == "voiceover":
         if getattr(a, "preset", None) == "short" and a.aspect == "horizontal":
             a.aspect = "vertical"

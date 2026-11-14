@@ -365,3 +365,34 @@ Full description: `docs/voice-and-voiceover.md`.
   takes the best unused clips from all of them, and repeats (only once every clip is shown) the
   one seen longest ago. Rerun of the user's 37 s GTA edit: 38 different clips in 38 shots.
   Test `test_long_edit_does_not_repeat_one_clip` (fails on the old search).
+
+## 2026-11-14: Thumbnails, Titles & Hashtags (AI ▸ Thumbnails, Titles & Hashtags…, `ei_engine.py package`)
+
+- From clips or images, a topic and an optional hook (or "search online": Claude with web search
+  for a hot hook and this week's hashtags): for YouTube video (1280×720), Shorts (1080×1920),
+  Instagram feed video (1080×1350) and Reels (1080×1920), in English and/or Hindi:
+  thumbnails (n variants each, the first the strongest), preview.jpg (all of them at feed size),
+  `<platform>-<language>.txt` (titles best first, thumbnail words, hooks, description or caption,
+  hashtags, YouTube tags), hashtags-youtube.txt, hashtags-instagram.txt and package.json (for posting).
+- Frames: CLIP over the cached 2 s index (topic, "eye-catching", "face with a strong emotion",
+  "intense action", against blur/dark/on-screen text/logos), the most face-like moments always in
+  the pool, then Apple Vision on ~70 candidates: faces (big ones weigh most; turned-away faces less),
+  on-screen text (subtitles, menus: nearly ruled out), sharpness, colour, exposure; near-duplicates
+  skipped.
+- Composition: landscape crops put the subject on a third with the words on the other side; a
+  vertical cover from a landscape frame is "framed" (the frame big at the bottom over a blurred,
+  darkened copy, the words large above it) so nothing is enlarged; colour/contrast, a softer darker
+  background around the subject, vignette, a shade behind the words. Words: Impact / Arial Black,
+  Kohinoor Devanagari for Hindi, drawn by libass (correct Hindi shaping; Pillow here has no raqm),
+  three styles (outline + shadow with a yellow key word, colour slabs, glow), sized to fill their
+  space, kept out of YouTube's duration badge and the Shorts/Reels caption area. Checks are written
+  to package.json and the log (words over the subject, under a badge, enlarged frame).
+- Words: Claude with the topic's most-viewed YouTube titles and the hook library; rules for a
+  curiosity gap the video closes, title + thumbnail words telling one story without repeating,
+  lengths per platform, Instagram's 5-hashtag limit, natural spoken Hindi in Devanagari, never
+  promising what the notes do not back. Cached for a day per request (re-runs for new frames are
+  ~25 s); `--fresh-words` writes new ones. Without Claude: simple rules.
+- Iterated on the user's GTA 6 trailer sections four times, looking at the results: the first set
+  picked backs, trucks and frames with burned-in subtitles and enlarged vertical crops; the final
+  one picks faces (Lucia, Jason, the bandana shot) with framed vertical covers. Samples kept in
+  ~/Movies/EI/Thumbnails (each try in its own folder).
