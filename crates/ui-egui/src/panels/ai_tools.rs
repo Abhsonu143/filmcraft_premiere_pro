@@ -245,6 +245,10 @@ struct Draft {
     // TV light sync
     tv_folder: String,
     relight: f64,
+    /// TV Light Sync, horizontal: put the video in a vertical frame, itself zoomed behind it.
+    tv_vframe: bool,
+    /// The zoomed video behind it: 0 = black, 1 = full.
+    tv_bg_opacity: f64,
     tv_bezel: bool,
     // short clips: "edited" (best moments cut together) or "sections" (one continuous part each)
     clip_type: &'static str,
@@ -440,6 +444,8 @@ impl Draft {
             hints: String::new(),
             tv_folder: setting_str("tv_recordings").unwrap_or_default(),
             relight: 1.0,
+            tv_vframe: false,
+            tv_bg_opacity: 0.35,
             tv_bezel: false,
             clip_type: "edited",
             resolution: "1080p",
@@ -581,6 +587,8 @@ impl Draft {
             d.clips.push(d.input.trim().to_string()); // one clip given as "input"
         }
         d.relight = num("relight", d.relight);
+        d.tv_vframe = flag("verticalFrame", d.tv_vframe);
+        d.tv_bg_opacity = num("backgroundOpacity", d.tv_bg_opacity).clamp(0.0, 1.0);
         d.tv_bezel = flag("bezel", d.tv_bezel);
         d.clip_type = pick("clipType", &CLIP_TYPES.map(|a| a.0), d.clip_type);
         d.sound = flag("soundDesign", d.sound);
@@ -713,6 +721,8 @@ impl Draft {
         m.insert("feedback".into(), json!(self.feedback));
         m.insert("recordings".into(), json!(self.tv_folder));
         m.insert("relight".into(), json!(self.relight));
+        m.insert("verticalFrame".into(), json!(self.tv_vframe));
+        m.insert("backgroundOpacity".into(), json!(self.tv_bg_opacity));
         m.insert("bezel".into(), json!(self.tv_bezel));
         m.insert("clipType".into(), json!(self.clip_type));
         m.insert("soundDesign".into(), json!(self.sound));
@@ -1191,6 +1201,13 @@ impl Draft {
                 push(&mut a, "--relight", &format!("{}", self.relight));
                 if self.tv_bezel {
                     push(&mut a, "--bezel", "0.012"); // thin; the bottom is twice as wide
+                }
+                if self.tv_vframe && orientation == "horizontal" {
+                    if !(0.0..=1.0).contains(&self.tv_bg_opacity) {
+                        return Err("The background opacity must be between 0% and 100%.".into());
+                    }
+                    a.push("--vertical-frame".into());
+                    push(&mut a, "--background-opacity", &format!("{:.2}", self.tv_bg_opacity));
                 }
                 push(&mut a, "--out-dir", self.out.trim());
             }
@@ -3613,6 +3630,25 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             ui.label("Final video");
                             radio_row(ui, &mut d.aspect, &TV_SHAPES, &format!("{p}.aspect"), &mut elems);
                             ui.end_row();
+                            if d.aspect != "vertical" {
+                                ui.label("");
+                                ui.vertical(|ui| {
+                                    let r = ui.checkbox(&mut d.tv_vframe, "Put it in a vertical frame (9:16): the video in the middle, the same video zoomed behind it");
+                                    elems.push((format!("{p}.verticalFrame"), r.rect, d.tv_vframe.to_string()));
+                                    ui.add_enabled_ui(d.tv_vframe, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Background");
+                                            let mut pct = d.tv_bg_opacity * 100.0;
+                                            let r = ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).step_by(5.0).suffix("% opacity"));
+                                            if r.changed() {
+                                                d.tv_bg_opacity = (pct / 100.0).clamp(0.0, 1.0);
+                                            }
+                                            elems.push((format!("{p}.backgroundOpacity"), r.rect, d.tv_bg_opacity.to_string()));
+                                        });
+                                    });
+                                });
+                                ui.end_row();
+                            }
                             ui.label("Backlight matching");
                             let r = ui.add(egui::Slider::new(&mut d.relight, 0.0..=1.0).text("recolour the glow"));
                             elems.push((format!("{p}.relight"), r.rect, d.relight.to_string()));
@@ -6043,6 +6079,17 @@ mod tests {
         let with_bezel =
             Draft::from_params(Kind::Tv, &json!({"clips": [c1.to_string_lossy()], "recordings": dir.to_string_lossy(), "bezel": true})).engine_args().unwrap();
         assert!(with_bezel.windows(2).any(|w| w == ["--bezel", "0.012"]));
+        let mut vf = Draft::from_params(
+            Kind::Tv,
+            &json!({"clips": [c1.to_string_lossy()], "recordings": dir.to_string_lossy(), "aspect": "horizontal", "verticalFrame": true, "backgroundOpacity": 0.5}),
+        );
+        let va = vf.engine_args().unwrap();
+        assert!(va.contains(&"--vertical-frame".to_string()) && va.windows(2).any(|w| w == ["--background-opacity", "0.50"]), "{va:?}");
+        let mut vert = Draft::from_params(
+            Kind::Tv,
+            &json!({"clips": [c1.to_string_lossy()], "recordings": dir.to_string_lossy(), "aspect": "vertical", "verticalFrame": true}),
+        );
+        assert!(!vert.engine_args().unwrap().contains(&"--vertical-frame".to_string()), "only for horizontal videos");
         // one clip given the old way ("input") still works
         let a = Draft::from_params(Kind::Tv, &json!({"input": c1.to_string_lossy(), "recordings": dir.to_string_lossy(), "aspect": "vertical"}))
             .engine_args()

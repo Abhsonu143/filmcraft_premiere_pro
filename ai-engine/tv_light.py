@@ -590,23 +590,59 @@ def framing_rect(Qs: np.ndarray, src_w: int, src_h: int, W: int, H: int, orienta
     return x0, y0, cw, ch
 
 
-def screen_look(clip_lin: np.ndarray, a: dict, match: float = 0.45) -> np.ndarray:
-    """The clip as a bright, clean TV picture: its mid-tones moved part of the way towards how the
-    camera saw this screen (so it belongs in the room), its own blacks and contrast kept (no grey
-    haze), and bright like a screen in a dark room."""
-    lum = clip_lin @ np.float32([0.2126, 0.7152, 0.0722])
-    c05, c50, c95 = (float(x) for x in np.percentile(lum, [5, 50, 95]))
+def screen_cast(a: dict, n: int = 6) -> np.ndarray:
+    """How this camera tints a TV picture (its white balance on the screen): per-channel gains
+    (BGR, mean 1) from what the real TV showed in the recording."""
+    import cv2
+
+    rec, Q = a["path"], np.float32(a["quads"])
+    T = len(Q) / HZ
+    means = []
+    for t in np.linspace(min(5.0, T * 0.1), max(0.0, T - 5.0), n):
+        try:
+            f = frame_at(rec, float(t), 480)
+        except AutocutError:
+            continue
+        h, w = f.shape[:2]
+        q = Q[min(len(Q) - 1, int(t * HZ))] * [w, h]
+        m = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(m, q.astype(np.int32), 255)
+        m = cv2.erode(m, np.ones((11, 11), np.uint8))
+        px = lin(f)[m > 0]
+        if len(px):
+            means.append(px.mean(axis=0))
+    if not means:
+        return np.ones(3, np.float32)
+    mu = np.mean(means, axis=0)
+    g = mu / max(1e-4, float(mu.mean()))
+    return np.clip(g, 0.85, 1.15).astype(np.float32)
+
+
+def screen_look(clip_lin: np.ndarray, a: dict, cast: np.ndarray | None = None) -> np.ndarray:
+    """The clip as this camera films a TV: its whites at the screen's whites, highlights rolled off
+    softly (no blown-out yellow), the panel's black a touch lifted by room light, the camera's white
+    balance on the screen, colour a little calmer. Real, not punchy."""
+    w = np.float32([0.0722, 0.7152, 0.2126])  # (BGR)
+    lum = clip_lin @ w
+    c95 = float(np.percentile(lum, 95))
     s_ = a["screen"]
-    mid = c50 * (1 - match) + float(s_["p50"]) * match
-    hi = c95 * (1 - match) + float(s_["p95"]) * match
-    xs = np.maximum.accumulate(np.float32([0.0, c05, c50, c95, 1.0]) + np.arange(5) * 1e-4)
-    ys = np.maximum.accumulate(np.float32([0.0, c05, mid, hi, max(hi, 1.0)]))
-    target = np.interp(lum, xs, ys)
-    out = clip_lin * (target / np.maximum(lum, 1e-4))[..., None]
-    p95 = float(np.percentile(out @ np.float32([0.2126, 0.7152, 0.0722]), 95))
-    out = out * float(np.clip(0.8 / max(p95, 1e-3), 1.0, 1.7))  # a screen is the brightest thing in the room
-    grey = (out @ np.float32([0.2126, 0.7152, 0.0722]))[..., None]
-    return np.clip(grey + (out - grey) * 1.08, 0, 1)
+    e = float(np.clip(float(s_["p95"]) * 0.95 / max(c95, 0.2), 0.85, 1.3))  # clip white -> the camera's screen white
+    x = clip_lin * e
+    x = x * 1.25 / (1.0 + 0.25 * x / 0.9)  # soft shoulder: highlights roll off like a camera's
+    x = np.clip(x, 0, 1)
+    if cast is not None:
+        x = x * (np.float32(cast) ** 0.6)[None, None, :]
+    grey = (x @ w)[..., None]
+    x = grey + (x - grey) * 0.9  # a filmed screen is a little less saturated than the signal
+    black = float(np.clip(float(s_.get("p05", 0.01)) * 0.25, 0.004, 0.015))
+    return np.clip(x * (1 - black) + black, 0, 1)
+
+
+def panel_falloff(h: int, w: int) -> np.ndarray:
+    """A real panel seen by a camera: a little darker towards its corners."""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    r = np.hypot((xx - w / 2) / (w / 2), (yy - h / 2) / (h / 2))
+    return (1.0 - 0.07 * np.clip(r - 0.35, 0, None) ** 1.5)[..., None].astype(np.float32)
 
 
 def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], out: str, W: int, H: int, fps: float = 30.0,
@@ -673,6 +709,9 @@ def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], 
     cw, ch = 1280, 720
     src_quad = np.float32([[0, 0], [cw, 0], [cw, ch], [0, ch]])
     full = np.full((ch, cw), 255, np.uint8)
+    cast = screen_cast(a)
+    falloff = panel_falloff(ch, cw)
+    log(f"screen look: this camera's white balance on the TV (B/G/R gains {', '.join(f'{x:.2f}' for x in cast)})")
     t1 = time.time()
     i = 0
     try:
@@ -717,10 +756,10 @@ def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], 
             img = lin(frame) * (1 + gain.reshape(H, W, 3))
             # the clip on the TV: bright and clean, locked to the TV
             c = np.frombuffer(buf, np.uint8).reshape(ch, cw, 3)
-            c = srgb(screen_look(lin(c), a))
+            c = srgb(screen_look(lin(c), a, cast) * falloff)
             if bezel > 0:  # the corners sit on the TV's outer edge: draw the bezel inside them
                 c = add_bezel(c, bezel)
-            c = cv2.GaussianBlur(c, (0, 0), 0.35)
+            c = cv2.GaussianBlur(c, (0, 0), 0.8)  # (the softness of a lens filming a screen)
             Mc = cv2.getPerspectiveTransform(src_quad, np.float32(quad))
             warped = cv2.warpPerspective(c, Mc, (W, H), flags=cv2.INTER_LINEAR)
             mask = cv2.warpPerspective(full, Mc, (W, H))
@@ -728,7 +767,7 @@ def render(clip: str, a: dict, path: np.ndarray, target: dict[str, np.ndarray], 
             wl = lin(warped)
             # the screen lights up what is right around it (a soft bloom), and the room falls off a little
             bloom = cv2.GaussianBlur(wl * mask, (0, 0), max(W, H) * 0.012)
-            img = img + bloom * 0.18 * (1 - mask)
+            img = img + bloom * 0.07 * (1 - mask)
             img = img * (1 - mask) + wl * mask
             outf = srgb(img)
             noise = rng.normal(0, 1.1, (H // 2, W // 2, 1)).astype(np.float32)
@@ -963,22 +1002,39 @@ def preview(path: str, out_png: str, n: int = 6) -> dict:
     return {"image": out_png, "times": times, "locked": round(locked, 3)}
 
 
+def vertical_frame(src: str, out: str, opacity: float = 0.35, resolution: str = "1080p") -> None:
+    """A horizontal video in a vertical (9:16) frame: the video full width in the middle, the same
+    video zoomed to fill the frame behind it, softly blurred, at `opacity` (0 = black, 1 = full)."""
+    W, H = ac.sized(*SIZES["vertical"], resolution)
+    o = float(np.clip(opacity, 0.0, 1.0))
+    blur = max(6, H // 90)
+    fc = (f"[0:v]split[a][b];[a]scale=-2:{H},crop={W}:{H},gblur=sigma={blur},colorchannelmixer=rr={o:.3f}:gg={o:.3f}:bb={o:.3f}[bg];"
+          f"[b]scale={W}:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]")
+    ac.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-filter_complex", fc, "-map", "[v]", "-map", "0:a?",
+            "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(W, H, 16.0), "-c:a", "copy", "-movflags", "+faststart", out])
+
+
+def out_name(clip: str, orientation: str, vframe: bool) -> str:
+    return f"{Path(clip).stem} - on TV {'horizontal in vertical' if vframe and orientation == 'horizontal' else orientation}"
+
+
 def make_batch(clips: list[str], folder: str, out_dir: str, orientation: str = "horizontal", relight: float = 1.0,
-               recording: str | None = None, bezel: float = 0.0, resolution: str = "1080p") -> dict:
+               recording: str | None = None, bezel: float = 0.0, resolution: str = "1080p", vframe: bool = False, bg_opacity: float = 0.35) -> dict:
     """Several clips one after another (the room analysis is shared, so later clips go faster).
     A clip that fails is reported and the rest carry on."""
     outd = Path(out_dir).expanduser().resolve()
     outd.mkdir(parents=True, exist_ok=True)
     done, failed = [], []
     for k, c in enumerate(clips, 1):
-        out = outd / f"{Path(c).stem} - on TV {orientation}.mp4"
+        name = out_name(c, orientation, vframe)
+        out = outd / f"{name}.mp4"
         n = 2
         while out.exists():
-            out = outd / f"{Path(c).stem} - on TV {orientation} {n}.mp4"
+            out = outd / f"{name} {n}.mp4"
             n += 1
         log(f"clip {k}/{len(clips)}: {Path(c).name}")
         try:
-            make(c, folder, str(out), orientation, relight, recording=recording, bezel=bezel, resolution=resolution)
+            make(c, folder, str(out), orientation, relight, recording=recording, bezel=bezel, resolution=resolution, vframe=vframe, bg_opacity=bg_opacity)
             done.append(str(out))
         except AutocutError as e:
             log(f"{Path(c).name} failed: {e}")
@@ -990,7 +1046,7 @@ def make_batch(clips: list[str], folder: str, out_dir: str, orientation: str = "
 
 
 def make(clip: str, folder: str, out: str, orientation: str = "horizontal", relight: float = 1.0, fps: float = 30.0,
-         recording: str | None = None, bezel: float = 0.0, resolution: str = "1080p") -> dict:
+         recording: str | None = None, bezel: float = 0.0, resolution: str = "1080p", vframe: bool = False, bg_opacity: float = 0.35) -> dict:
     """Clip on the TV of the best-matching recording of that orientation, backlight matched."""
     ac.require_tools()
     if orientation not in SIZES:
@@ -1025,9 +1081,19 @@ def make(clip: str, folder: str, out: str, orientation: str = "horizontal", reli
     outp.parent.mkdir(parents=True, exist_ok=True)
     part = outp.with_name(outp.stem + ".part.mp4")
     stats = render(clip, a, path, tgt, str(part), W, H, fps, relight, bezel, orientation)
-    part.replace(outp)
+    if vframe and orientation == "horizontal":  # the horizontal video in a vertical frame, itself zoomed behind it
+        framed = outp.with_name(outp.stem + ".framed.part.mp4")
+        try:
+            vertical_frame(str(part), str(framed), bg_opacity, resolution)
+            framed.replace(outp)
+        finally:
+            part.unlink(missing_ok=True)
+            framed.unlink(missing_ok=True)
+        log(f"in a vertical frame, background at {round(bg_opacity * 100)}%")
+    else:
+        part.replace(outp)
     plan = {"version": 1, "clip": str(Path(clip).resolve()), "recording": r["path"], "orientation": orientation, "match": round(cost, 3),
-            "path": path.tolist(), "relight": relight, **stats}
+            "path": path.tolist(), "relight": relight, "vertical_frame": bool(vframe and orientation == "horizontal"), "background_opacity": bg_opacity, **stats}
     outp.with_suffix(".tvlight.json").write_text(json.dumps(plan))
     log(f"done in {time.time() - t0:.0f}s using {Path(r['path']).name}")
     return {"outputs": [str(outp)], "out_dir": str(outp.parent), "recording": r["path"], "match": round(cost, 3)}
@@ -1061,6 +1127,8 @@ def add_args(sub) -> None:
     p.add_argument("--bezel", type=float, default=0.0,
                    help="draw a thin TV bezel around the clip (fraction of its width; 0.012 is thin; the bottom is twice as wide). "
                         "Use it when the corners are placed on the TV's outer edge")
+    p.add_argument("--vertical-frame", action="store_true", help="horizontal recordings: put the video in a vertical (9:16) frame, itself zoomed behind it")
+    p.add_argument("--background-opacity", type=float, default=0.35, help="the zoomed video behind it: 0 = black, 1 = full")
     _ = argparse
 
 
@@ -1091,9 +1159,15 @@ def run_args(a) -> dict:
         if not clips:
             raise AutocutError("none of the clips were found")
         if len(clips) == 1 and a.out and not a.out_dir:
-            return make(clips[0], a.recordings, a.out, a.orientation, a.relight, recording=a.recording, bezel=a.bezel, resolution=a.resolution)
+            return make(clips[0], a.recordings, a.out, a.orientation, a.relight, recording=a.recording, bezel=a.bezel, resolution=a.resolution,
+                        vframe=a.vertical_frame, bg_opacity=a.background_opacity)
         out_dir = a.out_dir or (str(Path(a.out).parent) if a.out else str(Path(clips[0]).parent / "EI on TV"))
-        res = make_batch(clips, a.recordings, out_dir, a.orientation, a.relight, recording=a.recording, bezel=a.bezel, resolution=a.resolution)
+        if a.vertical_frame and a.orientation != "horizontal":
+            log("a vertical frame is for horizontal recordings: ignored")
+        if not 0.0 <= a.background_opacity <= 1.0:
+            raise AutocutError("background opacity must be between 0 and 1")
+        res = make_batch(clips, a.recordings, out_dir, a.orientation, a.relight, recording=a.recording, bezel=a.bezel, resolution=a.resolution,
+                         vframe=a.vertical_frame, bg_opacity=a.background_opacity)
         res["failed"] = missing + res.get("failed", [])
         return res
     raise AutocutError(f"unknown command {a.cmd}")

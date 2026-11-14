@@ -263,6 +263,15 @@ fn ai_menu_and_dialogs() {
         ),
         ("audio", &["clips.add", "clips.addFolder", "format", "quality", "start", "end", "mono", "normalize", "out", "run"]),
     ];
+    // TV Light Sync, horizontal: the vertical frame and its background opacity
+    d.run("ai.tv", json!({}));
+    d.frames(3);
+    d.ok("ui.click", json!({"id": "ai.tv.aspect.horizontal"}));
+    d.frames(3);
+    let ids = d.ids("ai.tv.");
+    assert!(ids.iter().any(|i| i == "ai.tv.verticalFrame") && ids.iter().any(|i| i == "ai.tv.backgroundOpacity"), "{ids:?}");
+    d.ok("ui.click", json!({"id": "ai.tv.cancel"}));
+    d.frames(2);
     for (kind, fields) in expect {
         let r = d.run(&format!("ai.{kind}"), json!({}));
         assert_eq!(r["dialog"], json!(format!("ai.{kind}")));

@@ -80,10 +80,18 @@ The best recording of the chosen shape is picked automatically (lowest light dif
   fill about 95% of the width with its centre half way down (the lit wall above it, less of the dark
   floor), horizontal ones about 68%. The TV is never cut: when it is at the edge of the recording,
   the framing stops there. The crop also hides the edges the stabilisation moves.
-- **Screen.** The clip keeps its own blacks and contrast; only its mid-tones move part of the way to
-  how the camera saw this screen, then it is made as bright as a screen in a dark room, with a soft
-  bloom onto what is around the TV. Softening is minimal, and grain (fresh every frame) is only on the
-  screen; the room keeps the camera's own noise (the old repeating grain made the picture shimmer).
+- **Screen: filmed, not pasted.** The clip looks the way this camera films a TV: its whites at the
+  screen's recorded whites, highlights rolled off softly (never blown out), the panel's black lifted
+  only a touch by room light, the camera's own white balance on the screen (measured from what the real
+  TV showed in the recording; these recordings film screens a little cool), colour slightly calmer, the
+  softness of a lens filming a screen, a panel a little darker towards its corners, and a faint glow
+  onto what is around the TV. Grain (fresh every frame) is only on the screen; the room keeps the
+  camera's own noise (the old repeating grain made the picture shimmer).
+- **Horizontal in a vertical frame** (tick "Put it in a vertical frame", horizontal videos): the
+  finished horizontal video sits full width in the middle of a 9:16 frame, the same video zoomed to
+  fill the frame behind it, softly blurred, at the background opacity you choose (0% black … 100%
+  full; 35% by default). Engine: `--vertical-frame --background-opacity 0.35`. Saved as
+  "<clip> - on TV horizontal in vertical.mp4".
 
 ## Measured (M3 8 GB)
 

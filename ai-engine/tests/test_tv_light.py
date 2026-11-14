@@ -83,7 +83,8 @@ def test_good_quad_rejects_triangles():
 def test_batch_keeps_going_and_names_outputs(tmp_path, monkeypatch):
     made = []
 
-    def fake_make(clip, folder, out, orientation="horizontal", relight=1.0, fps=30.0, recording=None, bezel=0.0, resolution="1080p"):
+    def fake_make(clip, folder, out, orientation="horizontal", relight=1.0, fps=30.0, recording=None, bezel=0.0, resolution="1080p",
+                  vframe=False, bg_opacity=0.35):
         if "bad" in clip:
             raise tl.AutocutError("cannot read")
         made.append(out)
@@ -106,3 +107,11 @@ def test_bezel_thin_sides_wider_bottom():
     assert out[360, 2].max() < 40 and out[360, 1280 - 3].max() < 40 and out[3, 640].max() < 40  # dark sides and top
     assert out[720 - b - 3, 640].max() < 40  # the bottom bezel is wider than the sides
     assert out[720 - 2 * b - 4, 640].min() > 150 and out[b + 3, b + 3].min() > 150  # the picture inside
+
+
+def test_vertical_frame_names():
+    import tv_light as tl
+
+    assert tl.out_name("/x/clip.mp4", "horizontal", True) == "clip - on TV horizontal in vertical"
+    assert tl.out_name("/x/clip.mp4", "vertical", True) == "clip - on TV vertical"
+    assert tl.out_name("/x/clip.mp4", "horizontal", False) == "clip - on TV horizontal"

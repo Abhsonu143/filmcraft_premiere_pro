@@ -500,3 +500,8 @@ Full description: `docs/voice-and-voiceover.md`.
   540 px; TV movement per frame 0.16 -> 0.04 ‰; flicker 1.04 -> 1.16 levels (the raw recording:
   1.31); TV 74% -> 94% of the width; dark bottom ~45% -> ~30%. Render ~140 s for 20 s (was ~135 s).
   Tests: tests/test_tv_framing.py.
+- Follow-up (same day): the bright screen felt wrong ("should be soothing and feel real"). The screen
+  now copies how this camera films a TV: measured white balance on the real screen (GX011573: B/G/R
+  1.14/1.02/0.85), whites at the camera's screen white, soft highlight shoulder, slight panel black,
+  saturation 0.9, lens softness 0.8 px, panel falloff, bloom 0.07. New: horizontal in a vertical
+  frame with an adjustable background opacity (dialog ▸ tick + slider).

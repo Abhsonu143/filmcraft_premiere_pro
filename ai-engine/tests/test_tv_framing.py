@@ -33,12 +33,14 @@ def test_stretches_of_the_recording():
     assert [round(t, 2) for t, _ in segs] == [0.0, 1.0, 0.5] and [n for _, n in segs] == [9, 6, 3]
 
 
-def test_the_screen_is_bright_and_keeps_its_blacks():
-    a = {"screen": {"p05": 0.05, "p50": 0.12, "p95": 0.3}}  # the camera saw a dim, flat screen
+def test_the_screen_looks_filmed_not_punchy():
+    a = {"screen": {"p05": 0.01, "p50": 0.36, "p95": 0.88}}
     clip = np.zeros((90, 160, 3), np.float32)
-    clip[:, :80] = 0.01
-    clip[:, 80:] = 0.6
-    out = tv.screen_look(clip, a)
-    lum = out @ np.float32([0.2126, 0.7152, 0.0722])
-    assert np.percentile(lum, 95) > 0.7  # bright, like a screen in a dark room
-    assert np.percentile(lum, 5) < 0.04  # dark parts stay dark (no grey haze)
+    clip[:, :80] = 0.005
+    clip[:, 80:] = 1.0  # a blown-out white
+    out = tv.screen_look(clip, a, np.float32([1.12, 1.0, 0.88]))
+    lum = out @ np.float32([0.0722, 0.7152, 0.2126])
+    assert 0.5 < np.percentile(lum, 95) < 0.9  # the camera's screen white (0.88), not blown out
+    assert np.percentile(lum, 5) < 0.02  # dark stays dark
+    white = out[0, 120]
+    assert white[0] > white[2]  # the camera's cool white balance on the screen
