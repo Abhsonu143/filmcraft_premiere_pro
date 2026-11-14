@@ -117,6 +117,7 @@ fn ai_menu_and_dialogs() {
         "ai.hooks",
         "ai.download",
         "ai.package",
+        "ai.social",
         "ai.jobs",
         "ai.setup",
     ] {
@@ -539,4 +540,49 @@ fn tv_light_corner_check() {
     d.frames(3);
     d.snapshot("tv-saved");
     assert!(d.harness.query_by_label_contains("corners checked").is_some());
+}
+
+#[test]
+fn social_posting_window() {
+    let mut d = Driver::demo();
+    let pkg = std::env::var("EI_TEST_PACKAGE").unwrap_or_default();
+    d.run("ai.social", json!({"video": "/tmp/none.mp4", "package": pkg, "targets": ["youtube", "reels", "threads"], "tab": "post"}));
+    d.frames(4);
+    let ids = d.ids("ai.social.");
+    for want in [
+        "ai.social.tab.posts",
+        "ai.social.tab.accounts",
+        "ai.social.video",
+        "ai.social.package",
+        "ai.social.when",
+        "ai.social.post",
+        "ai.social.dryRun",
+        "ai.social.target.fbreels",
+        "ai.social.youtube.title",
+        "ai.social.reels.text",
+        "ai.social.threads.text",
+    ] {
+        assert!(ids.iter().any(|i| i == want), "{want} in {ids:?}");
+    }
+    if !pkg.is_empty() {
+        d.ok("ui.click", json!({"id": "ai.social.fill"}));
+        let end = Instant::now() + Duration::from_secs(60);
+        while !d.run("ai.social", json!({}))["message"].as_str().unwrap_or_default().contains("filled") {
+            assert!(Instant::now() < end, "words not filled");
+            d.frames(2);
+        }
+        d.snapshot("social");
+    }
+    // posting without a real video is refused in the window, nothing is started
+    d.ok("ui.click", json!({"id": "ai.social.post"}));
+    d.frames(2);
+    assert!(d.run("ai.social", json!({}))["message"].as_str().unwrap_or_default().contains("video"));
+    for tab in ["posts", "accounts"] {
+        d.ok("ui.click", json!({"id": format!("ai.social.tab.{tab}")}));
+        d.frames(6);
+        d.snapshot(&format!("social-{tab}"));
+    }
+    d.ok("ui.click", json!({"id": "ai.social.tab.post"}));
+    d.frames(2);
+    d.ok("ui.click", json!({"id": "ai.social.close"}));
 }

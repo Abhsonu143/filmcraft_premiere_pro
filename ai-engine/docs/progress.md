@@ -396,3 +396,27 @@ Full description: `docs/voice-and-voiceover.md`.
   picked backs, trucks and frames with burned-in subtitles and enlarged vertical crops; the final
   one picks faces (Lucia, Jason, the bandana shot) with framed vertical covers. Samples kept in
   ~/Movies/EI/Thumbnails (each try in its own folder).
+
+## 2026-11-14: Social Posting (AI ▸ Social Posting…, `ei_engine.py social …`) — built, not yet in the installed app
+
+- Post a video to YouTube (video or Short), Instagram (Reel, shown in the feed), a Facebook Page
+  (video or Reel) and Threads (text with the first video's link), one or several at once, now or at a
+  set time, with each platform's words filled in from a Thumbnails, Titles & Hashtags package and
+  editable per platform. Logins in the macOS Keychain; posts and per-platform results in
+  Application Support/EI/social/posts.json; the window's Posts tab shows them with links, Retry
+  Failed and Cancel. Setup steps and limits: docs/social.md.
+- YouTube: OAuth loopback + PKCE with the user's Desktop client JSON, resumable upload in 8 MB
+  chunks with retries, thumbnails.set, publishAt for a set time. Instagram: Facebook Login for
+  Business user token (60 days, renewed while valid), resumable upload to rupload.facebook.com,
+  container status polling, media_publish. Facebook: chunked /videos upload with thumb and
+  scheduled_publish_time; Reels via /video_reels + rupload. Threads: TEXT container + publish.
+- A set time: YouTube and Facebook parts are sent at once and published by the platform; Instagram
+  and Threads wait in posts.json and the app starts `social run-due` when they are due (checked every
+  minute, EI must be open).
+- Verified facts behind the design: unaudited YouTube API projects (after 28 Jul 2020) upload as
+  private only; Instagram resumable upload from a local file needs Facebook Login for Business;
+  Threads media must be at public URLs; Instagram allows 5 hashtags per post since Dec 2025.
+- Tested offline only (no real account was used): tests/test_social.py drives every platform's
+  protocol against a stand-in (order, Threads gets the video link, failures kept and retried alone,
+  scheduling sends YouTube/Facebook ahead and the rest when due); the window has a UI test
+  (social_posting_window) that fills the words from a real package and checks the tabs.

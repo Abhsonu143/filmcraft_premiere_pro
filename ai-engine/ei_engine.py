@@ -21,6 +21,8 @@ Subcommands (all paths absolute or relative to the current folder):
     download  URL [--audio-only] [--out-dir D] [--items 1-20]   a YouTube playlist/video, highest quality (or audio only)
     package   --clips C... --topic T [--hook H | --find-hook] [--platforms youtube shorts instagram reels] [--languages en hi]
               thumbnails, titles, hooks and hashtags (a folder "<topic> - package")
+    social    accounts | connect youtube|meta|threads … | post --video V --targets … [--package P] [--at T] | run-due | list
+              post to YouTube, Instagram, Facebook and Threads (see social.py)
     hooks-sync [--niches N...] [--geo IN US]   refresh the local hook library from what is hot (trends, top videos, Claude)
     hooks-list [--topic T --niche N]            the best hooks for a video (offline), or the library's state
     score     VOICE.wav --narration N.json --out O.wav   the sound design alone (or --narration X.score.json to mix an edited plan)
@@ -102,6 +104,10 @@ def otio_for(plan_path: Path) -> dict:
 
 
 def run(argv: list[str]) -> dict:
+    if argv[:1] == ["social"]:  # (its own commands: accounts, connect, post, run-due, …)
+        import social
+
+        return social.handle(argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("doctor")

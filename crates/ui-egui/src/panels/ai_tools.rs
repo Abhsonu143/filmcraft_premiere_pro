@@ -51,6 +51,8 @@ use serde_json::{Value, json};
 
 use crate::FilmcraftApp;
 
+mod social;
+
 /// Most log lines kept per job (older ones are dropped).
 const MAX_LOG: usize = 400;
 /// A running job whose progress has not moved for this long may be stuck (seconds).
@@ -2799,6 +2801,9 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
     if !id.starts_with("ai.") {
         return None;
     }
+    if let Some(r) = social::route(id, ctx, params) {
+        return Some(r);
+    }
     let has_params = params.as_object().is_some_and(|m| !m.is_empty());
     let r = match id {
         "ai.jobs" => {
@@ -2929,6 +2934,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     show_draft(app, ctx);
     show_jobs(app, ctx);
     show_health(app, ctx);
+    social::show(app, ctx);
     show_setup(app, ctx);
     import_finished(app);
     if jobs().lock().unwrap_or_else(PoisonError::into_inner).iter().any(|j| j.status == Status::Running) {
