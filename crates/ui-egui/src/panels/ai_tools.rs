@@ -251,7 +251,10 @@ struct Draft {
     queue_edit: Option<u64>,
     // download from YouTube
     url: String,
-    audio_only: bool,
+    /// "video", "audio" (audio only) or "subs" (subtitles only)
+    dl_mode: &'static str,
+    subs_claude: bool,
+    learn_style_name: String,
     dl_format: &'static str,
     container: &'static str,
     items: String,
@@ -424,7 +427,9 @@ impl Draft {
             find_hook: false,
             queue_edit: None,
             url: String::new(),
-            audio_only: false,
+            dl_mode: "video",
+            subs_claude: true,
+            learn_style_name: String::new(),
             dl_format: "original",
             container: "mp4",
             items: String::new(),
@@ -548,7 +553,18 @@ impl Draft {
         if let Some(v) = s("url") {
             d.url = v;
         }
-        d.audio_only = flag("audioOnly", d.audio_only);
+        if flag("audioOnly", false) {
+            d.dl_mode = "audio"; // (the older way to ask for audio only)
+        }
+        d.dl_mode = pick("mode", &DL_MODES.map(|a| a.0), d.dl_mode);
+        if let Some(l) = p.get("subLangs").and_then(Value::as_array) {
+            d.lang_en = l.iter().any(|v| v.as_str() == Some("en"));
+            d.lang_hi = l.iter().any(|v| v.as_str() == Some("hi"));
+        }
+        d.subs_claude = flag("polishClaude", d.subs_claude);
+        if let Some(v) = s("learnStyle") {
+            d.learn_style_name = v;
+        }
         d.dl_format = pick("audioFormat", &DL_FORMATS.map(|a| a.0), d.dl_format);
         d.container = pick("container", &CONTAINERS.map(|a| a.0), d.container);
         if let Some(v) = s("items") {
@@ -665,7 +681,10 @@ impl Draft {
         }
         p["languages"] = json!(langs);
         p["url"] = json!(self.url);
-        p["audioOnly"] = json!(self.audio_only);
+        p["mode"] = json!(self.dl_mode);
+        p["subLangs"] = json!([(self.lang_en, "en"), (self.lang_hi, "hi")].iter().filter(|x| x.0).map(|x| x.1).collect::<Vec<_>>());
+        p["polishClaude"] = json!(self.subs_claude);
+        p["learnStyle"] = json!(self.learn_style_name);
         p["audioFormat"] = json!(self.dl_format);
         p["container"] = json!(self.container);
         p["items"] = json!(self.items);
@@ -989,11 +1008,28 @@ impl Draft {
                 }
                 a = vec!["download".into(), url.into()];
                 push(&mut a, "--out-dir", self.out.trim());
-                if self.audio_only {
-                    a.push("--audio-only".into());
-                    push(&mut a, "--audio-format", self.dl_format);
-                } else {
-                    push(&mut a, "--container", self.container);
+                match self.dl_mode {
+                    "audio" => {
+                        a.push("--audio-only".into());
+                        push(&mut a, "--audio-format", self.dl_format);
+                    }
+                    "subs" => {
+                        if !self.lang_en && !self.lang_hi {
+                            return Err("Choose at least one subtitle language.".into());
+                        }
+                        a.push("--subs".into());
+                        a.push("--sub-langs".into());
+                        for (on, c) in [(self.lang_en, "en"), (self.lang_hi, "hi")] {
+                            if on {
+                                a.push(c.into());
+                            }
+                        }
+                        push(&mut a, "--polish", if self.subs_claude { "claude" } else { "rules" });
+                        if !self.learn_style_name.trim().is_empty() {
+                            push(&mut a, "--learn-style", self.learn_style_name.trim());
+                        }
+                    }
+                    _ => push(&mut a, "--container", self.container),
                 }
                 if !items.is_empty() {
                     push(&mut a, "--items", &items.replace(' ', ""));
@@ -1111,6 +1147,8 @@ const EFFECTS: [(&str, &str); 3] =
     [("full", "Full: speed ramps, punch-ins, flashes, transitions"), ("subtle", "Subtle: slow motion, push-ins, dissolves"), ("none", "Clean cuts only")];
 const ORDERS: [(&str, &str); 2] = [("time", "Follow the trip (shooting order)"), ("free", "Best shots first")];
 
+const DL_MODES: [(&str, &str); 3] =
+    [("video", "Video (highest quality)"), ("audio", "Audio only"), ("subs", "Subtitles only (English / Hindi, cleaned into text)")];
 const DL_FORMATS: [(&str, &str); 6] = [
     ("original", "Original: the best stream as it is (no quality lost)"),
     ("mp3", "MP3 (320 kb/s, plays everywhere)"),
@@ -2345,7 +2383,16 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
         Kind::Topic => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Speak => format!("{}: {}", d.kind.title(), file_stem(&d.out)),
         Kind::Hooks => format!("{}: sync {}", d.kind.title(), d.hook_niches.trim().chars().take(40).collect::<String>()),
-        Kind::Download => format!("{}: {}{}", d.kind.title(), if d.audio_only { "audio of " } else { "" }, d.url.trim().chars().take(60).collect::<String>()),
+        Kind::Download => format!(
+            "{}: {}{}",
+            d.kind.title(),
+            match d.dl_mode {
+                "audio" => "audio of ",
+                "subs" => "subtitles of ",
+                _ => "",
+            },
+            d.url.trim().chars().take(60).collect::<String>()
+        ),
         Kind::Tv => match d.clips.len() {
             1 => format!("{}: {}", d.kind.title(), d.clips.first().map(|c| file_stem(c)).unwrap_or_default()),
             n => format!("{}: {n} clips", d.kind.title()),
@@ -3276,18 +3323,50 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             let r = ui.add(egui::TextEdit::singleline(&mut d.url).hint_text("a playlist or a video link").desired_width(380.0));
                             elems.push((format!("{p}.url"), r.rect, d.url.clone()));
                             ui.end_row();
-                            ui.label("");
-                            let r = ui.checkbox(&mut d.audio_only, "Audio only");
-                            elems.push((format!("{p}.audioOnly"), r.rect, d.audio_only.to_string()));
+                            ui.label("Download");
+                            radio_row(ui, &mut d.dl_mode, &DL_MODES, &format!("{p}.mode"), &mut elems);
                             ui.end_row();
-                            if d.audio_only {
-                                ui.label("Audio format");
-                                combo_row(ui, &mut d.dl_format, &DL_FORMATS, &format!("{p}.audioFormat"), &mut elems);
-                            } else {
-                                ui.label("Video file");
-                                combo_row(ui, &mut d.container, &CONTAINERS, &format!("{p}.container"), &mut elems);
+                            match d.dl_mode {
+                                "audio" => {
+                                    ui.label("Audio format");
+                                    combo_row(ui, &mut d.dl_format, &DL_FORMATS, &format!("{p}.audioFormat"), &mut elems);
+                                    ui.end_row();
+                                }
+                                "subs" => {
+                                    ui.label("Languages");
+                                    ui.horizontal(|ui| {
+                                        let r = ui.checkbox(&mut d.lang_en, "English");
+                                        elems.push((format!("{p}.subs.en"), r.rect, d.lang_en.to_string()));
+                                        let r = ui.checkbox(&mut d.lang_hi, "Hindi");
+                                        elems.push((format!("{p}.subs.hi"), r.rect, d.lang_hi.to_string()));
+                                    });
+                                    ui.end_row();
+                                    ui.label("");
+                                    let r = ui.checkbox(&mut d.subs_claude, "Clean YouTube's automatic captions with Claude (punctuation, misheard words)");
+                                    elems.push((format!("{p}.polishClaude"), r.rect, d.subs_claude.to_string()));
+                                    ui.end_row();
+                                    ui.label("Learn a style");
+                                    ui.vertical(|ui| {
+                                        let r = ui.add(
+                                            egui::TextEdit::singleline(&mut d.learn_style_name)
+                                                .hint_text("a name, e.g. “tech explainer” (optional)")
+                                                .desired_width(300.0),
+                                        );
+                                        elems.push((format!("{p}.learnStyle"), r.rect, d.learn_style_name.clone()));
+                                        ui.label(
+                                            egui::RichText::new("Learns how they talk (words, phrases, sentence length, openings) for Write Voiceover Script and Video from Topic ▸ Style. Several videos teach it better than one.")
+                                                .small()
+                                                .weak(),
+                                        );
+                                    });
+                                    ui.end_row();
+                                }
+                                _ => {
+                                    ui.label("Video file");
+                                    combo_row(ui, &mut d.container, &CONTAINERS, &format!("{p}.container"), &mut elems);
+                                    ui.end_row();
+                                }
                             }
-                            ui.end_row();
                             ui.label("Items (optional)");
                             let r = ui.add(egui::TextEdit::singleline(&mut d.items).hint_text("all; or e.g. 1-20, 1,4,9").desired_width(200.0));
                             elems.push((format!("{p}.items"), r.rect, d.items.clone()));
@@ -4186,7 +4265,7 @@ fn poll_recorder(d: &mut Draft) {
 fn description(kind: Kind) -> &'static str {
     match kind {
         Kind::Download => {
-            "Downloads a YouTube playlist (or one video) in the highest quality there is: the best video and the best audio, merged. Tick “Audio only” for just the sound. A playlist gets its own folder named after it; running it again downloads only what is new (a stopped download continues), and unavailable videos are skipped and listed. For your own use: respect the creators' licences."
+            "Downloads a YouTube playlist (or one video) in the highest quality there is: the best video and the best audio, merged. Choose “Audio only” for just the sound, or “Subtitles only” for what is said, as clean English/Hindi text (the creator's own subtitles or YouTube's captions of the real speech, never a translation), optionally learned as a talking style for your scripts. A playlist gets its own folder named after it; running it again downloads only what is new (a stopped download continues), and unavailable videos are skipped and listed. For your own use: respect the creators' licences."
         }
         Kind::Hooks => {
             "Your hook library: proven opening lines (the first 3 seconds that keep viewers watching), kept on this Mac so the script writer, Video from Topic and the voiceover edit can use them offline. Sync fetches what is hot now (Google Trends for your countries, this week's most-viewed YouTube videos in your niches), and Claude (with web search) turns it into new hooks in English, Hindi and Hinglish."
@@ -4924,7 +5003,7 @@ mod tests {
     fn download_arguments() {
         let a = Draft::from_params(
             Kind::Download,
-            &json!({"url": " https://youtube.com/playlist?list=PLx ", "audioOnly": true, "items": "1 - 5", "out": "/tmp/bgm"}),
+            &json!({"url": " https://youtube.com/playlist?list=PLx ", "mode": "audio", "items": "1 - 5", "out": "/tmp/bgm"}),
         )
         .engine_args()
         .unwrap();
@@ -4935,7 +5014,22 @@ mod tests {
         assert!(a.contains(&"--audio-only".to_string()) && !a.contains(&"--container".to_string()));
         let v = Draft::from_params(Kind::Download, &json!({"url": "https://youtu.be/abc", "out": "/tmp/x"})).engine_args().unwrap();
         assert!(v.windows(2).any(|w| w == ["--container", "mp4"]) && !v.contains(&"--audio-only".to_string()), "{v:?}");
-        for bad in [json!({"url": "https://vimeo.com/1"}), json!({"url": "not a link"}), json!({"url": "https://youtu.be/a", "items": "1;rm"})] {
+        let s = Draft::from_params(
+            Kind::Download,
+            &json!({"url": "https://www.youtube.com/@creator/videos", "mode": "subs", "subLangs": ["hi"], "learnStyle": "my style", "out": "/tmp/x"}),
+        )
+        .engine_args()
+        .unwrap();
+        assert!(s.windows(3).any(|w| w == ["--subs", "--sub-langs", "hi"]) && s.windows(2).any(|w| w == ["--learn-style", "my style"]), "{s:?}");
+        assert!(s.windows(2).any(|w| w == ["--polish", "claude"]) && !s.contains(&"--container".to_string()), "{s:?}");
+        let old = Draft::from_params(Kind::Download, &json!({"url": "https://youtu.be/a", "audioOnly": true, "out": "/tmp/x"})).engine_args().unwrap();
+        assert!(old.contains(&"--audio-only".to_string()), "older audioOnly still works");
+        for bad in [
+            json!({"url": "https://vimeo.com/1"}),
+            json!({"url": "not a link"}),
+            json!({"url": "https://youtu.be/a", "items": "1;rm"}),
+            json!({"url": "https://youtu.be/a", "mode": "subs", "subLangs": []}),
+        ] {
             assert!(Draft::from_params(Kind::Download, &bad).engine_args().is_err(), "{bad}");
         }
     }
@@ -4993,9 +5087,13 @@ mod tests {
             (Kind::Hooks, json!({"niches": "gaming, travel", "countries": "IN", "hookClaude": false})),
             (
                 Kind::Download,
-                json!({"url": "https://youtube.com/playlist?list=PLx", "audioOnly": true, "audioFormat": "mp3", "items": "1-20", "out": "/tmp/bgm"}),
+                json!({"url": "https://youtube.com/playlist?list=PLx", "mode": "audio", "audioFormat": "mp3", "items": "1-20", "out": "/tmp/bgm"}),
             ),
             (Kind::Download, json!({"url": "https://youtu.be/abc", "container": "mkv", "out": "/tmp/bgm"})),
+            (
+                Kind::Download,
+                json!({"url": "https://youtube.com/@x", "mode": "subs", "subLangs": ["en"], "polishClaude": false, "learnStyle": "x", "out": "/tmp/s"}),
+            ),
         ];
         for (kind, params) in cases {
             let mut a = Draft::from_params(kind, &params);

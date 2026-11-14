@@ -215,7 +215,12 @@ def split_sentences(text: str) -> list[str]:
 
 
 def words_of(text: str) -> list[str]:
-    return re.findall(r"[\wऀ-ॿ']+", text)
+    # Devanagari letters and digits, not the danda (।, ॥) that ends a Hindi sentence
+    return re.findall(r"[\w\u0900-\u0963\u0966-\u097F']+", text)
+
+
+COMMON_WORDS = set("""about after again also because been before being both could does doing down each even ever every from going gonna have here into just know like look made make many more most much need only other over really right same should some still such sure take than that their them then there these they thing things think this those through time very want wanna well were what when where which while will with would your yeah okay also because yes nahi nahin hai hain tha thi the kya aur bhi yeh woh kuch abhi bahut
+हम आप मैं मेरा मेरी तुम उस इस जो जब तब कर करना करते करने किया होता होती होते रहा रही रहे गया गई गए था थी थे नहीं क्या कुछ अब बहुत सब लिए साथ तरह वाला वाली वाले बात""".split())
 
 
 def analyse_style(sources: list[dict]) -> dict:
@@ -248,6 +253,15 @@ def analyse_style(sources: list[dict]) -> dict:
                 continue
             grams[" ".join(g)] += 1
     signature = [g for g, c in grams.most_common(40) if c >= max(2, len(sources))][:15]
+    # the words they reach for: frequent content words, used in more than one video
+    common = stop | COMMON_WORDS
+    in_sources = Counter()
+    for t in texts:
+        for w in {x.lower() for x in words_of(t)}:
+            in_sources[w] += 1
+    counts = Counter(w for w in low if w not in common and (len(w) >= 4 if re.fullmatch(r"[a-z']+", w) else len(w) >= 3) and not w.isdigit())
+    need = 2 if len(sources) >= 3 else 1
+    vocabulary = [w for w, c in counts.most_common(200) if in_sources[w] >= need and c >= 3][:30]
     openers = [" ".join(words_of(t)[:40]) for t in texts[:6]]
     closers = [" ".join(words_of(t)[-40:]) for t in texts[:6]]
     examples = []
@@ -274,6 +288,7 @@ def analyse_style(sources: list[dict]) -> dict:
         "exclamation_rate": round(sum(1 for s in sents if s.rstrip().endswith("!")) / max(1, len(sents)), 3),
         "fillers": [f for f, _ in fillers.most_common(8)],
         "signature_phrases": signature,
+        "vocabulary": vocabulary,
         "openers": openers,
         "closers": closers,
         "examples": examples,
@@ -350,6 +365,7 @@ def build_prompt(topic: str, *, niche: str, seconds: float, language: str, tone:
             f"- Questions in {round(100 * style.get('question_rate', 0))}% of sentences, exclamations in {round(100 * style.get('exclamation_rate', 0))}%.\n"
             + (f"- English words make up {round(100 * style['english_word_share_in_hindi'])}% of their Hindi speech.\n" if style.get("english_word_share_in_hindi") else "")
             + (f"- Words and phrases they use: {', '.join(style.get('signature_phrases', [])[:12])}.\n" if style.get("signature_phrases") else "")
+            + (f"- Words they reach for again and again (prefer these where they fit): {', '.join(style.get('vocabulary', [])[:24])}.\n" if style.get("vocabulary") else "")
             + (f"- Typical fillers (use sparingly, only where natural): {', '.join(style.get('fillers', [])[:6])}.\n" if style.get("fillers") else "")
             + "- How their videos open:\n" + "\n".join(f"  > {o}" for o in style.get("openers", [])[:3])
             + "\n- Real passages of their speech (copy the voice, rhythm and attitude; never the content):\n"

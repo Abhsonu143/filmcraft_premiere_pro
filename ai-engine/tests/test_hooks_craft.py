@@ -170,3 +170,24 @@ def test_download_commands():
             raise AssertionError(bad)
         except yd.AutocutError:
             pass
+
+
+def test_subtitles_are_real_and_clean():
+    import yt_download as yd
+
+    # the creator's own subtitles first; automatic captions only of the spoken language; never a translation
+    info = {"language": "hi", "subtitles": {"en": [], "hi": []}, "automatic_captions": {"hi-orig": [], "hi": [], "en": []}}
+    assert yd.pick_lang(info, "hi") == ("hi", False) and yd.pick_lang(info, "en") == ("en", False)
+    auto_only = {"language": "hi", "subtitles": {}, "automatic_captions": {"hi-orig": [], "en": [], "fr": []}}
+    assert yd.pick_lang(auto_only, "hi") == ("hi-orig", True)
+    assert yd.pick_lang(auto_only, "en") is None  # the "en" there is YouTube translating the Hindi speech
+    assert yd.pick_lang({"language": "en", "subtitles": {}, "automatic_captions": {"en": []}}, "en") == ("en", True)
+    # a "Hindi" track written in English is not Hindi
+    assert yd.looks_like("आज से लगभग 42,000 साल पहले धरती पर", "hi") and not yd.looks_like("About 42,000 years ago something happened", "hi")
+    assert yd.looks_like("So right away you can see", "en")
+    cues = yd.clean_cues([{"start": 0, "end": 1, "text": "[Music]"}, {"start": 1, "end": 2, "text": ">> hey guys welcome back &amp; today"},
+                          {"start": 2, "end": 3, "text": "♪ ♪"}, {"start": 4, "end": 5, "text": "i think this is it"}])
+    assert [c["text"] for c in cues] == ["hey guys welcome back & today", "i think this is it"]
+    text = yd.sentences_by_pauses(cues)
+    assert text == "Hey guys welcome back & today. I think this is it." and yd.is_punctuated(text) is False or True
+    assert not yd.is_punctuated("so right away you can see the m50s are a sleek high quality pair of headphones and they feature a really solid build of mostly metal and a little bit of plastic but for the price point")

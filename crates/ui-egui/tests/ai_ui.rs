@@ -208,7 +208,7 @@ fn ai_menu_and_dialogs() {
         ("voice", &["name", "lang.hi", "lang.mix", "lang.en", "source.record", "source.files", "run"]),
         ("speak", &["script", "text", "voice", "sound", "out", "run"]),
         ("hooks", &["niches", "countries", "claude", "run"]),
-        ("download", &["url", "audioOnly", "container", "items", "out", "queue", "run"]),
+        ("download", &["url", "mode.video", "mode.audio", "mode.subs", "container", "items", "out", "queue", "run"]),
         (
             "clips",
             &[
