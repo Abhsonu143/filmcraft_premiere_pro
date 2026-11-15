@@ -268,3 +268,11 @@ Keep in mind:
 - The owner's display often sleeps; use headless UI snapshots.
 - A heavy job and a rebuild must never overlap.
 - Back up the queue before touching it.
+
+## Animated character (2026-11-15)
+
+Engine and the Topic dialog are done and committed (see `progress.md`, 2026-11-15 step 2). The installed EI.app
+does not have the dialog block yet: ask the owner before rebuilding. Test videos for the owner to watch:
+`~/Movies/EI/Character-tests/` (`gta-studio.mp4` circle, `gta-cutout.mp4` cut-out, `*.character*.mp4` the
+character alone). Next: the owner's verdict on the motion, then a Characters window with tints, then the
+other tools (`character.add_character_args` / `options` / `add_to_video` are the three calls to reuse).

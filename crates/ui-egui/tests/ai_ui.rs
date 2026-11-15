@@ -289,6 +289,36 @@ fn ai_menu_and_dialogs() {
     assert!(!ids.iter().any(|i| i == "ai.talk.input"), "no single video in plan mode");
     d.ok("ui.click", json!({"id": "ai.talk.cancel"}));
     d.frames(2);
+    // Video from Topic ▸ the animated character and its settings (below the fold: scroll down to it)
+    d.run("ai.topic", json!({}));
+    d.frames(8);
+    assert!(d.ids("ai.topic.").iter().any(|i| i == "ai.topic.character") && d.ids("ai.topic.characterLook").is_empty(), "the character is off at first");
+    for _ in 0..2 {
+        d.ok("ui.scroll", json!({"x": 800, "y": 500, "dy": -2000}));
+        d.frames(3);
+    }
+    d.ok("ui.click", json!({"id": "ai.topic.character"}));
+    d.frames(4);
+    d.ok("ui.scroll", json!({"x": 800, "y": 500, "dy": -2000}));
+    d.frames(3);
+    d.snapshot("topic-character");
+    let ids = d.ids("ai.topic.");
+    for want in [
+        "characterName",
+        "characterAdd",
+        "characterLook",
+        "characterBackground",
+        "characterBgColor",
+        "characterBorderColor",
+        "characterPosition",
+        "characterSize",
+        "characterEnergy",
+        "characterGestures",
+    ] {
+        assert!(ids.iter().any(|i| *i == format!("ai.topic.{want}")), "{want} in {ids:?}");
+    }
+    d.ok("ui.click", json!({"id": "ai.topic.cancel"}));
+    d.frames(2);
     // TV Light Sync, horizontal: the vertical frame and its background opacity
     d.run("ai.tv", json!({}));
     d.frames(3);

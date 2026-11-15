@@ -158,6 +158,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("ai.queueExport", "Export AI Queue", [], None),
     uic!("ai.queueMove", "Move AI Queue Task", [], None),
     uic!("ai.queueRemove", "Remove AI Queue Task", [], None),
+    uic!("ai.characterAdd", "Add AI Character", [], None),
     uic!("ai.health", "AI Health", [], None),
     uic!("app.keyboardShortcuts", "Keyboard Shortcuts…", ["Edit"], Some("Cmd+Alt+K")),
     uic!("app.settings.general", "General…", ["Edit", "Preferences"], Some("Cmd+,")),

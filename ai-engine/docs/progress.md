@@ -26,8 +26,15 @@
 - **Topic:** the character is the last stage; the edit without it is kept as `<name>.no-character.mp4`.
 - **Measured** on a 62 s vertical topic video (1080×1920): 30–39 s for the character stage (1.6–2.1x real time),
   peak memory footprint 0.43 GB including the 6 s Whisper pass. Tests: `tests/test_character.py`, `test_vrm.py`.
-- **Not yet:** the Character block in the dialogs and the Characters window (app side), colour tints in the UI,
-  other tools (voiceover edit, speak), spring colliders, finger-level gestures (counting).
+- **In the app (needs a rebuild to appear):** Video from Topic has a Character block (who, Add… a .vrm file, shown
+  as studio circle / cut-out / green, background and colours, where, size, movement, gestures). Control channel:
+  `character, characterName, characterLook, characterPosition, characterX/Y, characterSize, characterBackground,
+  characterPicture, characterBgColor, characterBorderColor, characterEnergy, characterGestures, characterCutout`;
+  `ai.characterAdd {path, name?}` (no path: lists the characters).
+- **Not yet:** a Characters window (preview, colour tints per part), the other tools (voiceover edit, speak,
+  shorts), spring colliders, finger-level gestures (counting). Not judged in motion by the owner yet.
+- **Seen once:** `ai_jobs_run_the_engine_and_import_results` failed twice when the UI tests ran with
+  `FILMCRAFT_UI_SNAPSHOT_DIR` set, and passed in every run without it (6 of 6). Not looked into.
 
 ## 2026-11-15: animated 3D character, step 1 (drawing a character)
 

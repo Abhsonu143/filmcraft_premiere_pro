@@ -28,6 +28,10 @@
 //! - `ai.speak {script (file) or notes (text), voice, takes?, out?}`: a script spoken (audio only).
 //! - sound design (speak, voiceover, topic, clips, music): `soundDesign?, musicSource?=internet|folder|ai|none,
 //!   musicFolder?, licence?=monetized|personal, soundEffects?, musicLevel?` (dB).
+//! - animated character (topic): `character?, characterName?, characterLook?=studio|cutout|green,
+//!   characterPosition?=bottom-right|bottom-left|top-right|top-left|bottom-center|custom, characterX?, characterY? (0–1, with custom),
+//!   characterSize?=0.3, characterBackground?=studio|room|color|picture, characterPicture?, characterBgColor?, characterBorderColor?,
+//!   characterEnergy?=calm|normal|energetic, characterGestures?, characterCutout?`. `ai.characterAdd {path, name?}` adds a VRM file.
 //! - `ai.audio {clips: [files or folders], outDir?, format?=mp3|m4a|wav|aiff|flac|alac|opus|ogg,
 //!   audioQuality?=original|best|high|medium|small, start?, end?, mono?, normalize?, import?}`
 //! - each returns `{job}`; `ai.jobs` returns every job (and shows the window); `ai.cancel {job}`;
@@ -166,6 +170,10 @@ impl Kind {
     fn has_sound_design(self) -> bool {
         matches!(self, Kind::Speak | Kind::Voiceover | Kind::Topic | Kind::Clips | Kind::Music)
     }
+    /// Tools that can add the optional animated character.
+    fn has_character(self) -> bool {
+        matches!(self, Kind::Topic)
+    }
     fn needs_clips(self) -> bool {
         matches!(self, Kind::Music | Kind::Reference | Kind::Voiceover | Kind::Audio | Kind::Tv | Kind::Package)
     }
@@ -301,6 +309,21 @@ struct Draft {
     licence: &'static str,
     sound_effects: bool,
     music_level: f64,
+    // optional animated 3D character (a presenter that speaks the voiceover)
+    character: bool,
+    ch_name: String,
+    ch_look: &'static str,
+    ch_position: &'static str,
+    ch_x: f64,
+    ch_y: f64,
+    ch_size: f64,
+    ch_background: &'static str,
+    ch_picture: String,
+    ch_bg_color: String,
+    ch_border_color: String,
+    ch_energy: &'static str,
+    ch_gestures: bool,
+    ch_cutout: bool,
     emo: EmotionEditor,
     tv: TvState,
 }
@@ -490,6 +513,20 @@ impl Draft {
             licence: "monetized",
             sound_effects: true,
             music_level: -12.0,
+            character: false,
+            ch_name: String::new(),
+            ch_look: "studio",
+            ch_position: "bottom-right",
+            ch_x: 0.85,
+            ch_y: 0.82,
+            ch_size: 0.3,
+            ch_background: "studio",
+            ch_picture: String::new(),
+            ch_bg_color: String::new(),
+            ch_border_color: String::new(),
+            ch_energy: "normal",
+            ch_gestures: true,
+            ch_cutout: true,
             emo: EmotionEditor::default(),
             tv: TvState::default(),
         }
@@ -669,6 +706,26 @@ impl Draft {
         if let Some(f) = s("musicFolder") {
             d.music_folder = f;
         }
+        d.character = flag("character", d.character);
+        d.ch_look = pick("characterLook", &CH_LOOKS.map(|a| a.0), d.ch_look);
+        d.ch_position = pick("characterPosition", &CH_POSITIONS.map(|a| a.0), d.ch_position);
+        d.ch_x = num("characterX", d.ch_x).clamp(0.0, 1.0);
+        d.ch_y = num("characterY", d.ch_y).clamp(0.0, 1.0);
+        d.ch_size = num("characterSize", d.ch_size).clamp(0.08, 0.9);
+        d.ch_background = pick("characterBackground", &CH_BACKGROUNDS.map(|a| a.0), d.ch_background);
+        d.ch_energy = pick("characterEnergy", &CH_ENERGY.map(|a| a.0), d.ch_energy);
+        d.ch_gestures = flag("characterGestures", d.ch_gestures);
+        d.ch_cutout = flag("characterCutout", d.ch_cutout);
+        for (k, dst) in [
+            ("characterName", &mut d.ch_name),
+            ("characterPicture", &mut d.ch_picture),
+            ("characterBgColor", &mut d.ch_bg_color),
+            ("characterBorderColor", &mut d.ch_border_color),
+        ] {
+            if let Some(v) = s(k) {
+                *dst = v;
+            }
+        }
         if d.clip_type == "sections" {
             d.min_len = num("min", SECTION_LENGTHS.0);
             d.target_len = num("target", SECTION_LENGTHS.1);
@@ -759,6 +816,20 @@ impl Draft {
         m.insert("soundEffects".into(), json!(self.sound_effects));
         m.insert("musicLevel".into(), json!(self.music_level));
         m.insert("musicFolder".into(), json!(self.music_folder));
+        m.insert("character".into(), json!(self.character));
+        m.insert("characterName".into(), json!(self.ch_name));
+        m.insert("characterLook".into(), json!(self.ch_look));
+        m.insert("characterPosition".into(), json!(self.ch_position));
+        m.insert("characterX".into(), json!(self.ch_x));
+        m.insert("characterY".into(), json!(self.ch_y));
+        m.insert("characterSize".into(), json!(self.ch_size));
+        m.insert("characterBackground".into(), json!(self.ch_background));
+        m.insert("characterPicture".into(), json!(self.ch_picture));
+        m.insert("characterBgColor".into(), json!(self.ch_bg_color));
+        m.insert("characterBorderColor".into(), json!(self.ch_border_color));
+        m.insert("characterEnergy".into(), json!(self.ch_energy));
+        m.insert("characterGestures".into(), json!(self.ch_gestures));
+        m.insert("characterCutout".into(), json!(self.ch_cutout));
         let mut p = Value::Object(m);
         let mut langs = Vec::new();
         for (on, c) in [(self.lang_en, "en"), (self.lang_hi, "hi"), (self.lang_mix, "mix")] {
@@ -822,6 +893,62 @@ impl Draft {
             return Err("Music level must be between -30 and 0 dB.".into());
         }
         a.extend(["--music-level".into(), format!("{}", self.music_level)]);
+        Ok(())
+    }
+
+    /// The optional animated character (`ai-engine/character.py`).
+    fn character_args(&self, a: &mut Vec<String>, names: &[String]) -> Result<(), String> {
+        let name = if self.ch_name.trim().is_empty() { names.first().cloned().unwrap_or_default() } else { self.ch_name.trim().to_string() };
+        if name.is_empty() || !names.contains(&name) {
+            return Err("Add a character first (Add…: a .vrm file, for example your own from VRoid Studio), or untick the character.".into());
+        }
+        a.extend(["--character".into(), name, "--character-look".into(), self.ch_look.into()]);
+        if self.ch_position == "custom" {
+            if !(0.0..=1.0).contains(&self.ch_x) || !(0.0..=1.0).contains(&self.ch_y) {
+                return Err("The character's x and y must be between 0 and 1.".into());
+            }
+            a.extend(["--character-x".into(), format!("{:.3}", self.ch_x), "--character-y".into(), format!("{:.3}", self.ch_y)]);
+        } else {
+            a.extend(["--character-position".into(), self.ch_position.into()]);
+        }
+        if !(0.08..=0.9).contains(&self.ch_size) {
+            return Err("The character's size must be between 8% and 90%.".into());
+        }
+        a.extend(["--character-size".into(), format!("{:.3}", self.ch_size), "--character-energy".into(), self.ch_energy.into()]);
+        let colour = |v: &str, what: &str| -> Result<Option<String>, String> {
+            let v = v.trim();
+            if v.is_empty() {
+                return Ok(None);
+            }
+            let hex = v.trim_start_matches('#');
+            if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                Ok(Some(format!("#{hex}")))
+            } else {
+                Err(format!("The {what} colour must look like #2e3a5c."))
+            }
+        };
+        if self.ch_look == "studio" {
+            if self.ch_background == "picture" {
+                if !Path::new(self.ch_picture.trim()).is_file() {
+                    return Err("Choose the picture behind the character (or another background).".into());
+                }
+                a.extend(["--character-background".into(), self.ch_picture.trim().into()]);
+            } else {
+                a.extend(["--character-background".into(), self.ch_background.into()]);
+            }
+            if let Some(c) = colour(&self.ch_bg_color, "background")? {
+                a.extend(["--character-bg-color".into(), c]);
+            }
+            if let Some(c) = colour(&self.ch_border_color, "border")? {
+                a.extend(["--character-border-color".into(), c]);
+            }
+        }
+        if !self.ch_gestures {
+            a.push("--character-no-gestures".into());
+        }
+        if self.ch_look == "green" && !self.ch_cutout {
+            a.push("--character-no-cutout".into());
+        }
         Ok(())
     }
 
@@ -1339,6 +1466,9 @@ impl Draft {
         if self.kind.has_sound_design() && self.sound && !(self.kind == Kind::Topic && !self.make_video) {
             self.sound_args(&mut a)?;
         }
+        if self.kind.has_character() && self.character && self.make_video && !self.voice.is_empty() {
+            self.character_args(&mut a, &saved_characters())?;
+        }
         Ok(a)
     }
 }
@@ -1396,6 +1526,23 @@ const MUSIC_SOURCES: [(&str, &str); 4] = [
     ("ai", "AI-composed score on this Mac (slow; personal use only)"),
     ("none", "No music, sound effects only"),
 ];
+const CH_LOOKS: [(&str, &str); 3] = [
+    ("studio", "In a studio, shown in a circle over the video"),
+    ("cutout", "Cut-out: no background, standing in the corner"),
+    ("green", "Green screen: a separate clip you can key yourself"),
+];
+const CH_POSITIONS: [(&str, &str); 6] = [
+    ("bottom-right", "Bottom right"),
+    ("bottom-left", "Bottom left"),
+    ("bottom-center", "Bottom centre"),
+    ("top-right", "Top right"),
+    ("top-left", "Top left"),
+    ("custom", "Somewhere else (x, y)"),
+];
+const CH_BACKGROUNDS: [(&str, &str); 4] =
+    [("studio", "Studio (a lit wall)"), ("room", "Room (soft, out of focus)"), ("color", "One colour"), ("picture", "My picture")];
+const CH_ENERGY: [(&str, &str); 3] =
+    [("calm", "Calm: small movements, few gestures"), ("normal", "Normal"), ("energetic", "Energetic: big gestures, on almost every phrase")];
 const LICENCES: [(&str, &str); 2] =
     [("monetized", "Safe for monetized videos (CC0, CC BY, CC BY-SA)"), ("personal", "Personal use (more music, incl. non-commercial licences)")];
 /// The emotions of the sound design (`ai-engine/emotions.py`), grouped by mood.
@@ -1741,6 +1888,38 @@ fn styles_dir() -> PathBuf {
 }
 
 /// Saved voices (folders with a profile) and talking styles, by name.
+/// The characters added to EI (`Application Support/EI/characters/<name>/`), by name.
+fn saved_characters() -> Vec<String> {
+    saved_characters_in(&settings_path().parent().map(Path::to_path_buf).unwrap_or_else(support_dir).join("characters"))
+}
+
+fn saved_characters_in(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|it| {
+            it.filter_map(Result::ok)
+                .filter(|e| e.path().join("character.json").is_file() && e.path().join("model.vrm").is_file())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// Start the job that adds a VRM file to EI's characters.
+fn add_character_job(path: &str, name: Option<&str>) -> Result<u64, String> {
+    if !Path::new(path).is_file() {
+        return Err(format!("{path}: no such file"));
+    }
+    let engine = engine_dir().ok_or("The AI engine was not found. Reinstall EI, or set EI_ENGINE_DIR to the ai-engine folder.")?;
+    let mut step = vec![python(Some(&engine)).to_string_lossy().to_string(), engine.join("ei_engine.py").to_string_lossy().to_string()];
+    step.extend(["character".into(), "--add".into(), path.to_string()]);
+    if let Some(n) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        step.extend(["--name".into(), n.to_string()]);
+    }
+    Ok(start_job(format!("Add character: {}", file_stem(path)), None, vec![step], false, None))
+}
+
 fn saved_voices() -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(voices_dir())
         .map(|it| {
@@ -3120,6 +3299,10 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             (Some(i), Some(t)) => Ok(json!({"moved": move_waiting(i as usize, t as usize)})),
             _ => Err("ai.queueMove needs {index, to} (0 = next to run)".into()),
         },
+        "ai.characterAdd" => match params.get("path").and_then(Value::as_str) {
+            Some(path) => add_character_job(path, params.get("name").and_then(Value::as_str)).map(|job| json!({"job": job})),
+            None => Ok(json!({"characters": saved_characters()})),
+        },
         "ai.queueRemove" => match params.get("index").and_then(Value::as_u64) {
             Some(i) => remove_waiting(usize::try_from(i).unwrap_or(usize::MAX))
                 .map(|t| json!({"removed": t}))
@@ -3186,6 +3369,8 @@ enum Pick {
     StyleSources,
     TvFolder,
     MusicFolder,
+    CharacterAdd,
+    CharacterPicture,
 }
 
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
@@ -3302,6 +3487,108 @@ fn sound_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String
     elems.push((format!("{p}.soundEffects"), r.rect, d.sound_effects.to_string()));
     ui.end_row();
     choose
+}
+
+/// What the character rows ask the dialog to do.
+#[derive(Clone, Copy, PartialEq)]
+enum CharacterAsk {
+    Nothing,
+    Add,
+    Picture,
+}
+
+/// The optional animated character rows.
+fn character_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> CharacterAsk {
+    let mut ask = CharacterAsk::Nothing;
+    ui.label("Character");
+    let r = ui.checkbox(&mut d.character, "Add an animated presenter that speaks the voiceover (lips, expressions and gestures follow it)");
+    elems.push((format!("{p}.character"), r.rect, d.character.to_string()));
+    ui.end_row();
+    if !d.character {
+        return ask;
+    }
+    ui.label("Who");
+    let names = saved_characters();
+    if !names.contains(&d.ch_name) {
+        d.ch_name = names.first().cloned().unwrap_or_default();
+    }
+    ui.horizontal(|ui| {
+        let shown = if d.ch_name.is_empty() { "No character yet: add a .vrm file".to_string() } else { d.ch_name.clone() };
+        let r = egui::ComboBox::from_id_salt(format!("{p}.characterName")).selected_text(shown.clone()).width(250.0).show_ui(ui, |ui| {
+            for n in &names {
+                let o = ui.selectable_value(&mut d.ch_name, n.clone(), n);
+                elems.push((format!("{p}.characterName.{n}"), o.rect, n.clone()));
+            }
+        });
+        elems.push((format!("{p}.characterName"), r.response.rect, shown));
+        let b = ui.button("Add…").on_hover_text("Add a character from a .vrm file: your own from VRoid Studio (free), or one you may use");
+        elems.push((format!("{p}.characterAdd"), b.rect, "Add…".into()));
+        if b.clicked() {
+            ask = CharacterAsk::Add;
+        }
+    });
+    ui.end_row();
+    ui.label("Shown as");
+    combo_row(ui, &mut d.ch_look, &CH_LOOKS, &format!("{p}.characterLook"), elems);
+    ui.end_row();
+    if d.ch_look == "studio" {
+        ui.label("Behind it");
+        combo_row(ui, &mut d.ch_background, &CH_BACKGROUNDS, &format!("{p}.characterBackground"), elems);
+        ui.end_row();
+        if d.ch_background == "picture" {
+            ui.label("Picture");
+            if path_row(ui, &mut d.ch_picture, &format!("{p}.characterPicture"), "a photo of your room or studio", elems) {
+                ask = CharacterAsk::Picture;
+            }
+            ui.end_row();
+        } else {
+            ui.label("Colours");
+            ui.horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut d.ch_bg_color).hint_text("background #2e3a5c").desired_width(150.0));
+                elems.push((format!("{p}.characterBgColor"), r.rect, d.ch_bg_color.clone()));
+                let r = ui.add(egui::TextEdit::singleline(&mut d.ch_border_color).hint_text("circle border #ffffff").desired_width(150.0));
+                elems.push((format!("{p}.characterBorderColor"), r.rect, d.ch_border_color.clone()));
+            });
+            ui.end_row();
+        }
+    }
+    if d.ch_look == "green" {
+        ui.label("");
+        let r = ui.checkbox(&mut d.ch_cutout, "Also show the character in the video (cut out, no green)");
+        elems.push((format!("{p}.characterCutout"), r.rect, d.ch_cutout.to_string()));
+        ui.end_row();
+    }
+    if d.ch_look != "green" || d.ch_cutout {
+        ui.label("Where");
+        combo_row(ui, &mut d.ch_position, &CH_POSITIONS, &format!("{p}.characterPosition"), elems);
+        ui.end_row();
+        if d.ch_position == "custom" {
+            ui.label("");
+            ui.horizontal(|ui| {
+                ui.label("x");
+                let r = ui.add(egui::Slider::new(&mut d.ch_x, 0.0..=1.0).step_by(0.01));
+                elems.push((format!("{p}.characterX"), r.rect, d.ch_x.to_string()));
+                ui.label("y");
+                let r = ui.add(egui::Slider::new(&mut d.ch_y, 0.0..=1.0).step_by(0.01));
+                elems.push((format!("{p}.characterY"), r.rect, d.ch_y.to_string()));
+            });
+            ui.end_row();
+        }
+        ui.label("Size");
+        let mut pct = d.ch_size * 100.0;
+        let r = ui.add(egui::Slider::new(&mut pct, 8.0..=90.0).suffix(" % of the shorter side").step_by(1.0));
+        d.ch_size = pct / 100.0;
+        elems.push((format!("{p}.characterSize"), r.rect, d.ch_size.to_string()));
+        ui.end_row();
+    }
+    ui.label("Movement");
+    combo_row(ui, &mut d.ch_energy, &CH_ENERGY, &format!("{p}.characterEnergy"), elems);
+    ui.end_row();
+    ui.label("");
+    let r = ui.checkbox(&mut d.ch_gestures, "Hand gestures that follow what is said (wave, point, shrug, open arms…)");
+    elems.push((format!("{p}.characterGestures"), r.rect, d.ch_gestures.to_string()));
+    ui.end_row();
+    ask
 }
 
 /// Emotions per line of the script (Speak, Voiceover): chosen by Claude when the script was
@@ -4233,6 +4520,13 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     if d.kind.has_sound_design() && !(d.kind == Kind::Topic && !d.make_video) && sound_rows(ui, &mut d, &p, &mut elems) {
                         pick = Some(Pick::MusicFolder);
                     }
+                    if d.kind.has_character() && d.make_video {
+                        match character_rows(ui, &mut d, &p, &mut elems) {
+                            CharacterAsk::Add => pick = Some(Pick::CharacterAdd),
+                            CharacterAsk::Picture => pick = Some(Pick::CharacterPicture),
+                            CharacterAsk::Nothing => {}
+                        }
+                    }
                     if !matches!(d.kind, Kind::Voice | Kind::Hooks) {
                         let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package) || planning;
                         ui.label(if folder_out { "Output folder" } else { "Save as" });
@@ -4345,6 +4639,19 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
                     let _ = save_setting("music_folder", &dir);
                     d.music_folder = dir;
+                }
+            }
+            Pick::CharacterAdd => {
+                if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f("VRM character", &["vrm", "glb"])) {
+                    app.ui.status = match add_character_job(&f, None) {
+                        Ok(_) => "Adding the character: it appears in the list in a moment".to_string(),
+                        Err(e) => e,
+                    };
+                }
+            }
+            Pick::CharacterPicture => {
+                if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f("Picture", &["png", "jpg", "jpeg", "webp", "heic", "tif", "tiff"])) {
+                    d.ch_picture = f;
                 }
             }
             Pick::TvFolder => {
@@ -6127,6 +6434,64 @@ mod tests {
                 Err(e) => panic!("{e}"),
             }
         }
+    }
+
+    #[test]
+    fn character_arguments() {
+        let dir = std::env::temp_dir().join(format!("ei-ai-character-{}", std::process::id()));
+        let who = dir.join("characters").join("Host");
+        std::fs::create_dir_all(&who).unwrap();
+        std::fs::write(who.join("character.json"), "{}").unwrap();
+        std::fs::write(who.join("model.vrm"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("characters").join("Half")).unwrap(); // no model: not a character
+        let names = saved_characters_in(&dir.join("characters"));
+        assert_eq!(names, ["Host"]);
+        let d = Draft::from_params(
+            Kind::Topic,
+            &json!({"topic": "GTA 6", "voice": "mac:Rishi", "character": true, "characterLook": "green", "characterCutout": false, "characterPosition": "custom",
+                    "characterX": 0.2, "characterY": 0.7, "characterSize": 0.4, "characterEnergy": "energetic", "characterGestures": false}),
+        );
+        let mut a = Vec::new();
+        d.character_args(&mut a, &names).unwrap();
+        for w in [
+            ["--character", "Host"],
+            ["--character-look", "green"],
+            ["--character-x", "0.200"],
+            ["--character-y", "0.700"],
+            ["--character-size", "0.400"],
+            ["--character-energy", "energetic"],
+        ] {
+            assert!(a.windows(2).any(|x| x == w), "{w:?} in {a:?}");
+        }
+        assert!(
+            a.contains(&"--character-no-gestures".to_string())
+                && a.contains(&"--character-no-cutout".to_string())
+                && !a.contains(&"--character-position".to_string())
+        );
+        // the settings survive a round trip (queue, Edit & Retry)
+        let back = Draft::from_params(Kind::Topic, &d.to_params());
+        assert!(back.character && back.ch_look == "green" && !back.ch_cutout && back.ch_position == "custom" && (back.ch_size - 0.4).abs() < 1e-9);
+        // studio: background and colours; a bad colour is refused, not passed on
+        let mut st = Draft::from_params(
+            Kind::Topic,
+            &json!({"topic": "GTA 6", "voice": "mac:Rishi", "character": true, "characterBackground": "room", "characterBgColor": "aabbcc"}),
+        );
+        let mut a = Vec::new();
+        st.character_args(&mut a, &names).unwrap();
+        assert!(a.windows(2).any(|x| x == ["--character-background", "room"]) && a.windows(2).any(|x| x == ["--character-bg-color", "#aabbcc"]), "{a:?}");
+        assert!(a.windows(2).any(|x| x == ["--character-position", "bottom-right"]));
+        st.ch_border_color = "red".into();
+        assert!(st.character_args(&mut Vec::new(), &names).is_err());
+        // a character that is not there, or none at all
+        st.ch_border_color.clear();
+        st.ch_name = "Ghost".into();
+        assert!(st.character_args(&mut Vec::new(), &names).is_err() && st.character_args(&mut Vec::new(), &[]).is_err());
+        // no character asked for, or a script only: nothing about it reaches the engine
+        let mut off = Draft::from_params(Kind::Topic, &json!({"topic": "GTA 6", "voice": "mac:Rishi"}));
+        assert!(!off.engine_args().unwrap().contains(&"--character".to_string()));
+        let mut script = Draft::from_params(Kind::Topic, &json!({"topic": "GTA 6", "video": false, "character": true}));
+        assert!(!script.engine_args().unwrap().contains(&"--character".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
