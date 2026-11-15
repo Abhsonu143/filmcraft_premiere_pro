@@ -545,7 +545,7 @@ def subtitle_events(frames: list[list[tuple[str, float, float, float, float]]], 
     for k, found in enumerate(frames):
         t = start + k / fps
         for text, x, bottom in rows_of(found):
-            text = re.sub(r"^[A-Z][\w' ]{1,18}:\s+", "", text.strip().lstrip("•·*-–— "))
+            text, named = re.subn(r"^[A-Z][\w' ]{1,18}:\s+", "", text.strip().lstrip("•·*-–— "))
             text = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]\s*", " ", text).strip()
             text = re.sub(r"\bl(?=\s|'|’|$)", "I", text)  # (a lone small L is a capital i read wrong)
             if abs(x - 0.5) >= 0.08 or not re.search(r"[^\W\d_]{2}", text) or (text.upper() == text and len(text.split()) >= 2):
@@ -556,7 +556,7 @@ def subtitle_events(frames: list[list[tuple[str, float, float, float, float]]], 
                     e["seen"].append(text)
                     break
             else:
-                live.append({"start": t, "last": t, "text": text, "seen": [text], "y": bottom})
+                live.append({"start": t, "last": t, "text": text, "seen": [text], "y": bottom, "named": bool(named)})
         for e in [e for e in live if t - e["last"] > 1.5 / fps]:  # (one unread picture is not the end of a line)
             live.remove(e)
             done.append(e)
@@ -566,7 +566,7 @@ def subtitle_events(frames: list[list[tuple[str, float, float, float, float]]], 
         if len(e["seen"]) < 3 or e["last"] - e["start"] > 15:  # (a real subtitle stays about a second or more)
             continue
         top = max(set(e["seen"]), key=lambda x: (e["seen"].count(x), len(x)))
-        ev = {"start": round(e["start"], 2), "end": round(e["last"] + 1 / fps, 2), "text": top, "y": round(e["y"], 3)}
+        ev = {"start": round(e["start"], 2), "end": round(e["last"] + 1 / fps, 2), "text": top, "y": round(e["y"], 3), **({"named": True} if e.get("named") else {})}
         if e["seen"].count(top) * 2 < len(e["seen"]):  # read differently from picture to picture: not to be trusted as it is
             ev["variants"] = list(dict.fromkeys(e["seen"]))[:8]
         prev = events[-1] if events else None
@@ -589,7 +589,7 @@ def read_subtitles(rec: str, spans: list[tuple[float, float]], names: list[str])
     store = ac.CACHE_DIR / "subtitles"
     out = []
     for s, e in spans:
-        cache = store / f"{ac.file_key(rec, 'subs7', f'{s:.1f}-{e:.1f}', ','.join(names))}.json"
+        cache = store / f"{ac.file_key(rec, 'subs8', f'{s:.1f}-{e:.1f}', ','.join(names))}.json"
         try:
             out += json.loads(cache.read_text())
             continue
@@ -688,13 +688,17 @@ def use_subtitles(a: dict | None, subs: list[dict], spans: list[tuple[float, flo
             log(f"{len(only)} heard line(s) have no subtitle in a game that subtitles its lines: left out ({'; '.join(str(d['text'])[:30] for d in only[:4])})")
             out = [d for d in out if not (inside(float(d["start"])) and not d.get("read"))]
     lag = float(np.clip(np.median(lags), 0.0, 1.0)) if lags else 0.4  # (a subtitle comes up a little after the line starts)
+    many_sentences = sum(1 for x in subs if re.search(r"[.!?…]$", x["text"]) and len(x["text"].split()) >= 3) >= 3
     added = 0
     for p in placed:
         if "sub" not in p:
             out.append(p)
             continue
         sub = p["sub"]
-        if not p.get("sure") and (not any(abs(sub["y"] - y) <= 0.06 for y in confirmed) or not inside(sub["start"])):  # (where confirmed subtitles sit)
+        # a subtitle nothing was heard for is taken when it is surely one: it names its speaker, or sits where
+        # confirmed subtitles sit, or (nothing confirmed at all) it is one of several full sentences read
+        known = p.get("sure") or sub.get("named") or any(abs(sub["y"] - y) <= 0.06 for y in confirmed) or (not confirmed and many_sentences and re.search(r"[.!?…]$", sub["text"]))
+        if not known or not inside(sub["start"]):
             continue
         s0 = max(0.0, sub["start"] - lag)
         ws = words_for(sub["text"], [], s0, min(sub["end"] - lag, s0 + 0.45 * len(sub["text"].split()) + 0.6))
@@ -807,6 +811,46 @@ def whole_at_edges(cuts: list[dict], analyses: dict[str, dict | None], limit: fl
         if len(inside) >= 2 and not re.search(r"[.!?…\"”'’\-–—]$", inside[-1]["text"].rstrip()) and inside[-1]["start"] - 0.1 - c["start"] >= MIN_PIECE:
             c["end"] = round(inside[-1]["start"] - 0.1, 2)  # the last sentence does not end (its rest is not known): the piece stops before it
     return [c for c in cuts if c["end"] - c["start"] >= MIN_PIECE]
+
+
+MENU_TEXTS = 5  # this many pieces of text in the picture at once is a map, a menu or a list, not the game
+
+
+def trim_menus(cuts: list[dict], analyses: dict[str, dict | None]) -> list[dict]:
+    """Pieces without the seconds at their start or end that show a map or a menu: the picture is full
+    of text there and nobody speaks. Only the edges are looked at (a second at a time, 6 s each)."""
+    try:
+        import thumbnails as th
+    except Exception:  # noqa: BLE001
+        return cuts
+    out = []
+    for c in cuts:
+        c = dict(c)
+        said = [(float(d["start"]), float(d["end"])) for d in (analyses.get(c["recording"]) or {}).get("dialogue", [])]
+        n = int(min(6, (c["end"] - c["start"]) // 2))
+        try:
+            with tempfile.TemporaryDirectory(prefix="ei-menu-") as tmp:
+                times = [c["start"] + k + 0.5 for k in range(n)] + [c["end"] - k - 0.5 for k in range(n)]
+                files = []
+                for k, t in enumerate(times):
+                    p = Path(tmp) / f"m{k:02d}.jpg"
+                    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-ss", f"{t:.2f}", "-i", str(c["recording"]), "-frames:v", "1", "-vf", "scale=960:-2", "-q:v", "4", str(p)], capture_output=True)
+                    files.append(p)
+                if not all(p.is_file() for p in files):
+                    raise OSError("no picture")
+                full = [len(boxes) >= MENU_TEXTS and not any(s < t + 0.5 and e > t - 0.5 for s, e in said) for (boxes, _), t in zip(th.text_and_turn(files), times)]
+        except Exception as e:  # noqa: BLE001 (not knowing is not a reason to stop)
+            log(f"could not look for maps and menus ({type(e).__name__})")
+            out.append(c)
+            continue
+        lead = next((k for k in range(n) if not full[k]), n)
+        tail = next((k for k in range(n) if not full[n + k]), n)
+        if lead or tail:
+            log(f"a map or menu at the {'start' if lead else 'end'} of a piece is left out ({lead + tail} s)")
+            c["start"], c["end"] = round(c["start"] + lead, 2), round(c["end"] - tail, 2)
+        if c["end"] - c["start"] >= MIN_PIECE:
+            out.append(c)
+    return out
 
 
 def listen_closer(rec: str, a: dict | None, spans: list[tuple[float, float]], hint: str = "") -> dict | None:
@@ -1173,6 +1217,8 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
             cuts = on_keyframes(cuts, by_rec)
         if not cuts:
             raise AutocutError("no cuts were left to make a video from")
+        if vertical:
+            cuts = trim_menus(cuts, by_rec) or cuts
         if vertical:  # (captions are shown word by word: the pieces are heard once more for lines that were missed)
             for rec in by_rec:
                 mine = merge_spans([(max(0.0, c["start"] - 1.0), c["end"] + 1.0) for c in cuts if c["recording"] == rec], gap=0.0)

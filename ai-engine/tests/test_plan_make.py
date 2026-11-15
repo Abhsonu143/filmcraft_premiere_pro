@@ -215,6 +215,11 @@ def test_subtitles_give_the_wording_and_heard_words_the_time():
     assert got[1]["words"] == [["My", 100.0, 100.4], ["name", 100.4, 100.8], ["is", 100.8, 1.2 + 100.0], ["Atsu.", 101.2, 101.6]]  # the name takes the misheard word's time
     assert got[2]["words"][2] == ["recognise", 110.8, 111.2] and got[4]["start"] == 130.2 and got[5]["start"] == pytest.approx(150.05, abs=0.06)  # (a subtitle nothing was heard for: it comes up about 0.45 s after the voice here)
     assert pm.use_subtitles(a, [], [(0.0, 9.0)]) is a and pm.use_subtitles(None, subs, [(0.0, 9.0)]) is None
+    quiet = {"dialogue": []}  # nothing heard at all (guards talking far away): subtitles that name their speaker, or several full sentences, are still taken
+    named = [{"start": 10.0, "end": 12.0, "text": "They say she's here...", "y": 0.77, "named": True}, {"start": 20.0, "end": 22.0, "text": "REACH THE CELLS", "y": 0.2}]
+    assert [d["text"] for d in pm.use_subtitles(quiet, named, [(0.0, 30.0)])["dialogue"]] == ["They say she's here..."]
+    plain = [{"start": 10.0 + 5 * k, "end": 12.0 + 5 * k, "text": t, "y": 0.9} for k, t in enumerate(["Have you heard the rumours?", "She rose from the dead.", "I heard that too.", "Loot"])]
+    assert [d["text"] for d in pm.use_subtitles(quiet, plain, [(0.0, 40.0)])["dialogue"]] == ["Have you heard the rumours?", "She rose from the dead.", "I heard that too."]
     assert [x[0] for x in pm.words_for("a b c d", [], 1.0, 3.0)] == ["a", "b", "c", "d"] and pm.words_for("a b c d", [], 1.0, 3.0)[3] == ["d", 2.5, 3.0]
     over = {"dialogue": [line(10.0, "Get him now please"), line(10.8, "Get back here")]}  # two people at once: no word is dropped
     words = pm.heard_words([{"recording": "/r", "start": 9.0, "end": 20.0}], {"/r": over})
@@ -256,4 +261,21 @@ def test_a_sentence_over_two_subtitles_is_one():
     assert [(d["start"], d["end"]) for d in got] == [(10.0, 18.0), (30.0, 31.5), (40.0, 46.0)] and got[2]["text"].endswith("will he pass on the secret.")
     cut = pm.whole_at_edges([{"recording": "/r", "start": 9.0, "end": 43.2}], {"/r": {"dialogue": lines}}, 36.0)
     assert [(c["start"], c["end"]) for c in cut] == [(9.0, 39.9)]  # no room for the whole sentence: the piece stops before it
+
+
+def test_a_map_at_the_edge_of_a_piece_is_left_out(monkeypatch, tmp_path):
+    import thumbnails as th
+
+    def fake_run(cmd, **k):  # (a picture file for each asked second)
+        from pathlib import Path
+
+        Path(cmd[-1]).write_bytes(b"x")
+
+    monkeypatch.setattr(pm.subprocess, "run", fake_run)
+    # 20 s piece: 6 looks from the start, then 6 from the end backwards; the first two seconds are a map, and one second in the middle of the start has a line said over much text
+    looks = [9, 7, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+    monkeypatch.setattr(th, "text_and_turn", lambda files: [([(0, 0, 1, 1)] * n, []) for n in looks])
+    cuts = [{"recording": "/r", "start": 100.0, "end": 120.0, "note": "n"}]
+    assert [(c["start"], c["end"]) for c in pm.trim_menus(cuts, {"/r": {"dialogue": []}})] == [(102.0, 120.0)]
+    assert [(c["start"], c["end"]) for c in pm.trim_menus(cuts, {"/r": {"dialogue": [{"start": 100.0, "end": 101.0, "text": "a line over a list"}]}})] == [(100.0, 120.0)]
 
