@@ -144,9 +144,11 @@ def run(argv: list[str]) -> dict:
 
     yt_download.add_args(sub.add_parser("download", help="a YouTube playlist or video in the highest quality, or only its audio"))
     import character
+    import presenter
     import gameplay_plan
 
     character.add_args(sub.add_parser("character", help="an animated 3D presenter that speaks a voiceover, over a video or as its own clip"))
+    presenter.add_args(sub.add_parser("presenter", help="your own camera as the presenter of a generated video: record its lines one by one"))
     gameplay_plan.add_args(sub.add_parser("gameplay-plan", help="plan videos from a list of gameplay recordings (analysed once, kept next to them)"))
     import thumbnails
 
@@ -196,6 +198,8 @@ def run(argv: list[str]) -> dict:
         return gameplay_plan.run_args(a)
     if a.cmd == "character":
         return character.run_args(a)
+    if a.cmd == "presenter":
+        return presenter.run_args(a)
     if a.cmd == "voiceover":
         if getattr(a, "preset", None) == "short" and a.aspect == "horizontal":
             a.aspect = "vertical"

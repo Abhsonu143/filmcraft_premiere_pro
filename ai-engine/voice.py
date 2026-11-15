@@ -105,6 +105,33 @@ def frame_db(y: np.ndarray, hop: int = SR // 50) -> np.ndarray:
     return 20 * np.log10(np.maximum(r, 1e-6))
 
 
+ROOM_TONE_MAX_DB = -45.0  # louder than this is not a quiet room: it is speech, breath or music
+
+
+def room_tone(clips: list[np.ndarray]) -> np.ndarray:
+    """The quietest 0.2 s of each clip, kept only where it really is quiet. Clips that are speech from
+    end to end (short, tightly cut references) give nothing: a "quietest" bit of them is a piece of a word."""
+    tone = []
+    for y in clips:
+        db = frame_db(y)
+        if len(db) > 10:
+            i = int(np.argmin(np.convolve(db, np.ones(10) / 10, mode="valid")))
+            if float(db[i : i + 10].max()) <= ROOM_TONE_MAX_DB:
+                tone.append(y[i * (SR // 50) : (i + 10) * (SR // 50)])
+    return np.concatenate(tone) if tone else np.zeros(0, np.float32)
+
+
+def pause_fill(tone: np.ndarray, n: int) -> np.ndarray:
+    """`n` samples for a pause between passages: the room tone if it is one, else silence.
+    (A saved room tone that is not quiet, from before the check above, must never be heard.)"""
+    if n <= 0:
+        return np.zeros(0, np.float32)
+    db = frame_db(tone)
+    if len(tone) == 0 or len(db) == 0 or float(db.max()) > ROOM_TONE_MAX_DB:
+        return np.zeros(n, np.float32)
+    return (np.tile(tone, int(np.ceil(n / len(tone))))[:n] * 0.9).astype(np.float32)
+
+
 def pitch_track(y: np.ndarray, sr: int = SR, hop: int = 480, lo: float = 70, hi: float = 400) -> np.ndarray:
     """F0 per 20 ms frame (Hz, 0 = unvoiced): normalised autocorrelation, cheap and robust enough
     for a speaker's median pitch and range."""
@@ -655,15 +682,11 @@ def enroll(name: str, files: list[str] | None = None, takes: list[dict] | None =
                      "words_per_s": round(float(np.median([r["features"]["words_per_s"] for r in rs if r["features"].get("words_per_s")] or [0])), 2),
                      "emotions": sorted({r["emotion"] for r in rs})}
     # room tone: the quietest stretch of the best references, used between lines
-    tone = []
-    for r in sorted(allrefs, key=lambda r: -r["quality"])[:6]:
-        y = read_wav(refs_dir / r["file"])
-        db = frame_db(y)
-        if len(db) > 10:
-            i = int(np.argmin(np.convolve(db, np.ones(10) / 10, mode="valid")))
-            tone.append(y[i * (SR // 50) : (i + 10) * (SR // 50)])
-    if tone:
-        write_wav(d / "roomtone.wav", np.concatenate(tone))
+    tone = room_tone([read_wav(refs_dir / r["file"]) for r in sorted(allrefs, key=lambda r: -r["quality"])[:6]])
+    if len(tone):
+        write_wav(d / "roomtone.wav", tone)
+    else:
+        (d / "roomtone.wav").unlink(missing_ok=True)  # no quiet moment in these recordings: pauses are silent
     prof.update({"name": name, "engine": prof.get("engine", engine) if add else engine, "languages": languages or langs, "stats": stats,
                  "refs": allrefs, "updated": time.strftime("%Y-%m-%d %H:%M"), "version": 1})
     pf.write_text(json.dumps(prof, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -1069,9 +1092,7 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
         if missing:
             raise AutocutError(f"{len(missing)} passage(s) could not be spoken")
         # assemble: passages joined by the script's pauses (your room tone), one gentle level for all
-        tone = read_wav(d / "roomtone.wav") if (d / "roomtone.wav").is_file() else np.zeros(SR, np.float32)
-        if len(tone) == 0:
-            tone = np.zeros(SR, np.float32)
+        tone = read_wav(d / "roomtone.wav") if (d / "roomtone.wav").is_file() else np.zeros(0, np.float32)
         parts, timeline, t = [], [], 0.0
         fade = int(0.012 * SR)
         for ci, c in enumerate(chunks):
@@ -1092,7 +1113,7 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
             # the script's pause, or the dramatic pause the next line's emotion asks for (before a reveal, awe, grief)
             gap = max(float(segs[last].get("pause_after", 0.35)), pause_before(segs[chunks[ci + 1]["lines"][0]])) if ci < len(chunks) - 1 else 0.6
             n = int(gap * SR)
-            parts.append(np.tile(tone, int(np.ceil(n / max(1, len(tone)))))[:n] * 0.9)
+            parts.append(pause_fill(tone, n))
             t += gap
         raw = Path(tmp) / "raw.wav"
         write_wav(raw, np.concatenate(parts))

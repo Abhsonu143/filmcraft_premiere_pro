@@ -1,0 +1,314 @@
+"""Your own camera as the presenter of a generated video.
+
+A finished video (Video from Topic, a voiceover edit) already has its voice and its lines. Here the owner
+records themself saying those lines, one at a time, in a page in the browser; only the picture of each
+take is used later, synced to the generated voice and laid over the video.
+
+This file is step 1: the recording session.
+- `Session`: what was recorded for which line, kept next to the video in `<name>.presenter/session.json`
+  (takes are numbered and never deleted; the session says which take of a line is the chosen one).
+- `serve`: a small page on this Mac only (127.0.0.1) that shows a line, plays how the voice says it,
+  records a take with the camera and saves it.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import secrets
+import threading
+import time
+import wave
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from autocut import AutocutError, log
+
+MAX_TAKE_BYTES = 400 * 1024 * 1024  # one line is seconds long: anything bigger is not a take
+TAKE_TYPES = {"webm": "video/webm", "mp4": "video/mp4", "mov": "video/quicktime"}
+IDLE = "idle"  # the take of just looking at the camera, shown where nothing is said
+
+
+def _atomic(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def lines_of(video: Path) -> tuple[Path, list[dict]]:
+    """The voice file and the lines of a generated video, in the video's time.
+    `src` is where the line starts in the voice file (it differs when the edit moved lines)."""
+    base = video.with_suffix("")
+    timeline_path = Path(f"{base}.narrate.json")
+    narration_path = Path(f"{base}.narration.json")
+    if not timeline_path.is_file() and not narration_path.is_file():
+        raise AutocutError(f"{video.name} has no lines next to it (.narrate.json or .narration.json): choose a video made by Video from Topic or a voiceover edit")
+    timeline = json.loads(timeline_path.read_text(encoding="utf-8")) if timeline_path.is_file() else {}
+    narration = json.loads(narration_path.read_text(encoding="utf-8")) if narration_path.is_file() else {}
+    voice = Path(str(timeline.get("voice") or f"{base}.wav"))
+    if not voice.is_file():
+        voice = Path(f"{base}.wav")
+    if not voice.is_file():
+        raise AutocutError(f"the voice of {video.name} was not found ({voice.name})")
+    src_of = {re.sub(r"\W+", " ", str(s.get("text", ""))).strip().lower(): float(s.get("start", 0)) for s in narration.get("segments") or []}
+    raw = [ln for ln in timeline.get("lines") or [] if str(ln.get("text", "")).strip()] or [s for s in narration.get("segments") or [] if str(s.get("text", "")).strip()]
+    lines = []
+    for ln in raw:
+        a, b = float(ln.get("start", 0)), float(ln.get("end", 0))
+        if b <= a:
+            continue
+        text = str(ln["text"]).strip()
+        lines.append({"index": len(lines), "start": a, "end": b, "src": src_of.get(re.sub(r"\W+", " ", text).strip().lower(), a), "text": text,
+                      "emotion": ln.get("emotion")})
+    if not lines:
+        raise AutocutError(f"{video.name} has no spoken lines")
+    return voice, lines
+
+
+class Session:
+    """The takes recorded for one video. Saved after every change."""
+
+    def __init__(self, video: str | Path):
+        self.video = Path(video).expanduser().resolve()
+        if not self.video.is_file():
+            raise AutocutError(f"no such video: {video}")
+        self.voice, self.lines = lines_of(self.video)
+        self.dir = self.video.with_name(self.video.stem + ".presenter")
+        self.path = self.dir / "session.json"
+        self.takes: dict[str, dict] = {}  # "3" or "idle" -> {"file", "chosen", "n", "seconds", "at"}
+        self._lock = threading.Lock()
+        if self.path.is_file():
+            try:
+                saved = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                saved = {}
+            by_text = {ln["text"]: ln["index"] for ln in self.lines}
+            for key, t in (saved.get("takes") or {}).items():
+                # a take belongs to its sentence: if the video was made again, it follows the text
+                k = IDLE if key == IDLE else by_text.get(t.get("text", ""))
+                if k is not None and (self.dir / "takes" / str(t.get("file", ""))).is_file():
+                    self.takes[str(k)] = t
+
+    def key(self, which: str) -> str:
+        if which == IDLE:
+            return IDLE
+        if not which.isdigit() or int(which) >= len(self.lines):
+            raise AutocutError(f"no such line: {which}")
+        return str(int(which))
+
+    def save(self) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        _atomic(self.path, json.dumps({"version": 1, "video": str(self.video), "voice": str(self.voice), "takes": self.takes}, indent=1, ensure_ascii=False))
+
+    def add_take(self, which: str, data: bytes, ext: str, seconds: float | None = None) -> dict:
+        """Keep a new take of a line (or of the idle look) and make it the chosen one. Older takes stay on disk."""
+        key = self.key(which)
+        ext = ext.lower().lstrip(".")
+        if ext not in TAKE_TYPES:
+            raise AutocutError(f"a take must be one of {', '.join(TAKE_TYPES)}")
+        if not data or len(data) > MAX_TAKE_BYTES:
+            raise AutocutError("the take is empty or too large")
+        with self._lock:
+            folder = self.dir / "takes"
+            folder.mkdir(parents=True, exist_ok=True)
+            stem = IDLE if key == IDLE else f"line-{int(key) + 1:03d}"
+            n = 1 + max([int(m.group(1)) for p in folder.glob(f"{stem}-t*.*") if (m := re.search(r"-t(\d+)\.", p.name))], default=0)
+            name = f"{stem}-t{n}.{ext}"
+            tmp = folder / (name + ".part")
+            tmp.write_bytes(data)
+            os.replace(tmp, folder / name)
+            take = {"file": name, "n": n, "seconds": round(float(seconds), 2) if seconds and seconds > 0 else None, "at": int(time.time()),
+                    "text": "" if key == IDLE else self.lines[int(key)]["text"]}
+            self.takes[key] = take
+            self.save()
+        return take
+
+    def forget(self, which: str) -> None:
+        """Un-choose the take of a line (the file stays)."""
+        with self._lock:
+            if self.takes.pop(self.key(which), None) is not None:
+                self.save()
+
+    def take_path(self, which: str) -> Path | None:
+        t = self.takes.get(self.key(which))
+        return self.dir / "takes" / t["file"] if t else None
+
+    def recorded_until(self) -> float:
+        """The video time up to which every line has a take (what a preview can show)."""
+        end = 0.0
+        for ln in self.lines:
+            if str(ln["index"]) not in self.takes:
+                break
+            end = ln["end"]
+        return end
+
+    def state(self) -> dict:
+        return {"video": self.video.name, "folder": str(self.dir), "recordedUntil": self.recorded_until(), "idle": self.takes.get(IDLE),
+                "lines": [{**ln, "seconds": round(ln["end"] - ln["start"], 2), "take": self.takes.get(str(ln["index"]))} for ln in self.lines]}
+
+    def line_audio(self, which: str) -> bytes:
+        """How the generated voice says one line, as a small WAV (cut from the voice file, not re-encoded)."""
+        ln = self.lines[int(self.key(which))]
+        try:
+            with wave.open(str(self.voice), "rb") as w:
+                rate = w.getframerate()
+                a = max(0, int(ln["src"] * rate))
+                n = max(1, int((ln["end"] - ln["start"]) * rate))
+                w.setpos(min(a, w.getnframes()))
+                frames = w.readframes(min(n, max(0, w.getnframes() - a)))
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as o:
+                    o.setnchannels(w.getnchannels())
+                    o.setsampwidth(w.getsampwidth())
+                    o.setframerate(rate)
+                    o.writeframes(frames)
+                return buf.getvalue()
+        except (wave.Error, EOFError, OSError) as e:
+            raise AutocutError(f"the voice file could not be read: {e}") from e
+
+
+def make_handler(session: Session, token: str, stop: threading.Event):
+    from presenter_page import PAGE
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "EI"
+
+        def log_message(self, *_):  # quiet: the job log is for the owner
+            pass
+
+        def _send(self, code: int, body: bytes, kind: str = "application/json") -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, obj, code: int = 200) -> None:
+            self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+        def _allowed(self, q: dict) -> bool:
+            # only the page EI opened may talk to this server (another site in the browser cannot guess the token)
+            if secrets.compare_digest((q.get("k") or [""])[0], token):
+                return True
+            self._json({"error": "not allowed"}, 403)
+            return False
+
+        def do_GET(self):  # noqa: N802
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            if not self._allowed(q):
+                return
+            try:
+                if u.path == "/":
+                    return self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                if u.path == "/api/session":
+                    return self._json(session.state())
+                m = re.fullmatch(r"/api/audio/(\d+)", u.path)
+                if m:
+                    return self._send(200, session.line_audio(m.group(1)), "audio/wav")
+                m = re.fullmatch(r"/api/take/(\d+|idle)", u.path)
+                if m:
+                    p = session.take_path(m.group(1))
+                    if p is None or not p.is_file():
+                        return self._json({"error": "no take"}, 404)
+                    return self._send(200, p.read_bytes(), TAKE_TYPES.get(p.suffix.lstrip("."), "application/octet-stream"))
+                self._json({"error": "not found"}, 404)
+            except AutocutError as e:
+                self._json({"error": str(e)}, 400)
+
+        def do_POST(self):  # noqa: N802
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            if not self._allowed(q):
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_TAKE_BYTES:
+                return self._json({"error": "too large"}, 413)
+            body = self.rfile.read(length) if length else b""
+            try:
+                m = re.fullmatch(r"/api/take/(\d+|idle)", u.path)
+                if m:
+                    try:
+                        seconds = float((q.get("seconds") or ["0"])[0])
+                    except ValueError:
+                        seconds = 0.0
+                    take = session.add_take(m.group(1), body, (q.get("ext") or ["webm"])[0], seconds)
+                    log(f"presenter: {'the idle look' if m.group(1) == IDLE else 'line ' + str(int(m.group(1)) + 1)} recorded ({take['file']})")
+                    return self._json({"take": take, "session": session.state()})
+                m = re.fullmatch(r"/api/forget/(\d+|idle)", u.path)
+                if m:
+                    session.forget(m.group(1))
+                    return self._json({"session": session.state()})
+                if u.path == "/api/done":
+                    self._json({"ok": True})
+                    stop.set()
+                    return
+                self._json({"error": "not found"}, 404)
+            except AutocutError as e:
+                self._json({"error": str(e)}, 400)
+
+    return Handler
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def server_bind(self):  # (the stock one looks up this Mac's network name first, which can take seconds)
+        import socketserver
+
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+
+
+def serve(video: str, *, port: int = 0, open_browser: bool = True, ready=None, stop: threading.Event | None = None) -> dict:
+    """Run the recording page until the owner presses Done (or the job is cancelled)."""
+    session = Session(video)
+    session.save()
+    token = secrets.token_urlsafe(16)
+    stop = stop or threading.Event()
+    httpd = _Server(("127.0.0.1", port), make_handler(session, token, stop))
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/?k={token}"
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    log(f"presenter: record your lines at {url}")
+    if ready:
+        ready(url)
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        while not stop.wait(0.5):
+            pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    st = session.state()
+    done = sum(1 for ln in st["lines"] if ln["take"])
+    log(f"presenter: {done} of {len(st['lines'])} lines recorded, video covered until {st['recordedUntil']:.1f}s")
+    return {"outputs": [str(session.path)], "session": str(session.path), "recorded": done, "lines": len(st["lines"]), "recordedUntil": st["recordedUntil"]}
+
+
+def add_args(p) -> None:
+    sub = p.add_subparsers(dest="presenter_cmd", required=True)
+    r = sub.add_parser("record", help="record yourself saying the lines of a generated video, one by one, in the browser")
+    r.add_argument("--video", required=True, help="a video made by Video from Topic or a voiceover edit")
+    r.add_argument("--port", type=int, default=0, help="the page's port on this Mac (default: any free one)")
+    r.add_argument("--no-open", action="store_true", help="do not open the browser (the address is printed)")
+    s = sub.add_parser("status", help="what is recorded so far")
+    s.add_argument("--video", required=True)
+
+
+def run_args(a) -> dict:
+    if a.presenter_cmd == "record":
+        return serve(a.video, port=a.port, open_browser=not a.no_open)
+    st = Session(a.video).state()
+    print(json.dumps(st, indent=1, ensure_ascii=False))
+    return {"outputs": []}

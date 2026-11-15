@@ -204,3 +204,21 @@ def test_split_points_find_the_breath():
     pts = vo.split_points(y, ["a much longer first sentence here", "short"])
     assert pts[0] == 0 and pts[-1] == pytest.approx(len(y) / vo.SR)
     assert 2.0 <= pts[1] <= 2.3  # inside the breath, not at the proportional guess
+
+
+def test_pauses_never_carry_a_piece_of_speech():
+    sr = vo.SR
+    rng = np.random.default_rng(0)
+    quiet = (rng.normal(0, 0.0008, sr)).astype(np.float32)  # a room, about -62 dB
+    talk = (0.2 * np.sin(2 * np.pi * 180 * np.arange(sr) / sr)).astype(np.float32)
+    # a recording with a real pause gives its room; one that is speech from end to end gives nothing
+    tone = vo.room_tone([np.concatenate([talk, quiet, talk]), talk])
+    assert len(tone) == sr // 5 and float(np.abs(tone).max()) < 0.01
+    assert len(vo.room_tone([talk, talk])) == 0
+    fill = vo.pause_fill(tone, sr // 2)
+    assert len(fill) == sr // 2 and 0 < float(np.abs(fill).max()) < 0.01
+    # a saved room tone that is really a bit of a word (from before the check) is not used: silence
+    bad = np.concatenate([quiet[: sr // 10], talk[: sr // 10]])
+    assert not vo.pause_fill(bad, sr // 2).any() and not vo.pause_fill(np.zeros(0, np.float32), 100).any()
+    assert len(vo.pause_fill(tone, 0)) == 0
+
