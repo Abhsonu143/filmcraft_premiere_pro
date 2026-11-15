@@ -100,3 +100,26 @@ def test_a_plan_becomes_a_video(tmp_path, monkeypatch):
     rec.unlink()
     with pytest.raises(AutocutError, match="not found"):
         pm.make(str(pj), pick="1", writer="rules")
+
+
+def test_the_hook_comes_from_inside_the_pieces():
+    a = {**ANALYSIS, "dialogue": [{"start": 100.0, "end": 104.0, "text": "Where did you get that sword?"}, {"start": 118.0, "end": 120.0, "text": "It's me!"},
+                                  {"start": 121.0, "end": 123.5, "text": "You don't recognize your own brother?"}]}
+    cuts = [{"recording": "/r/a.mov", "part": 1, "start": 99.6, "end": 125.0, "note": "the sword"}]
+    recs = {"/r/a.mov": a}
+    h = pm.hook_cut(plan(), cuts, recs, False)  # no idea given: the line with the most force, not the opening one
+    assert (h["start"], h["end"]) == (120.8, 123.8) and h["note"] == ""
+    asked = {**plan(), "hook_idea": {"part": 1, "start": "0:01:58", "end": "0:01:59"}}
+    h = pm.hook_cut(asked, cuts, recs, False)  # Claude's choice, with its line kept whole
+    assert (h["start"], h["end"]) == (117.8, 120.3) and "hook_idea" not in asked
+    opening = {**plan(), "hook_idea": {"part": 1, "start": "0:01:40", "end": "0:01:43"}}
+    assert pm.hook_cut(opening, cuts, recs, False)["start"] == 120.8  # the first seconds of the video are not a hook
+    keyed = pm.hook_cut(plan(), cuts, recs, True)
+    assert keyed["start"] == 120.0 and pm.HOOK[0] <= keyed["end"] - keyed["start"] <= pm.HOOK[1]  # joined without re-encoding: from a keyframe
+    assert pm.hook_cut(plan(), [{"recording": "/r/a.mov", "start": 99.6, "end": 110.0}], recs, False) is None  # too short a video for one
+    quiet = {**ANALYSIS, "dialogue": [], "loud": [0.1] * 300 + [0.9] * 4 + [0.1] * 296}
+    h = pm.hook_cut(plan(), [{"recording": "/r/a.mov", "part": 2, "start": 280.0, "end": 330.0, "note": "fight"}], {"/r/a.mov": quiet}, False)
+    assert 296 <= h["start"] <= 304 and h["end"] - h["start"] == 2.5  # nothing said: the peak of the action
+    text = pm.publish_text(plan(), [{"recording": "/r/a.mov", "start": 120.0, "end": 123.0, "note": ""}, *[{**c, "note": "the sword"} for c in cuts]], True)
+    assert "0:00 the sword" in text  # the first chapter starts at 0:00, teaser included
+

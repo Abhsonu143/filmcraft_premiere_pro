@@ -25,7 +25,7 @@
 //! - `ai.clips {input, outDir?, clipType?=edited|sections, count?=5, min?=10, target?=48, max?=60,
 //!   aspect?=vertical|square|horizontal|same, content?=auto|talk|gameplay, framing?=auto|center|blur|bars, captionMode?=auto|on|off, captionStyle?=pop|clean|boxed,
 //!   titleMode?=off|intro|always, pace?=fast|medium|slow, music?, llm?=default|<model>|none, hook?, import?}`
-//! - `ai.planMake {input (plans.json), pick? (number) | request? (text), fresh?}`: the video of a plan from Plan Videos, or of a
+//! - `ai.planMake {input (plans.json), pick? (number) | request? (text), fresh?, hook?=true}`: the video of a plan from Plan Videos, or of a
 //!   new plan written for what is asked; the result (`.otio` + `.srt`) opens in the timeline.
 //! - `ai.repair {input}`: the folder of a video made by EI (or a file in it) → a copy “<folder> - fixed” whose
 //!   voice pauses are silent and whose sound track has the bursts in them taken out (the picture is not re-encoded).
@@ -1304,6 +1304,9 @@ impl Draft {
                 }
                 if self.fresh {
                     a.push("--fresh".into());
+                }
+                if !self.hook {
+                    a.push("--no-hook".into());
                 }
             }
             Kind::Repair => {
@@ -3584,6 +3587,10 @@ fn plan_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String,
         elems.push((format!("{p}.request"), r.rect, d.plan_request.clone()));
         ui.label(egui::RichText::new("When this is filled in, a new plan is written for it from the recordings, added to the plans file and made.").small().weak());
     });
+    ui.end_row();
+    ui.label("Hook");
+    let r = ui.checkbox(&mut d.hook, "Open with 2–3 seconds from inside the video (its strongest line or moment), then start");
+    elems.push((format!("{p}.hook"), r.rect, d.hook.to_string()));
     ui.end_row();
     ui.label("");
     let r = ui.checkbox(&mut d.fresh, "Choose the cuts again (drops the cuts saved in the plan)");
@@ -6505,6 +6512,8 @@ mod tests {
         let mut asked = Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "1", "request": " a short of the wolf "}));
         assert_eq!(asked.engine_args().unwrap(), vec!["plan-make", "--plans", &file, "--request", "a short of the wolf"]); // (what is asked for wins)
         assert!(Draft::from_params(Kind::PlanMake, &json!({"input": file})).engine_args().is_err());
+        let mut plain = Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "1", "hook": false}));
+        assert_eq!(plain.engine_args().unwrap(), vec!["plan-make", "--plans", &file, "--pick", "1", "--no-hook"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

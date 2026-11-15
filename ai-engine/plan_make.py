@@ -15,6 +15,8 @@ Making it:
    out. No line is cut in the middle. The cuts are saved in the plan (`cuts`, editable: change the
    times in `plans.json` and make it again).
 3. The video:
+   - it opens with a hook: 2–3 seconds from inside it (the line or the moment that makes a viewer stay),
+     then starts from its beginning. Optional (`--no-hook`), and saved in the plan as `hook_cut`.
    - Shorts and Reels: vertical (the middle of the picture over a blurred copy), the hook as text at
      the start, what is said as captions.
    - long videos: the pieces joined as they are (nothing is re-encoded, so hours take minutes; a piece
@@ -42,6 +44,7 @@ from autocut import AutocutError, log
 VERTICAL = {"shorts", "reels"}
 MAX_SECONDS = {"shorts": 60.0, "reels": 90.0}
 MIN_PIECE = 2.0  # seconds: nothing shorter is kept
+HOOK = (1.5, 4.0)  # seconds: the shortest and longest teaser shown before the video starts
 REACH = 60.0  # how far outside a stretch of the plan a cut may go (the plan's times are rough)
 
 
@@ -132,8 +135,10 @@ Why it works: {plan.get("why")}
   and nothing happening. Keep: story dialogue, reveals, the build-up and the end of a fight, anything funny or beautiful.
 - Use only times inside the stretches shown. Pieces of one stretch are in order and do not overlap. You may drop a whole stretch if it adds nothing.
 - note: a few words on what happens in the piece (it becomes a chapter title in a long video).
+- hook: the 2 to 3 seconds from inside your pieces that would stop someone scrolling: the line that shocks, the hit that ends the fight,
+  the reveal. It is shown first as a teaser, then the video starts from its beginning, so it must not be the first seconds of the first piece.
 Answer with only this JSON:
-{{"cuts": [{{"part": 1, "start": "H:MM:SS", "end": "H:MM:SS", "note": "..."}}]}}"""
+{{"cuts": [{{"part": 1, "start": "H:MM:SS", "end": "H:MM:SS", "note": "..."}}], "hook": {{"part": 1, "start": "H:MM:SS", "end": "H:MM:SS"}}}}"""
 
 
 def keep_lines_whole(start: float, end: float, a: dict | None) -> tuple[float, float]:
@@ -222,7 +227,10 @@ def choose_cuts(plan: dict, game: str, analyses: list[dict | None], writer: str 
 
     log(f"Claude is choosing the exact cuts ({total / 60:.0f} min of recording in {len(parts)} stretch(es))")
     try:
-        raw = sw.extract_json(sw.ask_claude(cuts_prompt(plan, game, blocks), timeout=900)).get("cuts")
+        answer = sw.extract_json(sw.ask_claude(cuts_prompt(plan, game, blocks), timeout=900))
+        raw = answer.get("cuts")
+        if isinstance(answer.get("hook"), dict):
+            plan["hook_idea"] = answer["hook"]
     except (AutocutError, ValueError) as e:
         log(f"the cuts could not be chosen ({e}): the plan's stretches are used whole")
         return whole_parts(plan, analyses)
@@ -231,6 +239,68 @@ def choose_cuts(plan: dict, game: str, analyses: list[dict | None], writer: str 
         log("no usable cuts came back: the plan's stretches are used whole")
         return whole_parts(plan, analyses)
     return cuts
+
+
+def hook_cut(plan: dict, cuts: list[dict], analyses: dict[str, dict | None], on_keys: bool) -> dict | None:
+    """The teaser shown before the video starts: 2–3 seconds from inside the pieces. Claude's choice when
+    it is a good one; else the most striking line said (or, with nothing said, the peak of the action).
+    Never the opening seconds of the first piece (it would only play twice). `on_keys`: it starts on a
+    keyframe (a video joined without re-encoding)."""
+    if not cuts or sum(c["end"] - c["start"] for c in cuts) < 15:
+        return None
+    lo, hi = HOOK
+    first = cuts[0]
+
+    def usable(rec: str, s: float, e: float) -> dict | None:
+        inside = [c for c in cuts if c["recording"] == rec and c["start"] - 0.5 <= s and e <= c["end"] + 0.5]
+        if not inside or (inside[0] is first and s < first["start"] + 4.0):
+            return None
+        s, e = max(s, inside[0]["start"]), min(e, inside[0]["end"])
+        if on_keys:
+            keys = [k["t"] for k in (analyses.get(rec) or {}).get("keyframes", []) if inside[0]["start"] <= k["t"] <= s + 0.02]
+            if not keys:
+                return None
+            s = float(keys[-1])
+        e = min(max(e, s + lo), s + hi, inside[0]["end"])
+        return {"recording": rec, "part": inside[0].get("part"), "start": round(s, 2), "end": round(e, 2), "note": ""} if e - s >= lo else None
+
+    idea = plan.pop("hook_idea", None)
+    parts = plan.get("parts") or []
+    if isinstance(idea, dict):
+        try:
+            k = int(idea.get("part", 0)) - 1
+        except (TypeError, ValueError):
+            k = -1
+        s, e = gp.parse_t(idea.get("start")), gp.parse_t(idea.get("end"))
+        if 0 <= k < len(parts) and s >= 0 and e > s:
+            a = analyses.get(str(parts[k]["recording"]))
+            said = [d for d in (a or {}).get("dialogue", []) if d["start"] < e and d["end"] > s]  # (whole lines, not half of one)
+            if said:
+                s, e = min(s, said[0]["start"] - 0.2), max(e, said[-1]["end"] + 0.3)
+            got = usable(str(parts[k]["recording"]), s, e)
+            if got:
+                return got
+    best, best_score = None, -1.0
+    for c in cuts:
+        a = analyses.get(c["recording"])
+        if not a:
+            continue
+        action, _ = gp.per_second(a)
+        lines = [d for d in a.get("dialogue", []) if c["start"] <= d["start"] and d["end"] <= c["end"] and 1.0 <= d["end"] - d["start"] <= hi]
+        for d in lines:  # a short line with force: a question, a shout, action under it
+            text = str(d.get("text", ""))
+            act = float(action[int(d["start"]) : int(d["end"]) + 1].mean()) if len(action) > int(d["start"]) else 0.0
+            score = 1.0 + act + (0.5 if "?" in text or "!" in text else 0.0) + (0.3 if 3 <= len(text.split()) <= 9 else 0.0)
+            got = usable(c["recording"], d["start"] - 0.2, d["end"] + 0.3) if score > best_score else None
+            if got:
+                best, best_score = got, score
+        if not lines and len(action) > int(c["start"]) + 1:  # nothing said: the peak of the action
+            seg = action[int(c["start"]) : int(c["end"])]
+            peak = int(c["start"]) + int(np.argmax(seg))
+            got = usable(c["recording"], peak - 1.0, peak + 1.5) if float(seg.max()) > best_score else None
+            if got:
+                best, best_score = got, float(seg.max())
+    return best
 
 
 def request_plan(data: dict, text: str, writer: str = "claude") -> dict:
@@ -428,11 +498,12 @@ def publish_text(plan: dict, cuts: list[dict], long: bool) -> str:
     if long:
         lines.append("Chapters:")
         t, seen, last = 0.0, None, -99.0
-        for c in cuts:  # (YouTube: chapters at least 10 s apart, the first at 0:00)
+        for c in cuts:  # (YouTube: chapters at least 10 s apart, the first at 0:00: it covers the teaser too)
             if c.get("note") and c["note"] != seen and t - last >= 10:
-                at = f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{int(t % 60):02d}" if t >= 3600 else f"{int(t // 60)}:{int(t % 60):02d}"
-                lines.append(f"{at} {c['note']}")
-                seen, last = c["note"], t
+                at = 0.0 if seen is None else t
+                stamp = f"{int(at // 3600)}:{int(at % 3600 // 60):02d}:{int(at % 60):02d}" if at >= 3600 else f"{int(at // 60)}:{int(at % 60):02d}"
+                lines.append(f"{stamp} {c['note']}")
+                seen, last = c["note"], at
             t += c["end"] - c["start"]
         lines.append("")
     lines += [" ".join(plan.get("tags") or []), ""]
@@ -445,9 +516,10 @@ def safe_name(title: str) -> str:
 
 
 def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | None = None, writer: str = "claude", fresh: bool = False,
-         captions: bool = True, cuts_only: bool = False) -> dict:
+         captions: bool = True, cuts_only: bool = False, hook: bool = True) -> dict:
     """The video of one plan (`pick`: its number or a part of its title), or of a new plan written for
-    `request`. `fresh`: choose the cuts again. `cuts_only`: stop after the cuts are saved."""
+    `request`. `fresh`: choose the cuts again. `cuts_only`: stop after the cuts are saved. `hook`: the video opens
+    with a 2–3 second teaser from inside it (saved in the plan as `hook_cut`; delete it there to go without)."""
     ac.require_tools()
     data, pj = load(plans_file)
     plans = data["plans"]
@@ -478,11 +550,24 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
             cuts = choose_cuts(plan, game, [by_rec[str(p["recording"])] for p in parts], writer)
         vertical = plan.get("platform") in VERTICAL
         if vertical:
-            cuts = fit_short(cuts, MAX_SECONDS[plan["platform"]])
+            cuts = fit_short(cuts, MAX_SECONDS[plan["platform"]] - (HOOK[1] if hook else 0.0))
         else:
             cuts = on_keyframes(cuts, by_rec)
         if not cuts:
             raise AutocutError("no cuts were left to make a video from")
+        teaser = None
+        if hook:
+            saved = plan.get("hook_cut") if not fresh else None
+            if isinstance(saved, dict) and Path(str(saved.get("recording", ""))).is_file() and HOOK[0] <= float(saved.get("end", 0)) - float(saved.get("start", 0)) <= 10:
+                teaser = saved
+            else:
+                teaser = hook_cut(plan, cuts, by_rec, not vertical)
+            if teaser:
+                plan["hook_cut"] = teaser
+                log(f"hook: {teaser['end'] - teaser['start']:.1f}s from {gp.hms(teaser['start'])} of {Path(str(teaser['recording'])).name}, shown first")
+            else:
+                log("no hook: nothing in the pieces stands out enough to show first (or the video is very short)")
+        plan.pop("hook_idea", None)
         plan["cuts"] = cuts
         plan["cut_s"] = round(sum(c["end"] - c["start"] for c in cuts), 1)
         plan["cuts_made"] = time.strftime("%Y-%m-%d %H:%M")
@@ -494,7 +579,10 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
         log(f"{len(cuts)} piece(s), {plan['cut_s'] / 60:.1f} min (the plan's stretches: {planned / 60:.1f} min)")
     name = f"{idx + 1:02d} {safe_name(str(plan.get('title', '')))}"
     folder = (Path(out_dir).expanduser() if out_dir else pj.parent / "videos") / name
-    res = {"outputs": [], "out_dir": str(folder), "plan": idx + 1, "title": plan.get("title"), "pieces": len(cuts), "seconds": plan["cut_s"], "plans": str(pj)}
+    res = {"outputs": [], "out_dir": str(folder), "plan": idx + 1, "title": plan.get("title"), "pieces": len(cuts), "seconds": plan["cut_s"], "plans": str(pj),
+           "hook": bool(teaser)}
+    if teaser:  # (from here on the teaser is simply the first piece)
+        cuts = [teaser, *cuts]
     if cuts_only:
         return res
     with ac.stage("video"):
@@ -508,7 +596,7 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
             if captions and words and game_shows_subtitles(cuts, by_rec):
                 log("the game shows its own subtitles: no captions are added over them")
                 captions = False
-            ass = cp.build_ass(words if captions else [], hook_text(plan), 1080, 1920, plan["cut_s"], "pop", "intro") if (captions and words) or hook_text(plan) else None
+            ass = cp.build_ass(words if captions else [], hook_text(plan), 1080, 1920, sum(c["end"] - c["start"] for c in cuts), "pop", "intro") if (captions and words) or hook_text(plan) else None
             render_vertical(cuts, video, ass)
             W, H, fps = 1080, 1920, 30.0
         else:
@@ -541,7 +629,8 @@ def add_args(p) -> None:
     p.add_argument("--fresh", action="store_true", help="choose the cuts again (drops the cuts saved in the plan)")
     p.add_argument("--no-captions", action="store_true")
     p.add_argument("--cuts-only", action="store_true", help="choose and save the cuts, make no video")
+    p.add_argument("--no-hook", action="store_true", help="do not open with a 2–3 second teaser from inside the video")
 
 
 def run_args(a) -> dict:
-    return make(a.plans, pick=a.pick, request=a.request, out_dir=a.out_dir, writer=a.writer, fresh=a.fresh, captions=not a.no_captions, cuts_only=a.cuts_only)
+    return make(a.plans, pick=a.pick, request=a.request, out_dir=a.out_dir, writer=a.writer, fresh=a.fresh, captions=not a.no_captions, cuts_only=a.cuts_only, hook=not a.no_hook)
