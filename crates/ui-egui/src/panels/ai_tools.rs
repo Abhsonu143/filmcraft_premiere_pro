@@ -3634,13 +3634,13 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             ui.vertical(|ui| {
                                 ui.label(
                                     egui::RichText::new(
-                                        "From transcripts (.txt, .srt, .vtt) and/or YouTube links (one per line): how you or a creator you like talks.",
+                                        "From recordings (audio or video), transcripts (.txt, .srt, .vtt) and/or YouTube links (one per line): how you or a creator you like talks.",
                                     )
                                     .weak(),
                                 );
                                 ui.horizontal(|ui| {
-                                    let b = ui.button("Add Transcripts…");
-                                    elems.push((format!("{p}.styleSources.add"), b.rect, "Add Transcripts…".into()));
+                                    let b = ui.button("Add Files…");
+                                    elems.push((format!("{p}.styleSources.add"), b.rect, "Add Files…".into()));
                                     if b.clicked() {
                                         pick = Some(Pick::StyleSources);
                                     }
@@ -4236,7 +4236,9 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             Pick::StyleSources => {
                 if let Some(f) = app.hooks.pick_files.as_mut() {
-                    for c in f(&["txt", "srt", "vtt"]) {
+                    // transcripts, or recordings (transcribed on this Mac)
+                    let exts: Vec<&str> = ["txt", "srt", "vtt"].into_iter().chain(AUDIO_EXT.iter().copied()).chain(VIDEO_EXT.iter().copied()).collect();
+                    for c in f(&exts) {
                         if !d.style_sources.contains(&c) {
                             d.style_sources.push(c);
                         }
@@ -4370,7 +4372,7 @@ fn learn_style_job(d: &Draft) -> Result<u64, String> {
     let mut sources: Vec<String> = d.style_sources.clone();
     sources.extend(d.style_links.lines().map(str::trim).filter(|l| l.starts_with("http")).map(str::to_string));
     if sources.is_empty() {
-        return Err("Add transcript files or YouTube links to learn from.".into());
+        return Err("Add recordings, transcript files or YouTube links to learn from.".into());
     }
     let mut args = vec!["script-style".to_string(), "--name".into(), name.to_string()];
     args.extend(sources);

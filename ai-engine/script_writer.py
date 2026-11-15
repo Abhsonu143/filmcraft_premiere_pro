@@ -179,6 +179,9 @@ def fetch_youtube(url: str, folder: Path) -> Path | None:
     return None
 
 
+MEDIA_EXT = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".opus", ".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+
+
 def load_sources(sources: list[str]) -> list[dict]:
     """Each source -> {name, text, cues (timed or [])}."""
     out = []
@@ -195,6 +198,11 @@ def load_sources(sources: list[str]) -> list[dict]:
             path = Path(s)
             if not path.is_file():
                 raise AutocutError(f"transcript not found: {s}")
+            if path.suffix.lower() in MEDIA_EXT:  # a recording: what is said in it, with timing (cached)
+                tr = ac.transcribe(str(path))
+                cues = [{"start": float(c["start"]), "end": float(c["end"]), "text": c["text"].strip()} for c in tr.get("segments", []) if c.get("text", "").strip()]
+                out.append({"name": path.name, "cues": cues, "text": " ".join(c["text"] for c in cues)})
+                continue
             raw = path.read_text(encoding="utf-8", errors="replace")
             if path.suffix.lower() in (".srt", ".vtt") or "-->" in raw[:2000]:
                 cues = parse_timed(raw)
@@ -557,7 +565,7 @@ def write_script(topic: str, out: str, *, niche: str = "", seconds: float = 60, 
 
 def add_args(sub, prefix: str = "") -> None:
     p = sub.add_parser(f"{prefix}style", help="learn a talking style from transcripts / YouTube links")
-    p.add_argument("sources", nargs="+", help=".txt / .srt / .vtt files or YouTube URLs")
+    p.add_argument("sources", nargs="+", help=".txt / .srt / .vtt files, audio or video recordings, or YouTube URLs")
     p.add_argument("--name", required=True)
     p = sub.add_parser(f"{prefix}write", help="write a voiceover script")
     p.add_argument("--topic", required=True)

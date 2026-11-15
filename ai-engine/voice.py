@@ -474,8 +474,72 @@ def ref_quality(f: dict, cer_: float | None = None) -> float:
     return round(max(0.0, q), 3)
 
 
+SEPARATE_BELOW = 20.0  # dB: a recording whose voice is less than this above the background has music under it
+SEPARATE_PIECE = 10.0  # seconds separated at a time (with 1 s of overlap), so memory stays ~0.5 GB
+
+
+def _separate_worker(items: list[tuple[str, str]]) -> list[bool]:
+    """Runs in its own process: the voice of each recording without its music (Hybrid Demucs, MIT,
+    via torchaudio), 10 seconds at a time with crossfaded overlaps."""
+    import os
+    import subprocess
+
+    import numpy as np
+    import soundfile as sf
+    import torch
+
+    try:
+        import certifi
+
+        os.environ.setdefault("SSL_CERT_FILE", certifi.where())  # (the model downloads once)
+    except ImportError:
+        pass
+    from torchaudio.pipelines import HDEMUCS_HIGH_MUSDB_PLUS as bundle
+
+    model = bundle.get_model().eval()
+    sr = bundle.sample_rate
+    vi = model.sources.index("vocals")
+    piece, lap = int(SEPARATE_PIECE * sr), sr
+    out = []
+    for k, (src, dst) in enumerate(items):
+        raw = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", src, "-vn", "-ac", "2", "-ar", str(sr), "-f", "f32le", "-"], capture_output=True).stdout
+        x = np.frombuffer(raw[: len(raw) // 8 * 8], np.float32).reshape(-1, 2).T
+        n = x.shape[1]
+        if n < sr:
+            out.append(False)
+            continue
+        voc = np.zeros((2, n), np.float32)
+        weight = np.zeros(n, np.float32)
+        a = 0
+        while a < n:
+            b = min(n, a + piece + lap)
+            seg = torch.from_numpy(x[:, a:b].copy())
+            m, sd = seg.mean(), seg.std().clamp(min=1e-6)
+            with torch.no_grad():
+                y = (model(((seg - m) / sd)[None])[0, vi] * sd + m).numpy()
+            w = np.ones(b - a, np.float32)
+            if a > 0:
+                w[: min(lap, b - a)] = np.linspace(0, 1, min(lap, b - a), dtype=np.float32)
+            if b < n:
+                w[-lap:] = np.minimum(w[-lap:], np.linspace(1, 0, lap, dtype=np.float32))
+            voc[:, a:b] += y * w
+            weight[a:b] += w
+            a += piece
+        sf.write(dst, (voc / np.maximum(weight, 1e-6)).T, sr)
+        out.append(True)
+        ac.stage_progress((k + 1) / len(items), f"took the music out of {k + 1}/{len(items)}")
+    return out
+
+
+def music_under(src: str, tmp: Path) -> float:
+    """How far (dB) the voice sits above the rest of a recording (low: music under it)."""
+    probe = tmp / "probe.wav"
+    clean_file(src, probe, denoise=False)
+    return float(features(read_wav(probe)).get("snr_db", 99))
+
+
 def enroll(name: str, files: list[str] | None = None, takes: list[dict] | None = None, languages: list[str] | None = None,
-           engine: str = DEFAULT_ENGINE, add: bool = False) -> dict:
+           engine: str = DEFAULT_ENGINE, add: bool = False, separate: str = "auto") -> dict:
     """Build (or extend) a voice profile from recordings of your voice.
     files: any audio/video of you talking.  takes: [{file, text, lang, emotion}] read from the prompts."""
     ac.require_tools()
@@ -504,11 +568,22 @@ def enroll(name: str, files: list[str] | None = None, takes: list[dict] | None =
             write_wav(dst, y)
             new.append({"file": dst.name, "text": tk["text"], "lang": tk.get("lang") or detect_lang(tk["text"]), "emotion": tk.get("emotion", "neutral"),
                         "source": Path(tk["file"]).name, "kind": "read"})
-        for src in files or []:  # free recordings: cut into phrases
+        for src in files or []:
             if not Path(src).is_file():
                 raise AutocutError(f"not found: {src}")
+        # recordings with music under the voice (YouTube videos, Shorts): the voice is taken out of
+        # them first, or most phrases fail the quality check and the clone copies the music
+        voiced = {}
+        if separate != "never" and files:
+            todo = [s for s in files if separate == "always" or music_under(s, Path(tmp)) < SEPARATE_BELOW]
+            if todo:
+                log(f"{len(todo)} of {len(files)} recording(s) have music under the voice: taking it out (once per recording)")
+                pairs = [(s, str(Path(tmp) / f"v{i}.wav")) for i, s in enumerate(todo)]
+                done = ac.run_isolated(_separate_worker, pairs)
+                voiced = {s: d for (s, d), ok in zip(pairs, done) if ok}
+        for src in files or []:  # free recordings: cut into phrases
             clean = Path(tmp) / f"c{len(new)}.wav"
-            clean_file(src, clean)
+            clean_file(voiced.get(src, src), clean)
             tr = ac.transcribe(str(clean), language=None)
             lang = tr.get("language") or "en"
             y = read_wav(clean)
@@ -1151,6 +1226,8 @@ def add_args(sub) -> None:
     p.add_argument("--languages", nargs="*")
     p.add_argument("--engine", default=DEFAULT_ENGINE, choices=list(ENGINES))
     p.add_argument("--add", action="store_true", help="add to an existing voice instead of replacing its references")
+    p.add_argument("--separate", default="auto", choices=["auto", "always", "never"],
+                   help="take background music out of the recordings first (auto: when there is music under the voice)")
     sub.add_parser("voice-list", help="saved voices")
     p = sub.add_parser("speak", help="speak a script (or text) with a cloned voice")
     p.add_argument("--voice", required=True)
@@ -1177,7 +1254,7 @@ def run_args(a) -> dict:
         return {"voices": list_voices(), "mac": list_mac_voices()}
     if a.cmd == "voice-enroll":
         takes = json.loads(Path(a.takes).read_text(encoding="utf-8")) if a.takes else None
-        return enroll(a.name, a.files, takes, a.languages, a.engine, a.add)
+        return enroll(a.name, a.files, takes, a.languages, a.engine, a.add, a.separate)
     if a.cmd == "speak":
         import score
 

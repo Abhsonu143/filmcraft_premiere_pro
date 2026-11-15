@@ -162,3 +162,15 @@ Only clone your own voice, or a voice you have permission to use.
 - **No repeats:** a shot that looks like the same scene as the one before it is avoided (CLIP picture similarity).
 - **Framing:** vertical and square crops follow the subject when the footage has another shape.
 - **Samples:** `~/Movies/EI/Voiceover/`, where `v1 before` is the previous editor and `v2`/`v3` are the new one.
+
+## Recordings with music under the voice
+
+YouTube videos and Shorts usually have music under the voice. When a recording's voice sits less than 20 dB above the rest (`SEPARATE_BELOW`), Voice Clone first takes the music out. It uses Hybrid Demucs (MIT, through torchaudio; the model downloads once, about 320 MB), 10 seconds at a time, in its own process. Only then does it cut the recording into phrases.
+
+`voice-enroll --separate auto|always|never` (default `auto`).
+
+Measured on 9 GTA Shorts (8 min): without separation, 12 phrases (1.4 min) passed the quality check. With it, 68 phrases (6.8 min) passed, and memory peaked at 1.5 GB.
+
+## Talking style from recordings
+
+Learn Style (Script ▸ Learn a style, or `script-style --name N <files>`) also takes audio and video recordings. They're transcribed on this Mac, and the pace is measured from their timing.
