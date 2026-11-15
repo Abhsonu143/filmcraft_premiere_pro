@@ -1,5 +1,34 @@
 # Progress
 
+## 2026-11-15: animated 3D character, step 2 (it performs the voiceover; in Video from Topic)
+
+- **The owner's brief:** toon look is fine but it must not look robotic; gestures and emotions matter most.
+- `character.py` (subcommand `character`, and `--character …` on `topic`): voice + its lines → the video with
+  the character, the character's own clip, and an editable plan (`<out>.character.json`).
+- **Lips:** word timings (Whisper, cached) → mouth shapes per sound, English and Hindi (Devanagari), lips closed
+  on m/b/p, opened by the voice's real loudness per frame, so the mouth shuts in every pause.
+- **Face:** each line's emotion (the 43 of `emotions.py`, by family) → a mix of expressions that swells at the
+  line's start and eases; brows lift on stressed words; blinks at phrase ends, some double.
+- **Body:** breathing, weight shifts, a head that never stops; nods on stressed words; a new head angle per line;
+  posture by emotion (sinks when sad, leans in when tense). Arms and head go through a spring (overshoot, settle).
+- **Gestures** (12): wave, namaste, point up, stop, shrug, open both arms, hand on chest, fist, think, explain,
+  present, beat. Chosen from the words (English, Hindi, Hinglish cues), the emotion, a question mark; the stroke
+  lands on the cue or stressed word; held through the phrase; a kind returns only after two others; size follows
+  the emotion and the Energy setting (calm, normal, energetic). The arm towards the picture presents.
+- **Hair and cloth swing** (`vrm.Rig`: VRM spring bones, 1.0 and 0.x; no colliders yet, so a strand's swing is
+  capped at 28°). **VRM constraints** (rotation, roll, aim) are followed (sleeves, twist bones).
+- **Looks:** `studio` (studio / room / colour / your picture behind it, in a circle with border and shadow),
+  `cutout` (stands on the bottom edge), `green` (separate green clip; the video still gets the cut-out unless
+  `--character-no-cutout`). Position: a corner or x/y; size: a share of the shorter side.
+- **Characters:** `character --add file.vrm [--name N]`, `--list`; kept in `Application Support/EI/characters/`.
+  The two VRM Consortium samples were added on this Mac as "Sample-A" and "Seed-san" (for testing; Seed-san
+  needs credit, which EI adds to description.txt).
+- **Topic:** the character is the last stage; the edit without it is kept as `<name>.no-character.mp4`.
+- **Measured** on a 62 s vertical topic video (1080×1920): 30–39 s for the character stage (1.6–2.1x real time),
+  peak memory footprint 0.43 GB including the 6 s Whisper pass. Tests: `tests/test_character.py`, `test_vrm.py`.
+- **Not yet:** the Character block in the dialogs and the Characters window (app side), colour tints in the UI,
+  other tools (voiceover edit, speak), spring colliders, finger-level gestures (counting).
+
 ## 2026-11-15: animated 3D character, step 1 (drawing a character)
 
 - **Plan:** an optional presenter (head to stomach) for Video from Topic and later the other tools: a VRM

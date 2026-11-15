@@ -11,7 +11,13 @@ bone) and face-shape weights, off screen, with toon shading, and returns RGBA by
 (premultiplied, bottom row first). Nothing here loads an AI model; a frame takes a few
 milliseconds.
 
-Not drawn (yet): hair/cloth physics (spring bones), outlines, MToon rim light and UV animation.
+`Rig` adds what makes it move like a body rather than a puppet: hair and loose cloth that swing
+and settle (VRM spring bones: each joint's tip keeps its momentum, is pulled back to its rest
+direction and down by gravity), and VRM constraints (a sleeve or a twist bone that follows the
+arm). It keeps the hair's state from frame to frame, so frames are stepped in order.
+
+Not done (yet): spring colliders (hair can pass through a shoulder on a big move), outlines, MToon
+rim light and UV animation.
 """
 
 from __future__ import annotations
@@ -59,6 +65,83 @@ def quat_to_mat(q) -> np.ndarray:
     return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
                      [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
                      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]], np.float64)
+
+
+def axis_angle(axis, angle: float) -> np.ndarray:
+    """3x3 rotation of `angle` radians about a unit axis."""
+    x, y, z = (float(v) for v in axis)
+    c, s_ = math.cos(angle), math.sin(angle)
+    t = 1 - c
+    return np.array([[t * x * x + c, t * x * y - s_ * z, t * x * z + s_ * y],
+                     [t * x * y + s_ * z, t * y * y + c, t * y * z - s_ * x],
+                     [t * x * z - s_ * y, t * y * z + s_ * x, t * z * z + c]], np.float64)
+
+
+def to_axis_angle(m: np.ndarray) -> tuple[np.ndarray, float]:
+    """(unit axis, angle 0..pi) of a rotation matrix."""
+    c = max(-1.0, min(1.0, (float(np.trace(m)) - 1.0) / 2.0))
+    ang = math.acos(c)
+    if ang < 1e-7:
+        return np.array([1.0, 0.0, 0.0]), 0.0
+    if math.pi - ang < 1e-4:  # half a turn: the axis is in the diagonal
+        d = np.sqrt(np.maximum((np.diag(m) + 1.0) / 2.0, 0.0))
+        k = int(np.argmax(d))
+        ax = d.copy()
+        for i in range(3):
+            if i != k and m[k, i] + m[i, k] < 0:
+                ax[i] = -ax[i]
+        n = np.linalg.norm(ax)
+        return (ax / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])), ang
+    ax = np.array([m[2, 1] - m[1, 2], m[0, 2] - m[2, 0], m[1, 0] - m[0, 1]]) / (2 * math.sin(ang))
+    n = np.linalg.norm(ax)
+    return (ax / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])), ang
+
+
+def scaled(m: np.ndarray, w: float) -> np.ndarray:
+    """A share `w` of rotation m (1 = all of it)."""
+    if abs(w - 1.0) < 1e-6:
+        return m
+    ax, ang = to_axis_angle(m)
+    return axis_angle(ax, ang * w)
+
+
+def from_to(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """The shortest rotation that turns direction a onto direction b."""
+    a = a / (np.linalg.norm(a) or 1.0)
+    b = b / (np.linalg.norm(b) or 1.0)
+    ax = np.cross(a, b)
+    n = float(np.linalg.norm(ax))
+    d = float(np.clip(a @ b, -1.0, 1.0))
+    if n < 1e-9:
+        if d > 0:
+            return np.eye(3)
+        o = np.cross(a, [1.0, 0.0, 0.0])
+        if np.linalg.norm(o) < 1e-6:
+            o = np.cross(a, [0.0, 1.0, 0.0])
+        return axis_angle(o / np.linalg.norm(o), math.pi)
+    return axis_angle(ax / n, math.atan2(n, d))
+
+
+def twist_about(m: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    """The part of rotation m that turns about `axis` (swing-twist split)."""
+    ax, ang = to_axis_angle(m)
+    q_xyz, q_w = ax * math.sin(ang / 2), math.cos(ang / 2)
+    p = float(q_xyz @ axis)
+    n = math.hypot(p, q_w)
+    if n < 1e-9:
+        return np.eye(3)
+    return axis_angle(axis, 2 * math.atan2(p / n, q_w / n))
+
+
+AXES = {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1), "PositiveX": (1, 0, 0), "NegativeX": (-1, 0, 0), "PositiveY": (0, 1, 0),
+        "NegativeY": (0, -1, 0), "PositiveZ": (0, 0, 1), "NegativeZ": (0, 0, -1)}
+
+
+def unit_rot(m: np.ndarray) -> np.ndarray:
+    """The rotation of a 4x4 or 3x3 matrix, without its scale."""
+    r = m[:3, :3]
+    sc = np.linalg.norm(r, axis=0)
+    return r / np.where(sc > 1e-9, sc, 1.0)
 
 
 class Model:
@@ -238,7 +321,11 @@ class Model:
     def world(self, pose: dict[str, np.ndarray], lift: dict[str, np.ndarray] | None = None) -> np.ndarray:
         """World matrix of every node for a pose (bone name -> 3x3 rotation in the character's
         space, on top of the rest pose). `lift`: bone name -> movement (metres)."""
-        n = len(self.parent)
+        r, t = self.posed(pose, lift)
+        return self.compose(r, t)
+
+    def posed(self, pose: dict[str, np.ndarray], lift: dict[str, np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Local rotation and position of every node for a pose."""
         r = self.r
         t = self.t
         if pose or lift:
@@ -252,6 +339,10 @@ class Model:
                 i = self.bones.get(name)
                 if i is not None:
                     t[i] = t[i] + self.parent_rot[i].T @ np.asarray(d, np.float64)
+        return r, t
+
+    def compose(self, r: np.ndarray, t: np.ndarray) -> np.ndarray:
+        n = len(self.parent)
         local = np.zeros((n, 4, 4))
         local[:, :3, :3] = r * self.s[:, None, :]
         local[:, :3, 3] = t
@@ -300,6 +391,140 @@ class Model:
         hips, spine = self.bone_pos("hips"), self.bone_pos("spine")
         low = float(spine[1]) if spine is not None else (float(hips[1]) + 0.1 if hips is not None else top - 0.6)
         return top, low, float(head[0])
+
+
+MAX_SPRING_JOINTS = 600
+MAX_SWING_COS = math.cos(math.radians(28))
+
+
+class Rig:
+    """A Model in motion: pose -> world matrices, with constraints followed and hair/cloth swinging."""
+
+    def __init__(self, model: Model, springs: bool = True):
+        self.m = model
+        n = len(model.parent)
+        nodes = model.j.get("nodes") or []
+        self.constraints: list[tuple[int, str, int, tuple, float]] = []
+        for i, nd in enumerate(nodes):
+            c = ((nd.get("extensions") or {}).get("VRMC_node_constraint") or {}).get("constraint") or {}
+            for kind in ("rotation", "roll", "aim"):
+                spec = c.get(kind)
+                if isinstance(spec, dict) and isinstance(spec.get("source"), int) and 0 <= spec["source"] < n:
+                    axis = AXES.get(str(spec.get("rollAxis") or spec.get("aimAxis") or "X"), (1, 0, 0))
+                    self.constraints.append((i, kind, int(spec["source"]), axis, float(min(1.0, max(0.0, spec.get("weight", 1.0))))))
+        self.joints: list[dict] = []
+        if springs:
+            self._springs()
+        self.started = False
+
+    def _springs(self) -> None:
+        m = self.m
+        n = len(m.parent)
+        ext = m.j.get("extensions") or {}
+        chains: list[list[tuple[int, dict]]] = []
+        if m.v1:
+            for sp in (ext.get("VRMC_springBone") or {}).get("springs") or []:
+                js = [(int(j["node"]), j) for j in sp.get("joints") or [] if isinstance(j.get("node"), int) and 0 <= j["node"] < n]
+                chains.append(js)
+        else:
+            kids: dict[int, list[int]] = {}
+            for i, p in enumerate(m.parent):
+                kids.setdefault(p, []).append(i)
+            for g in ((ext.get("VRM") or {}).get("secondaryAnimation") or {}).get("boneGroups") or []:
+                gd = g.get("gravityDir") or {}
+                # 0.x numbers are per second on another scale: brought to the 1.0 meaning
+                setting = {"stiffness": float(g.get("stiffiness", g.get("stiffness", 1.0))), "gravityPower": float(g.get("gravityPower", 0.0)),
+                           "gravityDir": [float(gd.get("x", 0)), float(gd.get("y", -1)), float(gd.get("z", 0))], "dragForce": float(g.get("dragForce", 0.4))}
+                for root in g.get("bones") or []:
+                    stack = [int(root)] if isinstance(root, int) and 0 <= root < n else []
+                    seen = 0
+                    while stack and seen < n:  # every branch below the root is its own chain
+                        chain, k = [], stack.pop()
+                        while k is not None and seen < n:
+                            seen += 1
+                            chain.append((k, setting))
+                            ch = kids.get(k) or []
+                            stack.extend(ch[1:])
+                            k = ch[0] if ch else None
+                        chains.append(chain)
+        for chain in chains:
+            for (i, js), (child, _) in zip(chain, chain[1:]):
+                if m.parent[child] != i or len(self.joints) >= MAX_SPRING_JOINTS:
+                    continue
+                axis = m.t[child] * m.s[i]
+                length = float(np.linalg.norm(m.rest_world[child][:3, 3] - m.rest_world[i][:3, 3]))
+                if np.linalg.norm(axis) < 1e-6 or length < 1e-5:
+                    continue
+                g = np.asarray(js.get("gravityDir", [0, -1, 0]), np.float64)[:3]
+                self.joints.append({"node": i, "child": child, "axis": axis / np.linalg.norm(axis), "len": length,
+                                    "stiff": float(js.get("stiffness", 1.0)), "drag": float(min(1.0, max(0.0, js.get("dragForce", 0.5)))),
+                                    "grav": g * float(js.get("gravityPower", 0.0)), "tail": None, "prev": None})
+
+    def step(self, pose: dict[str, np.ndarray], lift: dict[str, np.ndarray] | None = None, dt: float = 1 / 30) -> np.ndarray:
+        """World matrices for the next frame (dt seconds after the last one)."""
+        m = self.m
+        r, t = m.posed(pose, lift)
+        if not self.constraints and not self.joints:
+            return m.compose(r, t)
+        r = r.copy()
+        world = m.compose(r, t)
+        if self.constraints:
+            for i, kind, src, axis, w in self.constraints:
+                ax = np.asarray(axis, np.float64)
+                if kind == "aim":
+                    p = m.parent[i]
+                    pr = unit_rot(world[p]) if p >= 0 else m.root[:3, :3]
+                    cur = pr @ m.r[i]
+                    to = world[src][:3, 3] - world[i][:3, 3]
+                    if np.linalg.norm(to) > 1e-6:
+                        r[i] = pr.T @ scaled(from_to(cur @ ax, to), w) @ cur
+                else:
+                    d = m.r[src].T @ r[src]  # how far the source has turned from its rest pose
+                    r[i] = m.r[i] @ scaled(twist_about(d, ax) if kind == "roll" else d, w)
+            world = m.compose(r, t)
+        if self.joints:
+            dt = float(min(0.1, max(1e-3, dt)))
+            # the VRM numbers are tuned for 60 steps a second: step twice per video frame
+            steps = 2 if dt > 1 / 45 else 1
+            h = dt / steps
+            for j in self.joints:
+                i, p = j["node"], m.parent[j["node"]]
+                wp = world[p] if p >= 0 else m.root
+                pr = unit_rot(wp)
+                local = np.eye(4)
+                local[:3, :3] = r[i] * m.s[i][None, :]
+                local[:3, 3] = t[i]
+                wi = wp @ local
+                pos = wi[:3, 3]
+                rest_dir = pr @ m.r[i] @ j["axis"]  # where the bone points when nothing moves it
+                if j["tail"] is None or not self.started:
+                    j["tail"] = j["prev"] = pos + rest_dir * j["len"]
+                for _ in range(steps):
+                    nxt = j["tail"] + (j["tail"] - j["prev"]) * (1.0 - j["drag"]) + rest_dir * (j["stiff"] * h) + j["grav"] * h
+                    d = nxt - pos
+                    dn = float(np.linalg.norm(d))
+                    d = d / dn if dn > 1e-9 else rest_dir
+                    # no colliders yet: a strand may swing at most MAX_SWING from where it rests, so it
+                    # cannot fold through the head or the shoulders
+                    c = float(np.clip(d @ rest_dir, -1.0, 1.0))
+                    if c < MAX_SWING_COS:
+                        side = d - rest_dir * c
+                        sn = float(np.linalg.norm(side))
+                        d = rest_dir * MAX_SWING_COS + (side / sn if sn > 1e-9 else 0.0) * math.sqrt(1.0 - MAX_SWING_COS**2)
+                    nxt = pos + d * j["len"]
+                    j["prev"], j["tail"] = j["tail"], nxt
+                r[i] = pr.T @ from_to(rest_dir, nxt - pos) @ pr @ m.r[i]
+                # the next joint of the chain starts from this one's new place
+                local[:3, :3] = r[i] * m.s[i][None, :]
+                wi = wp @ local
+                c = j["child"]
+                lc = np.eye(4)
+                lc[:3, :3] = r[c] * m.s[c][None, :]
+                lc[:3, 3] = t[c]
+                world[i], world[c] = wi, wi @ lc
+            self.started = True
+            world = m.compose(r, t)
+        return world
 
 
 VERT = """
@@ -494,10 +719,13 @@ class Renderer:
         self.prog["u_light"].value = tuple(light / np.linalg.norm(light))
 
     def render(self, pose: dict[str, np.ndarray] | None = None, shapes: dict[str, float] | None = None,
-               lift: dict[str, np.ndarray] | None = None, background: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)) -> bytes:
-        """One frame as RGBA bytes (size x size, premultiplied alpha, bottom row first)."""
+               lift: dict[str, np.ndarray] | None = None, background: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+               world: np.ndarray | None = None) -> bytes:
+        """One frame as RGBA bytes (size x size, premultiplied alpha, bottom row first). `world`:
+        matrices from a Rig (hair in motion) instead of the plain pose."""
         gl, ctx = self.gl, self.ctx
-        world = self.m.world(pose or {}, lift)
+        if world is None:
+            world = self.m.world(pose or {}, lift)
         for sk in self.skins:
             mats = world[sk["joints"]] @ sk["ibm"]
             sk["tex"].write(mats.transpose(0, 2, 1).astype("f4").tobytes())

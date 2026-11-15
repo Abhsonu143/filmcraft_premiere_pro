@@ -20,6 +20,7 @@ Subcommands (all paths absolute or relative to the current folder):
               [--sound-design --music-source internet|folder|ai|none]   also "<O> - scored.wav": music per emotion, hits, risers
     download  URL [--audio-only] [--out-dir D] [--items 1-20]   a YouTube playlist/video, highest quality (or audio only)
     gameplay-plan RECORDINGS... --game G [--count 12] [--focus F] [--analyse-only]   what to publish from gameplay recordings
+    character --voice V --narration N [--video F] --out O [--character NAME] [--character-look studio|cutout|green]   an animated presenter
     package   --clips C... --topic T [--hook H | --find-hook] [--platforms youtube shorts instagram reels] [--languages en hi]
               thumbnails, titles, hooks and hashtags (a folder "<topic> - package")
     social    accounts | connect youtube|meta|threads … | post --video V --targets … [--package P] [--at T] | run-due | list
@@ -142,8 +143,10 @@ def run(argv: list[str]) -> dict:
     import yt_download
 
     yt_download.add_args(sub.add_parser("download", help="a YouTube playlist or video in the highest quality, or only its audio"))
+    import character
     import gameplay_plan
 
+    character.add_args(sub.add_parser("character", help="an animated 3D presenter that speaks a voiceover, over a video or as its own clip"))
     gameplay_plan.add_args(sub.add_parser("gameplay-plan", help="plan videos from a list of gameplay recordings (analysed once, kept next to them)"))
     import thumbnails
 
@@ -191,6 +194,8 @@ def run(argv: list[str]) -> dict:
         return thumbnails.run_args(a)
     if a.cmd == "gameplay-plan":
         return gameplay_plan.run_args(a)
+    if a.cmd == "character":
+        return character.run_args(a)
     if a.cmd == "voiceover":
         if getattr(a, "preset", None) == "short" and a.aspect == "horizontal":
             a.aspect = "vertical"

@@ -540,7 +540,8 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
          script_only: bool = False, style: str | None = None, writer: str = "claude", model: str | None = None, tone: str = "", niche: str = "",
          sources: list[str] | None = None, footage: list[str] | None = None, music: str | None = None, captions: bool = True,
          caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False, sound: dict | None = None,
-         resolution: str = "1080p", hook_line: str | None = None, find_hook: bool = False, hints: str = "", feedback: str = "") -> dict:
+         resolution: str = "1080p", hook_line: str | None = None, find_hook: bool = False, hints: str = "", feedback: str = "",
+         character: dict | None = None) -> dict:
     import script_writer as sw
 
     hints = (hints or "").strip()
@@ -568,7 +569,8 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
     if fb_items and re.search(r"\b(fact|facts|wrong|incorrect|outdated|old news|research|source|detail|details|accurate|more info|missing)\b", fb_text, re.I):
         research_hints = (hints + "\nFix what the creator said about the last version:\n" + fb_text).strip()
     ac.progress_plan({"research": 0.08, "hook": 0.02, "script": 0.03} if script_only else
-                     {"research": 0.06, "hook": 0.02, "script": 0.02, "voice": 0.42, "media": 0.13, "edit": 0.35})
+                     {"research": 0.06, "hook": 0.02, "script": 0.02, "voice": 0.42, "media": 0.13, "edit": 0.35 if not character else 0.28,
+                      **({"character": 0.07} if character else {})})
     # 1. research (kept in the folder: running the same topic again reuses it unless asked to refresh)
     rj = folder / "research.json"
     data = None
@@ -677,11 +679,33 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
                     hook="text" if hook_line and hook_line.strip() else "auto", screen_text=hook_line)
         state.mark("edit", "done")
         outputs.insert(0, str(video_out))
+        if character:  # 6. the animated presenter, over the finished edit (which is kept without it too)
+            import character as chm
+
+            with ac.stage("character"):
+                plain = video_out.with_name(f"{name}.no-character.mp4")
+                video_out.replace(plain)
+                try:
+                    cr = chm.add_to_video(str(plain), sp["outputs"][0], sp["narration"], str(video_out), character,
+                                          timeline=str(video_out.with_suffix(".narrate.json")) if video_out.with_suffix(".narrate.json").is_file() else None,
+                                          language=None if language == "hinglish" else language)
+                except Exception:
+                    if not video_out.is_file():  # the video is never lost to a character that failed
+                        plain.replace(video_out)
+                    raise
+                if not cr["video"]:  # a green-screen clip only: the video stays as it was
+                    plain.replace(video_out)
+                outputs += [x for x in cr["outputs"] if x != str(video_out)] + ([str(plain)] if plain.is_file() else [])
+                character_credit = cr.get("credit")
+        else:
+            character_credit = None
     (folder / "sources.md").write_text(sources_md(data, items, script), encoding="utf-8")
     desc = description_txt(data, items, script)
     music_credits = video_out.with_suffix(".credits.txt") if video_out else None
     if music_credits and music_credits.is_file():  # the score's free music must be credited too
         desc = desc.rstrip() + "\n" + music_credits.read_text(encoding="utf-8")
+    if not script_only and character_credit:
+        desc = desc.rstrip() + "\n" + character_credit + "\n"
     (folder / "description.txt").write_text(desc, encoding="utf-8")
     outputs += [str(folder / "sources.md"), str(folder / "description.txt")]
     log(f"done in {time.time() - t0:.0f}s: {folder}")
@@ -715,9 +739,11 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--find-hook", action="store_true", help="look online for hooks that work for this exact topic first")
     p.add_argument("--feedback", default="", help="what did not come out right last time (kept in the folder; every retry follows all of it)")
     p.add_argument("--hints", default="", help="what you are looking for: angles, facts to find, what to leave out, how it should come out (one per line)")
+    import character
     import score
 
     score.add_sound_args(p)
+    character.add_character_args(p)
 
 
 def run_args(a) -> dict:
@@ -730,7 +756,7 @@ def run_args(a) -> dict:
                 writer=a.writer, model=a.model, tone=a.tone, niche=a.niche, sources=a.sources, footage=footage, music=a.music,
                 captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, fresh=a.fresh,
                 sound=__import__("score").options(a), resolution=a.resolution, hook_line=a.hook_line, find_hook=a.find_hook,
-                hints=a.hints or "", feedback=a.feedback or "")
+                hints=a.hints or "", feedback=a.feedback or "", character=__import__("character").options(a))
 
 
 def main(argv: list[str] | None = None) -> int:
