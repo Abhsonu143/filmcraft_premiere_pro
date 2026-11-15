@@ -87,20 +87,21 @@ def resolve_inputs(items: list[str]) -> list[dict]:
             if name.endswith(".ei-analysis.json"):
                 a = json.loads(f.read_text(encoding="utf-8"))
                 video = Path(a.get("source", "")) if a.get("source") else None
-                key = str(f.resolve())
+                key = str(f.resolve())[: -len(".ei-analysis.json")]
                 entry = {"video": video if video and video.is_file() else None, "analysis": f, "srt": f.with_name(name.replace(".ei-analysis.json", ".ei.srt"))}
             elif f.suffix.lower() == ".srt":
                 stem = name[:-len(".ei.srt")] if name.endswith(".ei.srt") else f.stem
                 ana = f.with_name(stem + ".ei-analysis.json")
                 vid = next((f.with_name(stem + e) for e in (".mov", ".mp4", ".MOV", ".MP4", ".mkv") if f.with_name(stem + e).is_file()), None)
-                key = str(f.resolve())
+                key = str(f.resolve().with_name(stem))
                 entry = {"video": vid, "analysis": ana if ana.is_file() else None, "srt": f}
             elif f.suffix.lower() in VIDEO_EXT:
                 ana, srt, _ = sidecars(f)
-                key = str(f.resolve())
+                key = str(f.resolve().with_suffix(""))
                 entry = {"video": f.resolve(), "analysis": ana, "srt": srt}
             else:
                 continue
+            # (one recording given several ways, as its video, analysis and .srt, counts once)
             if key not in seen:
                 seen.add(key)
                 out.append(entry)

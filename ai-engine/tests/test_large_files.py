@@ -81,7 +81,10 @@ def test_planner_inputs_moments_and_plans(tmp_path):
     (tmp_path / "r1.ei-analysis.json").write_text(json.dumps(a))
     (tmp_path / "r1.ei.srt").write_text("1\n00:00:01,000 --> 00:00:02,500\nHello there\n\n2\n00:01:00,000 --> 00:01:03,000\nBye\n")
     ents = gp.resolve_inputs([str(tmp_path / "r1.ei-analysis.json"), str(tmp_path / "r1.ei.srt")])
-    assert len(ents) == 2 and ents[0]["analysis"].name == "r1.ei-analysis.json"
+    assert len(ents) == 1 and ents[0]["analysis"].name == "r1.ei-analysis.json"  # (its .json and .srt: one recording)
+    (tmp_path / "r2.ei.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\nHi\n")
+    two = gp.resolve_inputs([str(tmp_path / "r1.ei.srt"), str(tmp_path / "r2.ei.srt"), str(tmp_path / "r1.ei-analysis.json")])
+    assert [e["srt"].name for e in two] == ["r1.ei.srt", "r2.ei.srt"]
     assert [s["text"] for s in gp.srt_segments(tmp_path / "r1.ei.srt")] == ["Hello there", "Bye"]
     m = gp.moments(a)
     assert m["action"] and 85 <= m["action"][0]["start"] <= 130
