@@ -3508,6 +3508,7 @@
 	Import AI Queue Tasks	AIキューにタスクを読み込む
 	Export AI Queue	AIキューを書き出す
 	Move AI Queue Task	AIキューのタスクを移動
+	Remove AI Queue Task	AIキューのタスクを削除
 	AI Health	AIの状態
 	Based on FilmCraft…	FilmCraft について…
 	A video editor with local AI auto-editing, based on the open-source FilmCraft editor.	ローカル AI による自動編集を備えた、オープンソースの FilmCraft エディターをもとにした動画編集ソフトです。

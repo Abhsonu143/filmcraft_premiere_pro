@@ -32,7 +32,13 @@ Two jobs in the voice step at once (two models on 8 GB) made both crawl for a lo
   `{"ei_queue": 1, "tasks": [{"command": "ai.topic", "title": "…", "params": {…}}]}`. Each task is checked like
   its dialog would, a task already waiting is skipped, and problems are listed per task.
 - Control channel: `ai.<tool> {…, "queue": true}`, `ai.queueImport {path | tasks}`, `ai.queueExport {path?}`,
-  `ai.queueMove {index, to}`, `ai.queue {paused?}`, `ai.queueCancel {current?}`.
+  `ai.queueMove {index, to}`, `ai.queueRemove {index}` (one waiting task, 0 = next to run), `ai.queue {paused?}`,
+  `ai.queueCancel {current?}`.
+- (2026-11-15) The task the queue is running stays in `queue.json` (`"running"`), so it is not lost when EI is
+  killed or crashes: next time it is first in the queue, paused. Before, a started task was only on disk again
+  after a clean quit, and when it was the last one the file was deleted. Cancelling the queue writes the removed
+  tasks to `~/Movies/EI/Queue/cancelled-<time>.queue.json` (Import Tasks brings them back).
+- (2026-11-15) Plan Videos keeps to the ticked platforms (a Shorts + Reels run had returned 3 YouTube plans).
 - The 6 waiting videos of 2026-11-13 were exported (without stopping the running ones) to
   `~/Movies/EI/Queue/queue-export-2026-11-13-2355.json`, and all 6 pass the import check.
 

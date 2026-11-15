@@ -2566,6 +2566,8 @@ fn next_uid() -> u64 {
 #[derive(Default)]
 struct QueueState {
     items: Vec<QueueItem>,
+    /// The task the queue is running now: kept in the file, so it is not lost when EI is killed.
+    running: Option<QueueItem>,
     paused: bool,
     loaded: bool,
     note: String,
@@ -2581,31 +2583,46 @@ fn queue_path() -> PathBuf {
 }
 
 fn save_queue(q: &QueueState) {
-    let path = queue_path();
-    if q.items.is_empty() {
-        let _ = std::fs::remove_file(&path);
+    save_queue_to(q, &queue_path());
+}
+
+fn save_queue_to(q: &QueueState, path: &Path) {
+    // a queue that was never read from the file knows nothing: it must not replace or delete the file
+    if !q.loaded {
+        return;
+    }
+    if q.items.is_empty() && q.running.is_none() {
+        let _ = std::fs::remove_file(path);
         return;
     }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(t) = serde_json::to_string_pretty(&json!({"items": q.items, "paused": q.paused})) {
+    if let Ok(t) = serde_json::to_string_pretty(&json!({"items": q.items, "running": q.running, "paused": q.paused})) {
         let tmp = path.with_extension("json.part");
         if std::fs::write(&tmp, t).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+            let _ = std::fs::rename(&tmp, path);
         }
     }
 }
 
 /// The queue saved when EI last quit (paused: it waits for Resume).
 fn load_queue(q: &mut QueueState) {
+    load_queue_from(q, &queue_path());
+}
+
+fn load_queue_from(q: &mut QueueState, path: &Path) {
     if q.loaded {
         return;
     }
     q.loaded = true;
-    let Ok(t) = std::fs::read_to_string(queue_path()) else { return };
+    let Ok(t) = std::fs::read_to_string(path) else { return };
     let Ok(v) = serde_json::from_str::<Value>(&t) else { return };
-    let items: Vec<QueueItem> = v.get("items").and_then(|i| serde_json::from_value(i.clone()).ok()).unwrap_or_default();
+    let mut items: Vec<QueueItem> = v.get("items").and_then(|i| serde_json::from_value(i.clone()).ok()).unwrap_or_default();
+    // a task that was running when EI was killed goes first (it continues from its saved stages)
+    if let Some(it) = v.get("running").and_then(|i| serde_json::from_value::<QueueItem>(i.clone()).ok()) {
+        items.insert(0, it);
+    }
     if !items.is_empty() {
         q.note = format!("{} task(s) waiting from last time: press Resume Queue to continue", items.len());
         q.items = items
@@ -2756,8 +2773,11 @@ fn check_tasks(v: &Value) -> Vec<Result<CheckedTask, String>> {
 fn export_tasks() -> Value {
     let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
     load_queue(&mut q);
-    let tasks: Vec<Value> = q
-        .items
+    tasks_file(&q.items)
+}
+
+fn tasks_file(items: &[QueueItem]) -> Value {
+    let tasks: Vec<Value> = items
         .iter()
         .map(|it| json!({"command": format!("ai.{}", it.kind), "title": it.title, "params": it.params.clone().unwrap_or(Value::Null), "args": item_args(it)}))
         .collect();
@@ -2767,11 +2787,24 @@ fn export_tasks() -> Value {
 /// Move a waiting task: `to` is its new position (0 = next to run).
 fn move_waiting(from: usize, to: usize) -> bool {
     let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+    load_queue(&mut q);
     let ok = move_in(&mut q.items, from, to);
     if ok {
         save_queue(&q);
     }
     ok
+}
+
+/// Take one waiting task out of the queue (0 = next to run). Returns its title.
+fn remove_waiting(index: usize) -> Option<String> {
+    let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+    load_queue(&mut q);
+    if index >= q.items.len() {
+        return None;
+    }
+    let it = q.items.remove(index);
+    save_queue(&q);
+    Some(it.title)
 }
 
 fn move_in<T>(v: &mut Vec<T>, from: usize, to: usize) -> bool {
@@ -2790,10 +2823,14 @@ fn tick_queue() {
     let next = {
         let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
         load_queue(&mut q);
+        if !busy && q.running.take().is_some() {
+            save_queue(&q); // the queue's job ended
+        }
         if busy || q.paused || q.items.is_empty() {
             return;
         }
         let it = q.items.remove(0);
+        q.running = Some(it.clone());
         save_queue(&q);
         it
     };
@@ -2807,7 +2844,11 @@ fn tick_queue() {
 fn cancel_queue(include_current: bool) -> usize {
     let n = {
         let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
+        load_queue(&mut q);
         let n = q.items.len();
+        if n > 0 {
+            keep_cancelled(&tasks_file(&q.items));
+        }
         q.items.clear();
         q.note.clear();
         save_queue(&q);
@@ -2821,6 +2862,17 @@ fn cancel_queue(include_current: bool) -> usize {
         }
     }
     n
+}
+
+/// The tasks a cancel removed, kept as a queue file in Movies/EI/Queue (Import Tasks brings them back).
+fn keep_cancelled(tasks: &Value) {
+    let dir = movies_dir().join("Queue");
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if std::fs::create_dir_all(&dir).is_ok()
+        && let Ok(t) = serde_json::to_string_pretty(tasks)
+    {
+        let _ = std::fs::write(dir.join(format!("cancelled-{secs}.queue.json")), t);
+    }
 }
 
 /// EI is quitting: a queued job that is still running goes back to the front of the saved queue
@@ -2846,8 +2898,14 @@ fn requeue_running() {
     }
     let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
     load_queue(&mut q);
-    for (k, it) in running.into_iter().enumerate() {
-        q.items.insert(k, it);
+    // the saved task has the dialog's settings; the job's own copy is the fallback
+    match q.running.take() {
+        Some(it) => q.items.insert(0, it),
+        None => {
+            for (k, it) in running.into_iter().enumerate() {
+                q.items.insert(k, it);
+            }
+        }
     }
     save_queue(&q);
 }
@@ -3061,6 +3119,12 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
         "ai.queueMove" => match (params.get("index").and_then(Value::as_u64), params.get("to").and_then(Value::as_u64)) {
             (Some(i), Some(t)) => Ok(json!({"moved": move_waiting(i as usize, t as usize)})),
             _ => Err("ai.queueMove needs {index, to} (0 = next to run)".into()),
+        },
+        "ai.queueRemove" => match params.get("index").and_then(Value::as_u64) {
+            Some(i) => remove_waiting(usize::try_from(i).unwrap_or(usize::MAX))
+                .map(|t| json!({"removed": t}))
+                .ok_or_else(|| "no waiting task at that index".to_string()),
+            None => Err("ai.queueRemove needs {index} (0 = next to run)".into()),
         },
         "ai.queueCancel" => {
             let all = params.get("current").and_then(Value::as_bool).unwrap_or(false);
@@ -5136,7 +5200,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut import: Option<u64> = None;
     let mut copy: Option<String> = None;
     let mut queue_action: Option<&str> = None;
-    let mut remove_waiting: Option<usize> = None;
+    let mut remove_task: Option<usize> = None;
     let mut move_item: Option<(usize, usize)> = None;
     let mut edit_item: Option<u64> = None;
     let mut import_file = false;
@@ -5209,7 +5273,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         let r = ui.small_button("Remove");
                         elems.push((format!("{id}.remove"), r.rect, "Remove".into()));
                         if r.clicked() {
-                            remove_waiting = Some(k);
+                            remove_task = Some(k);
                         }
                     });
                 }
@@ -5425,12 +5489,8 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
             };
         }
     }
-    if let Some(k) = remove_waiting {
-        let mut q = queue().lock().unwrap_or_else(PoisonError::into_inner);
-        if k < q.items.len() {
-            q.items.remove(k);
-            save_queue(&q);
-        }
+    if let Some(k) = remove_task {
+        remove_waiting(k);
     }
     match queue_action {
         Some("pause") | Some("resume") => {
@@ -6067,6 +6127,35 @@ mod tests {
                 Err(e) => panic!("{e}"),
             }
         }
+    }
+
+    #[test]
+    fn the_running_task_survives_a_killed_ei() {
+        let dir = std::env::temp_dir().join(format!("ei-queue-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.json");
+        let item =
+            |t: &str| QueueItem { title: t.into(), kind: "talk".into(), steps: vec![], import: true, cwd: None, params: Some(json!({"input": t})), uid: 0 };
+        // the last waiting task has started: nothing waits, and the file still holds the task
+        let q = QueueState { running: Some(item("a")), loaded: true, ..Default::default() };
+        save_queue_to(&q, &path);
+        let mut back = QueueState::default();
+        load_queue_from(&mut back, &path);
+        assert_eq!(back.items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert!(back.paused && back.running.is_none());
+        // with tasks waiting, it goes back in front of them
+        let q = QueueState { items: vec![item("b")], running: Some(item("a")), loaded: true, ..Default::default() };
+        save_queue_to(&q, &path);
+        let mut back = QueueState::default();
+        load_queue_from(&mut back, &path);
+        assert_eq!(back.items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        // a queue that never read the file leaves it alone
+        save_queue_to(&QueueState::default(), &path);
+        assert!(path.is_file());
+        // nothing waiting or running: no file
+        save_queue_to(&QueueState { loaded: true, ..Default::default() }, &path);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

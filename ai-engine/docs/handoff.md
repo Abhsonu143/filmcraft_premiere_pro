@@ -67,7 +67,8 @@ Driving the app, using the helper scripts in the session scratchpad (recreate th
   - `ai.queue {"paused":bool}`
   - `ai.queueImport {"path":…}`
   - `ai.queueExport`
-  - `ai.queueCancel {"current":bool}`. This removes **every** waiting task, and with `current:true` it also stops the running job. There's no per-task removal; to keep some tasks, quit EI and edit `queue.json`.
+  - `ai.queueCancel {"current":bool}`. This removes **every** waiting task, and with `current:true` it also stops the running job. The removed tasks are kept in `~/Movies/EI/Queue/cancelled-<time>.queue.json` (after the next rebuild).
+  - `ai.queueRemove {"index":n}` removes one waiting task, 0 = next to run (after the next rebuild).
   - `ai.editJob`
 - Headless UI tests render to PNG with `FILMCRAFT_UI_SNAPSHOT_DIR=<dir> cargo test -p filmcraft-ui-egui --test ai_ui`. Use this to look at dialogs when the display is asleep.
 
@@ -252,6 +253,16 @@ Older offers not yet taken up:
 - Re-render old TV Light Sync videos with the new look.
 - An optional Thumbcraft backend.
 - Topic sound design sometimes picks comedic music.
+
+### Update, 2026-11-15 afternoon (second session)
+
+- **Item 1 done.** Shorts and Reels plans made from the 7 analysed recordings (engine run directly, 0 new analysis). `plans.md` / `plans.json` now hold 17 plans: the 5 story episodes, plus 7 Shorts, 2 Reels and 3 YouTube plans that slipped in although only Shorts and Reels were asked for. The earlier plans are in `plans.before-shorts-2026-11-15.*` in the same folder.
+- **Planner keeps to the ticked platforms** (prompt and `clean_plans`), so that can't happen again.
+- **Items 3 and 4 done in code, not yet in the installed app (needs a rebuild; ask first):**
+  - The running task is saved in `queue.json` as `"running"` and comes back first, paused, if EI is killed. A queue that hasn't read the file can no longer delete it. Cancelling writes a `cancelled-<time>.queue.json`.
+  - `ai.queueRemove {index}`.
+  - What is still not proven is why the file vanished at 01:56. The known hole was: a started task was only in the file after a clean quit, and the file was deleted when nothing else waited.
+- Still open: items 2, 5, 6, 7.
 
 Keep in mind:
 - The owner's display often sleeps; use headless UI snapshots.
