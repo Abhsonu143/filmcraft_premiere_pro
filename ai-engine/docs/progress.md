@@ -1,5 +1,21 @@
 # Progress
 
+## 2026-11-15: animated 3D character, step 1 (drawing a character)
+
+- **Plan:** an optional presenter (head to stomach) for Video from Topic and later the other tools: a VRM
+  character, lips from the voice's word timings, expressions from each script line's emotion, shown in a circle
+  with a studio behind it, as a cut-out, or on green. Built as its own module so any tool can add it.
+- **Done:** `vrm.py` reads a VRM character (1.0 and 0.x, which VRoid Studio exports) and draws it off screen on
+  the GPU (`moderngl`, MIT): skinned body, face shapes (5 mouth vowels, blink, 5 expressions), toon shading,
+  see-through parts, head-to-stomach camera, colour tint per part (hair, skin, eyes, clothes).
+- **Measured** (720×720, 4x anti-aliasing, including the H.264 encode): 376–415 frames per second (about 13x
+  real time), peak memory footprint 215–270 MB. No AI model is loaded.
+- Tested with the two VRM Consortium sample characters (VRM Public License 1.0; downloaded for the test, not in
+  the repo).
+- **Not yet:** lip sync and expressions from a real voiceover, gestures, the studio/circle/green outputs, the
+  overlay, the Topic option and dialog, the Characters window. Hair and cloth do not swing (no spring bones), and
+  parts driven by VRM "constraints" stay in the rest pose (the pixiv sample's sleeves).
+
 ## 2026-11-15: short clips, joins that are not noticed and a livelier edit
 
 - **Why:** every join inside an action clip was a hard cut, in picture and in sound (only a 30 ms fade), so

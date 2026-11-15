@@ -28,3 +28,5 @@ soundfile>=0.12
 # thumbnails designed from scratch: backgrounds by a local image model (LCM Dreamshaper v7, MIT)
 diffusers>=0.32
 accelerate
+# animated 3D character: off-screen drawing on the Mac's GPU (MIT; no AI model)
+moderngl>=5.10
