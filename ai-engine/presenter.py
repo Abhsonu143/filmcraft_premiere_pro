@@ -134,6 +134,66 @@ def lines_of(video: Path, *, max_words: int = MAX_WORDS, listen: bool = True) ->
     return voice, out
 
 
+def face_boxes(images: list[Path]) -> list[tuple[float, float, float, float] | None]:
+    """The biggest face in each picture as (left, top, right, bottom) in fractions of the picture, or None.
+    (Apple's Vision, on this Mac; None for all when it is not there.)"""
+    try:
+        import objc
+        import Vision
+        from Foundation import NSURL
+    except ImportError:
+        return [None] * len(images)
+    out = []
+    for p in images:
+        box = None
+        with objc.autorelease_pool():
+            h = Vision.VNImageRequestHandler.alloc().initWithURL_options_(NSURL.fileURLWithPath_(str(p)), None)
+            rq = Vision.VNDetectFaceRectanglesRequest.alloc().init()
+            ok = h.performRequests_error_([rq], None)
+            if ok[0] if isinstance(ok, tuple) else ok:
+                best = 0.0
+                for r in rq.results() or []:
+                    b = r.boundingBox()
+                    if float(b.size.width * b.size.height) > best:
+                        best = float(b.size.width * b.size.height)
+                        box = (float(b.origin.x), float(1 - b.origin.y - b.size.height), float(b.origin.x + b.size.width), float(1 - b.origin.y))
+        out.append(box)
+    return out
+
+
+def framing_advice(boxes: list[tuple[float, float, float, float] | None]) -> str | None:
+    """What to change about how the camera sees you, from the face found in a few frames of a take
+    (None: it is fine). The presenter is shown from the shoulders up, and the lips must be seen."""
+    found = [b for b in boxes if b]
+    if not boxes:
+        return None
+    if len(found) * 2 < len(boxes):
+        return "Your whole face is not in the picture (the mouth or chin may be cut off). Tilt the screen or move back until your face and shoulders are inside the outline."
+    top = sorted(b[1] for b in found)[len(found) // 2]
+    bottom = sorted(b[3] for b in found)[len(found) // 2]
+    if bottom > 0.82:
+        return "Your chin is at the bottom edge. Tilt the screen down or sit higher, so your shoulders are in the picture too."
+    if top < 0.04:
+        return "The top of your head is cut off. Tilt the screen up or move back a little."
+    if bottom - top < 0.16:
+        return "You are far from the camera. Come closer, so your face fills the outline."
+    return None
+
+
+def check_take(path: Path) -> str | None:
+    """Look at a few frames of a take and say what is wrong with the framing, if anything."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="ei-take-") as tmp:
+        r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(path), "-vf", "fps=1,scale=640:-2", "-frames:v", "4", str(Path(tmp) / "f%d.jpg")],
+                           capture_output=True)
+        frames = sorted(Path(tmp).glob("f*.jpg"))
+        if r.returncode != 0 or not frames:
+            return None
+        return framing_advice(face_boxes(frames))
+
+
 class Session:
     """The takes recorded for one video. Saved after every change."""
 
@@ -188,6 +248,11 @@ class Session:
             os.replace(tmp, folder / name)
             take = {"file": name, "n": n, "seconds": round(float(seconds), 2) if seconds and seconds > 0 else None, "at": int(time.time()),
                     "text": "" if key == IDLE else self.lines[int(key)]["text"]}
+            try:
+                take["advice"] = check_take(folder / name)
+            except Exception as e:  # noqa: BLE001 (a take is never lost to the check)
+                log(f"presenter: the framing of {name} could not be checked ({e})")
+                take["advice"] = None
             self.takes[key] = take
             self.save()
         return take
@@ -312,6 +377,15 @@ def make_handler(session: Session, token: str, stop: threading.Event):
                 if m:
                     session.forget(m.group(1))
                     return self._json({"session": session.state()})
+                if u.path == "/api/framing":  # one picture from the live camera: is the face framed well?
+                    import tempfile
+
+                    if not body or len(body) > 4 * 1024 * 1024:
+                        return self._json({"advice": None})
+                    with tempfile.NamedTemporaryFile(suffix=".jpg") as tf:
+                        tf.write(body)
+                        tf.flush()
+                        return self._json({"advice": framing_advice(face_boxes([Path(tf.name)]))})
                 if u.path == "/api/done":
                     self._json({"ok": True})
                     stop.set()

@@ -147,3 +147,13 @@ def test_long_lines_become_parts_in_the_session(tmp_path):
     assert s.lines[0]["start"] == 0.0 and s.lines[0]["end"] == s.lines[1]["start"] and s.lines[1]["end"] == 6.0
     s.add_take("0", b"x", "webm")
     assert s.recorded_until() == s.lines[0]["end"]
+
+
+def test_framing_advice():
+    good = (0.4, 0.25, 0.6, 0.6)
+    assert pr.framing_advice([good, good, None]) is None and pr.framing_advice([]) is None
+    assert "not in the picture" in pr.framing_advice([None, None, good])
+    assert "chin" in pr.framing_advice([(0.4, 0.5, 0.6, 0.9)] * 3)
+    assert "top of your head" in pr.framing_advice([(0.4, 0.01, 0.6, 0.4)] * 3)
+    assert "closer" in pr.framing_advice([(0.45, 0.4, 0.55, 0.5)] * 3)
+

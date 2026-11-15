@@ -24,6 +24,8 @@ PAGE = r"""<!doctype html>
   .stage video.mirror { transform:scaleX(-1); }
   .badge { position:absolute; top:10px; left:10px; background:rgba(0,0,0,.6); padding:4px 10px; border-radius:99px; font-size:13px; font-variant-numeric:tabular-nums; }
   .badge.rec::before { content:""; display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--rec); margin-right:6px; }
+  .guide { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; opacity:.55; }
+  .advice { position:absolute; left:10px; right:10px; top:44px; background:rgba(245,185,66,.95); color:#201500; padding:8px 12px; border-radius:8px; font-weight:600; display:none; }
   .count { position:absolute; inset:0; display:none; align-items:center; justify-content:center; font-size:120px; font-weight:700; background:rgba(0,0,0,.35); }
   .level { position:absolute; left:10px; right:10px; bottom:10px; height:5px; background:rgba(255,255,255,.15); border-radius:3px; overflow:hidden; }
   .level i { display:block; height:100%; width:0; background:var(--ok); }
@@ -48,6 +50,7 @@ PAGE = r"""<!doctype html>
   .item.cur { border-color:var(--accent); background:#222733; }
   .item .dot { width:18px; height:18px; border-radius:50%; border:2px solid var(--line); margin-top:1px; font-size:11px; display:flex; align-items:center; justify-content:center; }
   .item.done .dot { background:var(--ok); border-color:var(--ok); color:#06301f; }
+  .item.warn .dot { background:var(--warn); border-color:var(--warn); color:#201500; }
   .item .t { overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
   .item .s { color:var(--dim); font-variant-numeric:tabular-nums; }
   .note { color:var(--dim); font-size:12.5px; }
@@ -65,6 +68,11 @@ PAGE = r"""<!doctype html>
     <div class="stage" id="stage">
       <video id="live" class="mirror" autoplay muted playsinline></video>
       <video id="review" playsinline controls style="display:none"></video>
+      <svg class="guide" id="guide" viewBox="0 0 160 90" preserveAspectRatio="none">
+        <ellipse cx="80" cy="36" rx="15" ry="20" fill="none" stroke="#fff" stroke-width="0.5" stroke-dasharray="2 1.5"/>
+        <path d="M44 90 C46 66 62 62 80 62 C98 62 114 66 116 90" fill="none" stroke="#fff" stroke-width="0.5" stroke-dasharray="2 1.5"/>
+      </svg>
+      <div class="advice" id="advice"></div>
       <div class="badge" id="badge">camera</div>
       <div class="count" id="count"></div>
       <div class="level"><i id="level"></i></div>
@@ -126,14 +134,14 @@ function draw() {
   } else {
     $("where").textContent = `${cur + 1} of ${S.lines.length}` + (l.parts > 1 ? ` · part ${l.part} of ${l.parts} of this sentence` : "") + ` · the voice takes ${fmt(l.seconds)}` + (l.emotion ? ` · ${l.emotion}` : "");
     $("say").textContent = l.text;
-    $("hint").textContent = l.take ? `Recorded (take ${l.take.n}${l.take.seconds ? ", " + fmt(l.take.seconds) : ""}). Record again to replace it.` : "Say it at the voice's pace, looking at the camera.";
+    $("hint").textContent = l.take && l.take.advice ? "Recorded, but the framing was off: " + l.take.advice : l.take ? `Recorded (take ${l.take.n}${l.take.seconds ? ", " + fmt(l.take.seconds) : ""}). Record again to replace it.` : "Say it at the voice's pace, looking at the camera.";
   }
   const list = $("list");
   list.innerHTML = "";
   S.lines.forEach((x, i) => {
     const d = document.createElement("div");
-    d.className = "item" + (x.take ? " done" : "") + (i === cur && mode === "line" ? " cur" : "");
-    d.innerHTML = `<span class="dot">${x.take ? "✓" : ""}</span><span class="t"></span><span class="s">${fmt(x.seconds)}</span>`;
+    d.className = "item" + (x.take ? (x.take.advice ? " warn" : " done") : "") + (i === cur && mode === "line" ? " cur" : "");
+    d.innerHTML = `<span class="dot">${x.take ? (x.take.advice ? "!" : "✓") : ""}</span><span class="t"></span><span class="s">${fmt(x.seconds)}</span>`;
     d.querySelector(".t").textContent = x.text;
     d.onclick = () => { if (!recording()) go(i); };
     list.appendChild(d);
@@ -158,8 +166,25 @@ function buttons() {
   $("stage").classList.toggle("rec", !!r);
 }
 
+function advise(text) {
+  $("advice").textContent = text || ""; $("advice").style.display = text ? "block" : "none";
+}
+
+// every few seconds, while not recording: is the face framed well? (one small picture to EI on this Mac)
+async function framing() {
+  if (!stream || recording() || busy || $("live").style.display === "none" || !$("live").videoWidth) return;
+  try {
+    const c = document.createElement("canvas"); c.width = 640; c.height = Math.round(640 * $("live").videoHeight / $("live").videoWidth);
+    c.getContext("2d").drawImage($("live"), 0, 0, c.width, c.height);
+    const b = await new Promise(res => c.toBlob(res, "image/jpeg", 0.8));
+    const j = await (await fetch(api("/api/framing"), { method: "POST", body: b })).json();
+    if (!recording()) advise(j.advice);
+  } catch (e) {}
+}
+setInterval(framing, 3000);
+
 function showLive() {
-  $("review").pause(); $("review").style.display = "none"; $("live").style.display = "block";
+  $("review").pause(); $("review").style.display = "none"; $("live").style.display = "block"; $("guide").style.display = "block";
   $("badge").className = "badge"; $("badge").textContent = "camera";
 }
 
@@ -192,7 +217,7 @@ function mime() {
 
 async function start() {
   if (!stream || busy || recording()) return;
-  busy = true; blob = null; showLive(); buttons();
+  busy = true; blob = null; showLive(); advise(""); buttons();
   if (mode === "line" && $("hearfirst").checked && !$("along").checked) await hear();
   await countdown();
   chunks = [];
@@ -204,7 +229,7 @@ async function start() {
     blobSeconds = (performance.now() - t0) / 1000;
     blob = new Blob(chunks, { type: rec.mimeType || m || "video/webm" });
     const v = $("review");
-    v.src = URL.createObjectURL(blob); v.style.display = "block"; $("live").style.display = "none"; v.play().catch(() => {});
+    v.src = URL.createObjectURL(blob); v.style.display = "block"; $("live").style.display = "none"; $("guide").style.display = "none"; advise(""); v.play().catch(() => {});
     $("badge").className = "badge"; $("badge").textContent = "your take · " + fmt(blobSeconds);
     if (mode === "line") {
       const want = S.lines[cur].seconds, off = blobSeconds / want;
@@ -238,9 +263,11 @@ async function keep() {
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || r.status);
     S = j.session;
-    $("status").textContent = `Saved ${j.take.file}.`;
+    $("status").className = j.take.advice ? "note err" : "note";
+    $("status").textContent = `Saved ${j.take.file}.` + (j.take.advice ? " But: " + j.take.advice + " Fix it and record this one again." : "");
     blob = null; busy = false;
-    if (mode === "idle") { mode = "line"; go(cur); }
+    if (j.take.advice) { showLive(); draw(); }  // stay on this line: it should be recorded again
+    else if (mode === "idle") { mode = "line"; go(cur); }
     else { const nxt = S.lines.findIndex((l, i) => i > cur && !l.take); go(nxt < 0 ? Math.min(cur + 1, S.lines.length - 1) : nxt); }
   } catch (e) {
     busy = false; $("status").className = "note err"; $("status").textContent = "The take was not saved: " + e.message + ". It is still here: try Keep again."; buttons();
