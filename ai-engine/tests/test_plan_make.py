@@ -87,15 +87,44 @@ def test_a_plan_becomes_a_video(tmp_path, monkeypatch):
     r = pm.make(str(pj), pick="2", writer="rules")  # a Short: vertical, with the hook and captions
     out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", r["outputs"][0]], capture_output=True, text=True).stdout
     assert out.strip() == "1080,1920" and r["seconds"] == pytest.approx(17.2, abs=0.2)
+    # a caption correction is kept in the plan and made in every later make
+    monkeypatch.setattr(pm, "check_captions", lambda video, cues, lang, hint="": {"lines": len(cues), "found": len(cues), "worst": 0.1, "late": 0, "which": [], "moves": []})
+    with pytest.raises(AutocutError, match="=>"):
+        pm.make(str(pj), pick="2", writer="rules", caption_fix="no arrow here")
+    r = pm.make(str(pj), pick="2", writer="rules", caption_fix="hello there => Hi there, old")
+    assert "Hi there, old friend." in " ".join(c["text"] for c in pm.read_srt(pm.Path(r["srt"])))
+    r = pm.make(str(pj), pick="2", writer="rules")  # (still there without being said again)
+    assert "Hi there, old friend." in " ".join(c["text"] for c in pm.read_srt(pm.Path(r["srt"]))) and json.loads(pj.read_text())["plans"][1]["caption_fixes"] == [{"wrong": "hello there", "right": "Hi there, old"}]
+    # the finished video is checked without making anything
+    c = pm.check_video(str(pj), pick="2")
+    report = pm.Path(c["outputs"][0]).read_text()
+    assert c["problems"] == [] and c["captions"] >= 1 and "No problems found" in report and "Hi there, old friend." in report
+    monkeypatch.setattr(pm, "check_captions", lambda video, cues, lang, hint="": {"lines": 2, "found": 2, "worst": 1.4, "late": 1, "which": ["3.0s “Hi there” +1.4s"], "moves": []})
+    c = pm.check_video(str(pj), pick="2")
+    assert len(c["problems"]) == 1 and "1.4" in c["problems"][0] and "PROBLEMS" in pm.Path(c["outputs"][0]).read_text()
+    # saying what is wrong: Claude corrects the plan (pieces, teaser, caption words), the note is kept
+    monkeypatch.setattr(pm.gp, "research_game", lambda game, writer="claude", fresh=False: {"summary": "s"})
+    asked = []
+    monkeypatch.setattr(sw, "ask_claude", lambda prompt, model=None, timeout=600: (asked.append(prompt), json.dumps(
+        {"cuts": [{"part": 1, "start": "0:00:05", "end": "0:00:11", "note": "only the hello"}], "hook": "none", "captions": [{"wrong": "friend", "right": "Friend"}], "did": "Kept only the hello."}
+        if "found something wrong" in prompt else {"lines": []}))[1])
+    r = pm.make(str(pj), pick="2", fix="the second part is boring, drop it; no teaser; Friend is a name", cuts_only=True)
+    fixed = json.loads(pj.read_text())["plans"][1]
+    assert [c["part"] for c in fixed["cuts"]] == [1] and fixed["no_hook"] is True and not r["hook"] and fixed["fixes"][0]["did"] == "Kept only the hello."
+    assert {"wrong": "friend", "right": "Friend"} in fixed["caption_fixes"] and "the second part is boring" in asked[0] and "Hi there, old friend." in asked[0]
+    assert "The creator found these wrong" in pm.cuts_prompt(fixed, "Game", [])
+    with pytest.raises(AutocutError, match="needs Claude"):
+        pm.make(str(pj), pick="2", fix="x", writer="rules")
     # asking for a video in words: a new plan is written from the recordings, added and made
     monkeypatch.setattr(sw, "ask_claude", lambda prompt, model=None, timeout=600: json.dumps(
         {"plans": [{"title": "Game – Hello", "platform": "shorts", "format": "moment", "length": "20 s", "hook": "h", "why": "w", "edit_tool": "clips",
                     "parts": [{"recording": "R1", "start": "0:00:05", "end": "0:00:25", "note": "hello"}]}]} if "Plan exactly ONE video" in prompt
         else {"cuts": [{"part": 1, "start": "0:00:07", "end": "0:00:20", "note": "hello"}]}))
-    monkeypatch.setattr(pm.gp, "research_game", lambda game, writer="claude", fresh=False: {"summary": "s"})
     r = pm.make(str(pj), request="a short of the hello", cuts_only=True)
     d = json.loads(pj.read_text())
     assert r["plan"] == 3 and d["plans"][2]["requested"] == "a short of the hello" and [(c["start"], c["end"]) for c in d["plans"][2]["cuts"]] == [(5.6, 20.0)]
+    with pytest.raises(AutocutError, match="no finished video"):
+        pm.check_video(str(pj), pick="3")
     with pytest.raises(AutocutError):
         pm.make(str(tmp_path / "none.json"), pick="1")
     rec.unlink()
@@ -278,4 +307,16 @@ def test_a_map_at_the_edge_of_a_piece_is_left_out(monkeypatch, tmp_path):
     cuts = [{"recording": "/r", "start": 100.0, "end": 120.0, "note": "n"}]
     assert [(c["start"], c["end"]) for c in pm.trim_menus(cuts, {"/r": {"dialogue": []}})] == [(102.0, 120.0)]
     assert [(c["start"], c["end"]) for c in pm.trim_menus(cuts, {"/r": {"dialogue": [{"start": 100.0, "end": 101.0, "text": "a line over a list"}]}})] == [(100.0, 120.0)]
+
+
+def test_caption_corrections():
+    words = [{"word": w, "start": float(k), "end": k + 1.0} for k, w in enumerate("My name is Arzu. Maybe could- stay, Arzu".split())]
+    out, unused = pm.fix_captions(words, [{"wrong": "arzu", "right": "Atsu"}, {"wrong": "Maybe could", "right": "Maybe I could-"}, {"wrong": "not there", "right": "x"}, {"wrong": "stay", "right": ""}])
+    assert " ".join(w["word"] for w in out) == "My name is Atsu. Maybe I could- Atsu" and unused == ["not there"]  # (every place; the full stop stays; empty takes words out)
+    assert out[3]["start"] == 3.0 and (out[4]["start"], out[6]["end"]) == (4.0, 6.0)  # word for word keeps its time; more words share the old time
+    assert pm.fix_captions(words, [])[0] == words and pm.fix_captions([], [{"wrong": "a", "right": "b"}]) == ([], ["a"])
+    assert pm.parse_caption_fixes("Arzu => Atsu; a b -> c\n=> nothing\nno arrow") == [("Arzu", "Atsu"), ("a b", "c")]
+    p = {}
+    assert pm.add_caption_fixes(p, [("Arzu", "Atsu"), ("", "x"), ("same", "same")]) == 1 and pm.add_caption_fixes(p, [("arzu!", "Atsu-san")]) == 1
+    assert p["caption_fixes"] == [{"wrong": "arzu!", "right": "Atsu-san"}]  # (the same wrong words: the later correction stands)
 

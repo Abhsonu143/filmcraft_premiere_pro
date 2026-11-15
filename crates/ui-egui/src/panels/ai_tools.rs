@@ -25,8 +25,10 @@
 //! - `ai.clips {input, outDir?, clipType?=edited|sections, count?=5, min?=10, target?=48, max?=60,
 //!   aspect?=vertical|square|horizontal|same, content?=auto|talk|gameplay, framing?=auto|center|blur|bars, captionMode?=auto|on|off, captionStyle?=pop|clean|boxed,
 //!   titleMode?=off|intro|always, pace?=fast|medium|slow, music?, llm?=default|<model>|none, hook?, import?}`
-//! - `ai.planMake {input (plans.json), pick? (number) | request? (text), fresh?, hook?=true}`: the video of a plan from Plan Videos, or of a
-//!   new plan written for what is asked; the result (`.otio` + `.srt`) opens in the timeline.
+//! - `ai.planMake {input (plans.json), pick? (number) | request? (text), fresh?, hook?=true, fix? (text), captionFix? ("wrong => right; …"),
+//!   check?}`: the video of a plan from Plan Videos, or of a new plan written for what is asked; the result (`.otio` + `.srt`) opens in
+//!   the timeline. `fix`: what is wrong with the video made before (corrected in the plan, then made again); `captionFix`: caption words
+//!   corrected in this and every later make; `check`: nothing is made, the finished video is checked (`check.txt` next to it).
 //! - `ai.repair {input}`: the folder of a video made by EI (or a file in it) → a copy “<folder> - fixed” whose
 //!   voice pauses are silent and whose sound track has the bursts in them taken out (the picture is not re-encoded).
 //! - `ai.speak {script (file) or notes (text), voice, takes?, out?}`: a script spoken (audio only).
@@ -270,6 +272,11 @@ struct Draft {
     /// and the plans of the file last read (to choose from).
     plan_pick: String,
     plan_request: String,
+    /// Make Video from Plan, for a video made before: what is wrong with it (corrected, then made again), caption
+    /// corrections that stay (`wrong words => right words`), and whether the finished video is only checked.
+    plan_fix: String,
+    plan_caption_fix: String,
+    plan_check: bool,
     plan_list: Vec<String>,
     plan_list_for: String,
     // TV light sync
@@ -498,6 +505,9 @@ impl Draft {
             hints: String::new(),
             plan_pick: String::new(),
             plan_request: String::new(),
+            plan_fix: String::new(),
+            plan_caption_fix: String::new(),
+            plan_check: false,
             plan_list: Vec::new(),
             plan_list_for: String::new(),
             tv_folder: setting_str("tv_recordings").unwrap_or_default(),
@@ -664,6 +674,13 @@ impl Draft {
         if let Some(v) = s("request") {
             d.plan_request = v;
         }
+        if let Some(v) = s("fix") {
+            d.plan_fix = v;
+        }
+        if let Some(v) = s("captionFix") {
+            d.plan_caption_fix = v;
+        }
+        d.plan_check = flag("check", d.plan_check);
         if let Some(v) = p.get("recordings").and_then(Value::as_str) {
             d.tv_folder = v.to_string();
         }
@@ -834,6 +851,9 @@ impl Draft {
         m.insert("hints".into(), json!(self.hints));
         m.insert("pick".into(), json!(self.plan_pick));
         m.insert("request".into(), json!(self.plan_request));
+        m.insert("fix".into(), json!(self.plan_fix));
+        m.insert("captionFix".into(), json!(self.plan_caption_fix));
+        m.insert("check".into(), json!(self.plan_check));
         m.insert("feedback".into(), json!(self.feedback));
         m.insert("recordings".into(), json!(self.tv_folder));
         m.insert("relight".into(), json!(self.relight));
@@ -1297,12 +1317,34 @@ impl Draft {
                     return Err("Choose a plan from the list, or say what video you want.".into());
                 }
                 a = vec!["plan-make".into(), "--plans".into(), self.input.trim().into()];
-                if request.is_empty() {
+                let (fix, words) = (self.plan_fix.trim(), self.plan_caption_fix.trim());
+                if self.plan_check {
+                    // only a look at the video already made: nothing is planned, corrected or made
+                    if pick.is_empty() {
+                        return Err("Choose the plan whose finished video is to be checked.".into());
+                    }
                     push(&mut a, "--pick", pick);
+                    a.push("--check".into());
+                    return Ok(a);
+                }
+                if (!fix.is_empty() || !words.is_empty()) && pick.is_empty() {
+                    return Err("Choose the plan whose video is to be corrected.".into());
+                }
+                if !words.is_empty() && !words.split([';', '\n']).any(|w| w.contains("=>") || w.contains("->") || w.contains('→')) {
+                    return Err("Write a caption correction as: wrong words => right words".into());
+                }
+                if request.is_empty() || !fix.is_empty() || !words.is_empty() {
+                    push(&mut a, "--pick", pick); // (a correction is of the chosen plan's video, whatever else is asked for)
                 } else {
                     push(&mut a, "--request", request);
                 }
-                if self.fresh {
+                if !fix.is_empty() {
+                    push(&mut a, "--fix", fix);
+                }
+                if !words.is_empty() {
+                    push(&mut a, "--caption-fix", words);
+                }
+                if self.fresh && fix.is_empty() {
                     a.push("--fresh".into());
                 }
                 if !self.hook {
@@ -3182,7 +3224,16 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
         Kind::Hooks => format!("{}: sync {}", d.kind.title(), d.hook_niches.trim().chars().take(40).collect::<String>()),
         Kind::Repair => format!("{}: {}", d.kind.title(), file_stem(d.input.trim().trim_end_matches('/'))),
         Kind::PlanMake => {
-            let what = if d.plan_request.trim().is_empty() { format!("plan {}", d.plan_pick.trim()) } else { d.plan_request.trim().chars().take(50).collect() };
+            let corrected = !d.plan_fix.trim().is_empty() || !d.plan_caption_fix.trim().is_empty();
+            let what = if d.plan_check {
+                format!("check of plan {}", d.plan_pick.trim())
+            } else if corrected {
+                format!("plan {} corrected", d.plan_pick.trim())
+            } else if d.plan_request.trim().is_empty() {
+                format!("plan {}", d.plan_pick.trim())
+            } else {
+                d.plan_request.trim().chars().take(50).collect()
+            };
             format!("{}: {what}", d.kind.title())
         }
         Kind::Download => format!(
@@ -3595,6 +3646,30 @@ fn plan_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String,
     ui.label("");
     let r = ui.checkbox(&mut d.fresh, "Choose the cuts again (drops the cuts saved in the plan)");
     elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
+    ui.end_row();
+    ui.label("Something wrong?");
+    ui.vertical(|ui| {
+        let r = ui.add(
+            egui::TextEdit::multiline(&mut d.plan_fix)
+                .hint_text("say what is wrong with the video made from this plan, e.g.\nit ends before he answers\nthe fight in the middle is too long\nno teaser at the start")
+                .desired_rows(3)
+                .desired_width(430.0),
+        );
+        elems.push((format!("{p}.fix"), r.rect, d.plan_fix.clone()));
+        ui.label(egui::RichText::new("Only that is corrected (pieces, teaser, caption words), and the video is made again. It is kept in the plan for later makes.").small().weak());
+    });
+    ui.end_row();
+    ui.label("Caption words");
+    ui.vertical(|ui| {
+        let r =
+            ui.add(egui::TextEdit::singleline(&mut d.plan_caption_fix).hint_text("wrong words => right words; more => after a semicolon").desired_width(430.0));
+        elems.push((format!("{p}.captionFix"), r.rect, d.plan_caption_fix.clone()));
+        ui.label(egui::RichText::new("Corrected everywhere they stand in this video's captions, now and in every later make.").small().weak());
+    });
+    ui.end_row();
+    ui.label("Check");
+    let r = ui.checkbox(&mut d.plan_check, "Only check the finished video: length, shape, captions against its own sound (makes nothing)");
+    elems.push((format!("{p}.check"), r.rect, d.plan_check.to_string()));
     ui.end_row();
 }
 
@@ -4746,6 +4821,8 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Topic => "Research and Write",
                     Kind::Hooks => "Sync Hooks",
                     Kind::Repair => "Copy and Repair",
+                    Kind::PlanMake if d.plan_check => "Check Video",
+                    Kind::PlanMake if !d.plan_fix.trim().is_empty() || !d.plan_caption_fix.trim().is_empty() => "Correct and Make Again",
                     Kind::PlanMake => "Make Video",
                     Kind::Speak => "Speak",
                     Kind::Download => "Download",
@@ -5568,7 +5645,7 @@ fn description(kind: Kind) -> &'static str {
             "Downloads a YouTube playlist (or one video) in the highest quality there is: the best video and the best audio, merged. Choose “Audio only” for just the sound, or “Subtitles only” for what is said, as clean English/Hindi text (the creator's own subtitles or YouTube's captions of the real speech, never a translation), optionally learned as a talking style for your scripts. A playlist gets its own folder named after it; running it again downloads only what is new (a stopped download continues), and unavailable videos are skipped and listed. For your own use: respect the creators' licences."
         }
         Kind::PlanMake => {
-            "Makes the video of a plan from Plan Videos. Choose the plans file and a plan, or say in your own words what video you want: it is then planned from what happens in the recordings (their analysis, kept next to them) and added to the plans. Claude reads each stretch of the plan in detail and chooses the exact cuts: no line is cut in the middle, and menus, loading, deaths and wandering are left out. Shorts and Reels are made vertical with the hook and captions; long videos are joined as they are, with chapters. The cuts are saved in the plans file and can be changed there. The recordings are never changed."
+            "Makes the video of a plan from Plan Videos. Choose the plans file and a plan, or say in your own words what video you want: it is then planned from what happens in the recordings (their analysis, kept next to them) and added to the plans. Claude reads each stretch of the plan in detail and chooses the exact cuts: no line is cut in the middle, and menus, loading, deaths and wandering are left out. Shorts and Reels are made vertical with the hook and captions; long videos are joined as they are, with chapters. The cuts are saved in the plans file and can be changed there. Every finished Short is checked against its own sound. Found something wrong in a video? Choose its plan and say what is wrong, or correct caption words (wrong => right): only that is changed, the video is made again, and the correction stays in the plan. “Only check” looks at a finished video again and writes what it finds, with every caption to read, to check.txt next to it. The recordings are never changed."
         }
         Kind::Repair => {
             "For a video whose voice has an odd sound in its pauses (a short burst every few seconds, from a cloned voice made before EI checked its room tone). Give the video's folder: EI makes a copy next to it (“<folder> - fixed”), silences the pauses of the voice and takes the bursts out of the video's sound. The picture is not re-encoded and the original folder is not changed. A folder whose pauses are already quiet is left alone."
@@ -6514,6 +6591,21 @@ mod tests {
         assert!(Draft::from_params(Kind::PlanMake, &json!({"input": file})).engine_args().is_err());
         let mut plain = Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "1", "hook": false}));
         assert_eq!(plain.engine_args().unwrap(), vec!["plan-make", "--plans", &file, "--pick", "1", "--no-hook"]);
+        // a video made before: checked only, or corrected (in words, or caption words) and made again
+        let mut check = Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "2", "check": true, "fresh": true, "fix": "ignored"}));
+        assert_eq!(check.engine_args().unwrap(), vec!["plan-make", "--plans", &file, "--pick", "2", "--check"]);
+        assert!(Draft::from_params(Kind::PlanMake, &json!({"input": file, "request": "x", "check": true})).engine_args().is_err());
+        let mut fix = Draft::from_params(
+            Kind::PlanMake,
+            &json!({"input": file, "pick": "2", "fix": " it ends too early ", "captionFix": "Arzu => Atsu", "fresh": true, "request": "x"}),
+        );
+        assert_eq!(
+            fix.engine_args().unwrap(),
+            vec!["plan-make", "--plans", &file, "--pick", "2", "--fix", "it ends too early", "--caption-fix", "Arzu => Atsu"]
+        );
+        assert!(Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "2", "captionFix": "no arrow"})).engine_args().is_err());
+        assert!(Draft::from_params(Kind::PlanMake, &json!({"input": file, "fix": "which one?"})).engine_args().is_err());
+        assert_eq!(fix.to_params()["captionFix"], json!("Arzu => Atsu"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

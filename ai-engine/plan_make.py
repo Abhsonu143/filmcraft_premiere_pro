@@ -128,7 +128,7 @@ Title: {plan.get("title")}
 For: {plan.get("platform")} · {plan.get("format")} · {plan.get("length")}
 Hook: {plan.get("hook")}
 Why it works: {plan.get("why")}
-{('What the creator asked for: ' + str(plan.get("requested")) + chr(10)) if plan.get("requested") else ''}
+{('What the creator asked for: ' + str(plan.get("requested")) + chr(10)) if plan.get("requested") else ''}{corrections(plan)}
 ## The stretches (per 5 seconds: action 0-1, what is on screen, scene cuts; indented: every line said, with its time)
 {chr(10).join(blocks)}
 
@@ -142,6 +142,12 @@ Why it works: {plan.get("why")}
   the reveal. It is shown first as a teaser, then the video starts from its beginning, so it must not be the first seconds of the first piece.
 Answer with only this JSON:
 {{"cuts": [{{"part": 1, "start": "H:MM:SS", "end": "H:MM:SS", "note": "..."}}], "hook": {{"part": 1, "start": "H:MM:SS", "end": "H:MM:SS"}}}}"""
+
+
+def corrections(plan: dict) -> str:
+    """What the creator found wrong in earlier makes of this plan, for the editor to keep to."""
+    notes = [str(x.get("note", "")).strip() for x in plan.get("fixes") or [] if isinstance(x, dict) and str(x.get("note", "")).strip()]
+    return ("The creator found these wrong in an earlier make (keep them right): " + " | ".join(notes[-6:]) + "\n") if notes else ""
 
 
 def keep_lines_whole(start: float, end: float, a: dict | None) -> tuple[float, float]:
@@ -325,6 +331,140 @@ def hook_cut(plan: dict, cuts: list[dict], analyses: dict[str, dict | None], on_
             if got:
                 best, best_score, best_said = got, float(seg.max()), False
     return best if best_said or not second else second
+
+
+def fix_prompt(plan: dict, game: str, blocks: list[str], note: str, captions: list[str]) -> str:
+    now = "\n".join(f"- stretch {c.get('part')}: {gp.hms(c['start'])}–{gp.hms(c['end'])} ({c['end'] - c['start']:.0f} s): {c.get('note', '')}" for c in plan.get("cuts") or [])
+    hook = plan.get("hook_cut")
+    limit = MAX_SECONDS.get(plan.get("platform"), 0)
+    return f"""You are the editor of a gaming video made from a creator's own recordings of "{game}".
+The video below was made and the creator found something wrong with it. Correct that and nothing else.
+
+## The video
+Title: {plan.get("title")}
+For: {plan.get("platform")} · {plan.get("format")} · {plan.get("length")}
+Hook: {plan.get("hook")}
+Its pieces now:
+{now or "(none)"}
+Its teaser now (shown first): {(gp.hms(hook["start"]) + "–" + gp.hms(hook["end"])) if isinstance(hook, dict) else "none"}
+Its captions now:
+{chr(10).join(captions) or "(none)"}
+
+## What the creator says is wrong
+{note}
+
+## The recording around it (per 5 seconds: action 0-1, what is on screen, scene cuts; indented: every line said, with its time)
+{chr(10).join(blocks)}
+
+## Rules
+- Change only what the creator's words ask for. Whatever they do not mention stays exactly as it is.
+- cuts: give ALL the pieces again only when a piece must change (a time, an added or removed piece); otherwise null.
+  A piece starts just before a line is said and ends just after a line ends; never inside a line. Use only times inside the stretches shown.
+{f"  The pieces together stay under {limit - 7:.0f} seconds." + chr(10) if limit else ""}- hook: a new teaser of 2 to 3 seconds from inside the pieces when the teaser is what is wrong; "none" when the creator wants no teaser; otherwise null.
+- captions: when words of a caption are wrong, the wrong words exactly as they stand in the captions above, and the right words.
+  Only what the creator asks for, or a name they tell you is misspelled. Otherwise an empty list.
+- did: one short plain sentence on what you changed, or why nothing could be changed.
+Answer with only this JSON:
+{{"cuts": null, "hook": null, "captions": [{{"wrong": "...", "right": "..."}}], "did": "..."}}"""
+
+
+def apply_fix(plan: dict, game: str, analyses: list[dict | None], note: str, captions: list[str]) -> str:
+    """What the creator says is wrong, corrected in the plan by Claude: its cuts, its teaser, words of
+    its captions. The note is kept in the plan (`fixes`), so later makes keep to it. → what was done."""
+    import script_writer as sw
+
+    parts = plan.get("parts") or []
+    blocks = []
+    for k, (p, a) in enumerate(zip(parts, analyses), 1):
+        head = f"### Stretch {k}: {gp.hms(p['start'])}–{gp.hms(p['end'])} of {Path(str(p['recording'])).name}: {p.get('note', '')}"
+        blocks.append(head + "\n" + (detail(a, max(0.0, float(p["start"]) - 30.0), float(p["end"]) + 30.0, 5) if a else "(no detail)"))
+    log("Claude is correcting what you found wrong")
+    answer = sw.extract_json(sw.ask_claude(fix_prompt(plan, game, blocks, note, captions), timeout=900))
+    if not isinstance(answer, dict):
+        raise AutocutError("the correction could not be read")
+    done = []
+    if isinstance(answer.get("cuts"), list):
+        cuts = clean_cuts(answer["cuts"], plan, analyses)
+        if cuts:
+            plan["cuts"], plan["times"] = cuts, "heard"
+            done.append(f"{len(cuts)} piece(s) set again")
+    h = answer.get("hook")
+    if isinstance(h, dict):
+        plan["hook_idea"] = h
+        plan.pop("hook_cut", None)
+        plan.pop("no_hook", None)
+        done.append("a new teaser")
+    elif isinstance(h, str) and h.strip().lower() == "none":
+        plan["no_hook"] = True
+        plan.pop("hook_cut", None)
+        done.append("no teaser")
+    n = add_caption_fixes(plan, [(str(c.get("wrong", "")), str(c.get("right", ""))) for c in answer.get("captions") or [] if isinstance(c, dict)])
+    if n:
+        done.append(f"{n} caption correction(s)")
+    did = str(answer.get("did", "")).strip()[:300]
+    plan.setdefault("fixes", []).append({"note": note[:500], "did": did, "when": time.strftime("%Y-%m-%d %H:%M")})
+    return f"{did} ({', '.join(done) if done else 'nothing was changed'})"
+
+
+def _tokens(text: str) -> list[str]:
+    return [t for t in (re.sub(r"[^\w]+", "", w.lower()) for w in str(text).split()) if t]
+
+
+def add_caption_fixes(plan: dict, pairs: list[tuple[str, str]]) -> int:
+    """Caption corrections kept in the plan (`caption_fixes`: wrong words → right words), so they hold
+    in every later make. A correction of the same wrong words replaces the earlier one."""
+    fixes = [x for x in plan.get("caption_fixes") or [] if isinstance(x, dict)]
+    n = 0
+    for wrong, right in pairs:
+        wrong, right = " ".join(wrong.split())[:200], " ".join(right.split())[:200]
+        if not _tokens(wrong) or wrong == right:
+            continue
+        fixes = [x for x in fixes if _tokens(x.get("wrong", "")) != _tokens(wrong)] + [{"wrong": wrong, "right": right}]
+        n += 1
+    if fixes:
+        plan["caption_fixes"] = fixes[-200:]
+    return n
+
+
+def parse_caption_fixes(text: str) -> list[tuple[str, str]]:
+    """'wrong => right; wrong2 => right2' (also -> or →; one per line or after a semicolon)."""
+    out = []
+    for item in re.split(r"[;\n]+", text or ""):
+        m = re.split(r"\s*(?:=>|->|→)\s*", item.strip(), maxsplit=1)
+        if len(m) == 2 and m[0].strip():
+            out.append((m[0].strip(), m[1].strip()))
+    return out
+
+
+def fix_captions(words: list[dict], fixes: list[dict]) -> tuple[list[dict], list[str]]:
+    """The caption words with the plan's corrections made: every place the wrong words stand (compared
+    without capitals and punctuation) shows the right words over the same time. Right words left empty
+    take the words out. → (the words, the corrections that matched nothing)"""
+    out, unused = [dict(w) for w in words], []
+    for fx in fixes or []:
+        wrong, right = _tokens(fx.get("wrong", "")), str(fx.get("right", "")).split()
+        if not wrong:
+            continue
+        k, hit = 0, False
+        while k + len(wrong) <= len(out):
+            if [t for w in out[k:k + len(wrong)] for t in _tokens(w["word"])] != wrong or any(len(_tokens(w["word"])) != 1 for w in out[k:k + len(wrong)]):
+                k += 1
+                continue
+            old = out[k:k + len(wrong)]
+            s, e = old[0]["start"], old[-1]["end"]
+            if len(right) == len(old):  # (word for word: each keeps its own time)
+                new = [{**o, "word": r} for o, r in zip(old, right)]
+            else:
+                new = [{**sp, **({"est": True} if old[0].get("est") else {})} for sp in spread(right, s, e)] if right else []
+            tail = re.search(r"[.!?…,;:]+$", str(old[-1]["word"]))
+            if new and tail and not re.search(r"[^\w\s]$", new[-1]["word"]):
+                new[-1]["word"] += tail.group(0)  # (the sentence still ends where it ended)
+            out[k:k + len(wrong)] = new
+            k += max(len(new), 1) if new else 0
+            hit = True
+        if not hit:
+            unused.append(str(fx.get("wrong", "")))
+    return out, unused
 
 
 def request_plan(data: dict, text: str, writer: str = "claude") -> dict:
@@ -1161,11 +1301,98 @@ def safe_name(title: str) -> str:
     return re.sub(r"\s+", " ", s).strip()[:70] or "video"
 
 
+def read_srt(path: Path) -> list[dict]:
+    cues = []
+    for block in re.split(r"\n\s*\n", path.read_text(encoding="utf-8", errors="replace").strip()):
+        m = re.search(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)[^\n]*\n(.*)", block, re.S)
+        if m:
+            g = [int(x) for x in m.groups()[:8]]
+            cues.append({"start": g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000, "end": g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000, "text": " ".join(m.group(9).split())})
+    return cues
+
+
+def video_folder(pj: Path, idx: int, plan: dict, out_dir: str | None) -> tuple[Path, str]:
+    name = f"{idx + 1:02d} {safe_name(str(plan.get('title', '')))}"
+    return (Path(out_dir).expanduser() if out_dir else pj.parent / "videos") / name, name
+
+
+def check_video(plans_file: str, *, pick: str, out_dir: str | None = None) -> dict:
+    """The finished video of a plan, checked without making anything: its length and shape, each
+    caption against where its words are heard in the video's own sound, how it ends. The result and
+    every caption are written to `check.txt` next to the video (and to the log), to be read."""
+    ac.require_tools()
+    data, pj = load(plans_file)
+    idx = pick_plan(data["plans"], pick)
+    plan = data["plans"][idx]
+    folder, name = video_folder(pj, idx, plan, out_dir)
+    video = folder / f"{name}.mp4"
+    if not video.is_file():
+        raise AutocutError(f"plan {idx + 1} has no finished video yet ({video.name} is not in {folder.parent.name}): make it first")
+    ac.progress_plan({"check": 1.0})
+    with ac.stage("check"):
+        info = ac.probe(str(video))
+        srt = folder / f"{name}.srt"
+        cues = read_srt(srt) if srt.is_file() else []
+        vertical = plan.get("platform") in VERTICAL
+        limit = MAX_SECONDS.get(plan.get("platform"))
+        problems, good = [], []
+        if limit and info.duration > limit + 0.6:
+            problems.append(f"it is {info.duration:.0f} s long: over the {limit + 1:.0f} s limit of {plan.get('platform')}")
+        else:
+            good.append(f"{info.duration:.0f} s long")
+        if vertical and info.width >= info.height:
+            problems.append(f"it is not vertical ({info.width}x{info.height})")
+        else:
+            good.append(f"{info.width}x{info.height}")
+        if cues and not re.search(r"[.!?…\"”'’\-–—]$", cues[-1]["text"]):
+            problems.append(f"the last caption does not end a sentence: “{cues[-1]['text']}”")
+        for a, b in zip(cues, cues[1:]):
+            if _tokens(a["text"]) == _tokens(b["text"]) and len(_tokens(a["text"])) >= 2 and b["start"] - a["end"] < 3:
+                problems.append(f"the same caption twice in a row at {gp.hms(b['start'])}: “{b['text']}”")
+        shown = " " + " ".join(t for c in cues for t in _tokens(c["text"])) + " "
+        still = [x["wrong"] for x in plan.get("caption_fixes") or [] if isinstance(x, dict) and _tokens(x.get("wrong", ""))
+                 and f" {' '.join(_tokens(x['wrong']))} " in shown and f" {' '.join(_tokens(x['wrong']))} " not in f" {' '.join(_tokens(x.get('right', '')))} "]
+        if still:
+            problems.append("corrected caption words are still in the captions (make the video again): " + "; ".join(still[:5]))
+        chk = None
+        if cues:
+            first = next((str(p["recording"]) for p in plan.get("parts") or []), "")
+            chk = check_captions(video, cues, language_of(analysis_of(first)) if first else None)
+        if chk:
+            chk.pop("moves", None)
+            if chk["late"]:
+                problems.append(f"{chk['late']} of {chk['found']} caption lines heard are more than 0.6 s from the speech (worst {chk['worst']} s): {'; '.join(chk['which'][:6])}")
+            elif chk["found"] * 2 < chk["lines"]:
+                good.append(f"only {chk['found']} of {chk['lines']} caption lines could be heard in the video (quiet speech or loud music), those within {max(chk['worst'], 0.1)} s; "
+                            "the others are not confirmed by sound")
+            else:
+                good.append(f"{chk['found']} of {chk['lines']} caption lines heard, all within {max(chk['worst'], 0.1)} s of the speech")
+        elif not cues:
+            good.append("no captions (nothing is said, or no caption file is next to the video)")
+        lines = [f"Check of: {video.name}", time.strftime("%Y-%m-%d %H:%M"), ""]
+        lines += ["PROBLEMS"] + [f"- {p}" for p in problems] + [""] if problems else ["No problems found by the check.", ""]
+        lines += ["Checked"] + [f"- {g}" for g in good] + ["", "The captions, to read (time in the video, words):"]
+        lines += [f"{gp.hms(c['start'])}  {c['text']}" for c in cues] or ["(none)"]
+        lines += ["", "To correct something: Make Video from Plan → this plan → say what is wrong, or give a caption correction (wrong words => right words)."]
+        out = folder / "check.txt"
+        out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        for p in problems:
+            log(f"CHECK: {p}")
+        for g in good:
+            log(f"checked: {g}")
+        for c in cues[:80]:
+            log(f"  {gp.hms(c['start'])}  {c['text']}")
+    return {"outputs": [str(out)], "out_dir": str(folder), "plan": idx + 1, "title": plan.get("title"), "problems": problems, "checked": good, "check": chk, "captions": len(cues)}
+
+
 def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | None = None, writer: str = "claude", fresh: bool = False,
-         captions: bool = True, cuts_only: bool = False, hook: bool = True) -> dict:
+         captions: bool = True, cuts_only: bool = False, hook: bool = True, fix: str = "", caption_fix: str = "") -> dict:
     """The video of one plan (`pick`: its number or a part of its title), or of a new plan written for
     `request`. `fresh`: choose the cuts again. `cuts_only`: stop after the cuts are saved. `hook`: the video opens
-    with a 2–3 second teaser from inside it (saved in the plan as `hook_cut`; delete it there to go without)."""
+    with a 2–3 second teaser from inside it (saved in the plan as `hook_cut`; delete it there to go without).
+    `fix`: what is wrong with the video made before, in the creator's words: Claude corrects that in the plan
+    and the video is made again. `caption_fix`: 'wrong words => right words' (several: one per line or after ';'),
+    kept in the plan and made in every later make."""
     ac.require_tools()
     data, pj = load(plans_file)
     plans = data["plans"]
@@ -1187,6 +1414,11 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
         missing = sorted({Path(str(p["recording"])).name for p in parts if not Path(str(p["recording"])).is_file()})
         if missing:
             raise AutocutError(f"recording(s) not found: {', '.join(missing)} (is the disk connected?)")
+        if caption_fix.strip():
+            pairs = parse_caption_fixes(caption_fix)
+            if not pairs:
+                raise AutocutError("a caption correction is written as: wrong words => right words")
+            log(f"{add_caption_fixes(plan, pairs)} caption correction(s) kept in the plan: " + "; ".join(f"“{w}” → “{r}”" for w, r in pairs[:6]))
     with ac.stage("cuts"):
         by_rec = {str(p["recording"]): analysis_of(str(p["recording"])) for p in parts}
         hint = ""
@@ -1202,6 +1434,19 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
         if sum(e - s for sp in wide.values() for s, e in sp) <= 600:  # (longer stretches: only the chosen pieces are read, below)
             for rec in by_rec:
                 by_rec[rec] = use_subtitles(by_rec[rec], read_subtitles(rec, wide[rec], names), wide[rec])
+        if fix.strip():
+            if writer != "claude":
+                raise AutocutError("saying what is wrong needs Claude (the writer is set to rules)")
+            old = video_folder(pj, idx, plan, out_dir)
+            was = old[0] / f"{old[1]}.srt"
+            shown = [f"{gp.hms(c['start'])}  {c['text']}" for c in read_srt(was)] if was.is_file() else []
+            try:
+                log("corrected: " + apply_fix(plan, game, [by_rec[str(p["recording"])] for p in parts], fix.strip(), shown))
+            except ValueError as e:
+                raise AutocutError(f"the correction could not be read ({e})") from e
+            fresh = False  # (the corrected plan is what is made)
+        if plan.get("no_hook"):
+            hook = False
         if plan.get("cuts") and not fresh and plan.get("times") != "heard":
             log("the saved cuts were chosen from rough line times: they are chosen again")
             fresh = True
@@ -1257,8 +1502,7 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
         gp.write_md(pj.parent, game, plans)
         planned = sum(float(p["end"]) - float(p["start"]) for p in parts)
         log(f"{len(cuts)} piece(s), {plan['cut_s'] / 60:.1f} min (the plan's stretches: {planned / 60:.1f} min)")
-    name = f"{idx + 1:02d} {safe_name(str(plan.get('title', '')))}"
-    folder = (Path(out_dir).expanduser() if out_dir else pj.parent / "videos") / name
+    folder, name = video_folder(pj, idx, plan, out_dir)
     res = {"outputs": [], "out_dir": str(folder), "plan": idx + 1, "title": plan.get("title"), "pieces": len(cuts), "seconds": plan["cut_s"], "plans": str(pj),
            "hook": bool(teaser)}
     if teaser:  # (from here on the teaser is simply the first piece)
@@ -1269,7 +1513,10 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
         folder.mkdir(parents=True, exist_ok=True)
         video = folder / f"{name}.mp4"
         info = ac.probe(cuts[0]["recording"])
-        words = heard_words(cuts, by_rec)
+        words, unused = fix_captions(heard_words(cuts, by_rec), plan.get("caption_fixes") or [])
+        if plan.get("caption_fixes"):
+            log(f"{len(plan['caption_fixes']) - len(unused)} of the plan's {len(plan['caption_fixes'])} caption correction(s) made"
+                + (f" (not in this video's captions: {'; '.join(unused[:4])})" if unused else ""))
         if vertical:
             import captions as cp
 
@@ -1336,7 +1583,13 @@ def add_args(p) -> None:
     p.add_argument("--no-captions", action="store_true")
     p.add_argument("--cuts-only", action="store_true", help="choose and save the cuts, make no video")
     p.add_argument("--no-hook", action="store_true", help="do not open with a 2–3 second teaser from inside the video")
+    p.add_argument("--fix", default="", help="what is wrong with the video made before, in your own words: that is corrected and the video made again")
+    p.add_argument("--caption-fix", default="", help="'wrong words => right words' (several: after ';'): kept in the plan, made in every later make")
+    p.add_argument("--check", action="store_true", help="make nothing: check the plan's finished video (length, shape, captions against its own sound) and write check.txt")
 
 
 def run_args(a) -> dict:
-    return make(a.plans, pick=a.pick, request=a.request, out_dir=a.out_dir, writer=a.writer, fresh=a.fresh, captions=not a.no_captions, cuts_only=a.cuts_only, hook=not a.no_hook)
+    if a.check:
+        return check_video(a.plans, pick=a.pick, out_dir=a.out_dir)
+    return make(a.plans, pick=a.pick, request=a.request, out_dir=a.out_dir, writer=a.writer, fresh=a.fresh, captions=not a.no_captions, cuts_only=a.cuts_only, hook=not a.no_hook,
+                fix=a.fix, caption_fix=a.caption_fix)

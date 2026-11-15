@@ -214,7 +214,7 @@ fn ai_menu_and_dialogs() {
         ("speak", &["script", "text", "voice", "sound", "out", "run"]),
         ("hooks", &["niches", "countries", "claude", "run"]),
         ("repair", &["input", "input.choose", "run"]),
-        ("planMake", &["input", "input.choose", "reload", "pick", "request", "hook", "fresh", "run"]),
+        ("planMake", &["input", "input.choose", "reload", "pick", "request", "hook", "fresh", "fix", "captionFix", "check", "run"]),
         ("download", &["url", "mode.video", "mode.audio", "mode.subs", "container", "items", "out", "queue", "run"]),
         (
             "package",
