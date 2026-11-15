@@ -214,6 +214,8 @@ struct Draft {
     hook: bool,
     title_mode: &'static str,
     caption_style: &'static str,
+    /// How fast the cloned voice talks next to its own recordings (reference | relaxed | slow).
+    speech_pace: &'static str,
     llm: &'static str,
     format: &'static str,
     audio_quality: &'static str,
@@ -442,6 +444,7 @@ impl Draft {
             hook: true,
             title_mode: "off",
             caption_style: if kind == Kind::Voiceover { "clean" } else { "pop" },
+            speech_pace: "relaxed",
             llm: "default",
             format: "mp3",
             audio_quality: "high",
@@ -569,6 +572,7 @@ impl Draft {
         d.hook = p.get("hook").and_then(Value::as_bool).unwrap_or(d.hook);
         d.title_mode = pick("titleMode", &TITLE_MODES.map(|a| a.0), d.title_mode);
         d.caption_style = pick("captionStyle", &CAPTION_STYLES.map(|a| a.0), d.caption_style);
+        d.speech_pace = pick("speechPace", &SPEECH_PACES.map(|a| a.0), d.speech_pace);
         d.llm = pick("llm", &LLMS.map(|a| a.0), d.llm);
         d.format = pick("format", &AUDIO_FORMATS.map(|a| a.0), d.format);
         d.audio_quality = pick("audioQuality", &AUDIO_QUALITIES.map(|a| a.0), d.audio_quality);
@@ -765,6 +769,7 @@ impl Draft {
         m.insert("captionMode".into(), json!(self.caption_mode));
         m.insert("titleMode".into(), json!(self.title_mode));
         m.insert("captionStyle".into(), json!(self.caption_style));
+        m.insert("speechPace".into(), json!(self.speech_pace));
         m.insert("llm".into(), json!(self.llm));
         m.insert("format".into(), json!(self.format));
         m.insert("audioQuality".into(), json!(self.audio_quality));
@@ -1237,6 +1242,9 @@ impl Draft {
                 if self.make_video {
                     push(&mut a, "--voice", self.voice.trim());
                     push(&mut a, "--takes", &format!("{}", self.takes.round()));
+                    if !self.voice.starts_with("mac") {
+                        push(&mut a, "--speech-pace", self.speech_pace);
+                    }
                     push(&mut a, "--pace", self.pace_for_engine());
                     a.push("--sources".into());
                     for (on, k) in [(self.src_free, "free"), (self.src_cards, "cards"), (self.src_youtube, "youtube")] {
@@ -1376,6 +1384,7 @@ impl Draft {
                 push(&mut a, "--out", self.out.trim());
                 if !self.voice.starts_with("mac") {
                     push(&mut a, "--takes", &format!("{}", self.takes.round()));
+                    push(&mut a, "--pace", self.speech_pace);
                 }
             }
             Kind::Tv => {
@@ -1491,6 +1500,9 @@ const QUALITIES: [(&str, &str); 5] = [
     ("small", "Small (re-encode, 4 Mb/s)"),
 ];
 const ASPECTS: [(&str, &str); 4] = [("same", "Same as reference"), ("horizontal", "Horizontal 16:9"), ("vertical", "Vertical 9:16"), ("square", "Square 1:1")];
+/// How fast a cloned voice talks, next to the recordings it was made from (the engine's `voice.PACES`).
+const SPEECH_PACES: [(&str, &str); 3] =
+    [("relaxed", "Relaxed (slower than the recordings, longer pauses)"), ("reference", "As in the voice's recordings"), ("slow", "Slow (clear and unhurried)")];
 const PACES: [(&str, &str); 3] = [("fast", "Fast (~1 s shots)"), ("medium", "Medium (~2 s)"), ("slow", "Slow (~3 s)")];
 /// Auto Edit Clips to Music also cuts dynamically: shot lengths follow the music and the footage.
 const MUSIC_PACES: [(&str, &str); 4] = [
@@ -2856,6 +2868,7 @@ fn params_from_args(kind: &str, args: &[String]) -> Option<Value> {
             "--no-effects" => ("soundEffects", json!(false), 1),
             "--seconds" => ("seconds", num(&val), 2),
             "--takes" => ("takes", num(&val), 2),
+            "--speech-pace" => ("speechPace", json!(val), 2),
             "--music-level" => ("musicLevel", num(&val), 2),
             "--language" => ("language", json!(val), 2),
             "--aspect" => ("aspect", json!(val), 2),
@@ -4238,6 +4251,9 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                                     let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
                                     elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
                                     ui.end_row();
+                                    ui.label("Speaking pace");
+                                    combo_row(ui, &mut d.speech_pace, &SPEECH_PACES, &format!("{p}.speechPace"), &mut elems);
+                                    ui.end_row();
                                 }
                                 ui.label("Shape");
                                 radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
@@ -4467,6 +4483,9 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                                 ui.label("Takes per line");
                                 let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
                                 elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
+                                ui.end_row();
+                                ui.label("Speaking pace");
+                                combo_row(ui, &mut d.speech_pace, &SPEECH_PACES, &format!("{p}.speechPace"), &mut elems);
                                 ui.end_row();
                             }
                         }
@@ -6410,6 +6429,8 @@ mod tests {
             "nxstory-a1",
             "--takes",
             "2",
+            "--speech-pace",
+            "relaxed",
             "--pace",
             "medium",
             "--sources",
