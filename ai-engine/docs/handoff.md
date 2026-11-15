@@ -276,3 +276,14 @@ does not have the dialog block yet: ask the owner before rebuilding. Test videos
 `~/Movies/EI/Character-tests/` (`gta-studio.mp4` circle, `gta-cutout.mp4` cut-out, `*.character*.mp4` the
 character alone). Next: the owner's verdict on the motion, then a Characters window with tints, then the
 other tools (`character.add_character_args` / `options` / `add_to_video` are the three calls to reuse).
+
+### Shelved by the owner (2026-11-15)
+
+The owner did not like the 3D sample characters and asked for a real-face presenter from a reference photo.
+A trial of Ditto (Ant Group, Apache-2.0; its face finder uses InsightFace models, non-commercial) ran on this
+Mac from the scratch folder only: real-looking lips, blinks and head movement, but about 1.1 s per frame
+(27x the voiceover's length) and 3.8 GB peak footprint with models freed early (5.1 GB as shipped). No hand
+gestures are possible this way. During the 72 s full run the owner said to stop and shelve the feature.
+Nothing of the trial is in the repo. The 3D character code (`character.py`, `vrm.py`, the Topic dialog block)
+is committed and left as it is, off by default. Do not continue either without the owner asking.
+
