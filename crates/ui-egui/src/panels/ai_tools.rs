@@ -25,6 +25,8 @@
 //! - `ai.clips {input, outDir?, clipType?=edited|sections, count?=5, min?=10, target?=48, max?=60,
 //!   aspect?=vertical|square|horizontal|same, content?=auto|talk|gameplay, framing?=auto|center|blur|bars, captionMode?=auto|on|off, captionStyle?=pop|clean|boxed,
 //!   titleMode?=off|intro|always, pace?=fast|medium|slow, music?, llm?=default|<model>|none, hook?, import?}`
+//! - `ai.planMake {input (plans.json), pick? (number) | request? (text), fresh?}`: the video of a plan from Plan Videos, or of a
+//!   new plan written for what is asked; the result (`.otio` + `.srt`) opens in the timeline.
 //! - `ai.repair {input}`: the folder of a video made by EI (or a file in it) → a copy “<folder> - fixed” whose
 //!   voice pauses are silent and whose sound track has the bursts in them taken out (the picture is not re-encoded).
 //! - `ai.speak {script (file) or notes (text), voice, takes?, out?}`: a script spoken (audio only).
@@ -89,6 +91,7 @@ pub enum Kind {
     Download,
     Package,
     Repair,
+    PlanMake,
 }
 
 impl Kind {
@@ -110,6 +113,7 @@ impl Kind {
             Kind::Download => "download",
             Kind::Package => "package",
             Kind::Repair => "repair",
+            Kind::PlanMake => "planMake",
         }
     }
     fn from_command(id: &str) -> Option<Kind> {
@@ -130,6 +134,7 @@ impl Kind {
             "ai.download" => Kind::Download,
             "ai.package" => Kind::Package,
             "ai.repair" => Kind::Repair,
+            "ai.planMake" => Kind::PlanMake,
             _ => return None,
         })
     }
@@ -151,6 +156,7 @@ impl Kind {
             Kind::Download => "Download from YouTube",
             Kind::Package => "Thumbnails, Titles & Hashtags",
             Kind::Repair => "Repair Sounds in Pauses",
+            Kind::PlanMake => "Make Video from Plan",
         }
     }
     fn input_label(self) -> &'static str {
@@ -160,6 +166,7 @@ impl Kind {
             Kind::Clips => "Long video",
             Kind::Tv => "Your clip",
             Kind::Repair => "Video folder",
+            Kind::PlanMake => "Plans file",
             _ => "Video",
         }
     }
@@ -259,6 +266,12 @@ struct Draft {
     fresh: bool,
     /// Video from Topic: what the creator is looking for (research and script follow it).
     hints: String,
+    /// Make Video from Plan: the chosen plan's number (as in plans.md), what was asked for instead,
+    /// and the plans of the file last read (to choose from).
+    plan_pick: String,
+    plan_request: String,
+    plan_list: Vec<String>,
+    plan_list_for: String,
     // TV light sync
     tv_folder: String,
     relight: f64,
@@ -483,6 +496,10 @@ impl Draft {
             src_youtube: false,
             fresh: false,
             hints: String::new(),
+            plan_pick: String::new(),
+            plan_request: String::new(),
+            plan_list: Vec::new(),
+            plan_list_for: String::new(),
             tv_folder: setting_str("tv_recordings").unwrap_or_default(),
             relight: 1.0,
             tv_vframe: false,
@@ -640,6 +657,12 @@ impl Draft {
         d.fresh = flag("fresh", d.fresh);
         if let Some(v) = s("hints") {
             d.hints = v;
+        }
+        if let Some(v) = p.get("pick") {
+            d.plan_pick = v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())).unwrap_or_default();
+        }
+        if let Some(v) = s("request") {
+            d.plan_request = v;
         }
         if let Some(v) = p.get("recordings").and_then(Value::as_str) {
             d.tv_folder = v.to_string();
@@ -809,6 +832,8 @@ impl Draft {
         m.insert("youtube".into(), json!(self.src_youtube));
         m.insert("fresh".into(), json!(self.fresh));
         m.insert("hints".into(), json!(self.hints));
+        m.insert("pick".into(), json!(self.plan_pick));
+        m.insert("request".into(), json!(self.plan_request));
         m.insert("feedback".into(), json!(self.feedback));
         m.insert("recordings".into(), json!(self.tv_folder));
         m.insert("relight".into(), json!(self.relight));
@@ -1264,6 +1289,21 @@ impl Draft {
                     }
                 } else {
                     a.push("--script-only".into());
+                }
+            }
+            Kind::PlanMake => {
+                let (pick, request) = (self.plan_pick.trim(), self.plan_request.trim());
+                if pick.is_empty() && request.is_empty() {
+                    return Err("Choose a plan from the list, or say what video you want.".into());
+                }
+                a = vec!["plan-make".into(), "--plans".into(), self.input.trim().into()];
+                if request.is_empty() {
+                    push(&mut a, "--pick", pick);
+                } else {
+                    push(&mut a, "--request", request);
+                }
+                if self.fresh {
+                    a.push("--fresh".into());
                 }
             }
             Kind::Repair => {
@@ -1870,9 +1910,10 @@ fn default_output(d: &Draft) -> String {
         Kind::Audio => d.clips.first().map(|c| parent_dir(c).to_string_lossy().to_string()).unwrap_or_else(|| movies_dir().to_string_lossy().to_string()),
         Kind::Script => movies_dir().join("Scripts").join(slug(if d.topic.trim().is_empty() { "script" } else { &d.topic })).to_string_lossy().to_string(),
         Kind::Voice => voices_dir().join(slug(&d.voice_name)).to_string_lossy().to_string(),
-        Kind::Topic => String::new(),  // the engine names the folder after the topic (Movies/EI/Topics/…)
-        Kind::Hooks => String::new(),  // the library has one place (Application Support/EI/hooks)
-        Kind::Repair => String::new(), // a copy next to the folder ("<folder> - fixed")
+        Kind::Topic => String::new(),    // the engine names the folder after the topic (Movies/EI/Topics/…)
+        Kind::Hooks => String::new(),    // the library has one place (Application Support/EI/hooks)
+        Kind::Repair => String::new(),   // a copy next to the folder ("<folder> - fixed")
+        Kind::PlanMake => String::new(), // a folder per video in "videos" next to the plans file
         Kind::Package => movies_dir().join("Thumbnails").to_string_lossy().to_string(),
         // the folder chosen last time (a playlist gets a folder of its own inside it)
         Kind::Download => setting_str("download_dir").unwrap_or_else(|| movies_dir().join("Downloads").to_string_lossy().to_string()),
@@ -3137,6 +3178,10 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
         Kind::Speak => format!("{}: {}", d.kind.title(), file_stem(&d.out)),
         Kind::Hooks => format!("{}: sync {}", d.kind.title(), d.hook_niches.trim().chars().take(40).collect::<String>()),
         Kind::Repair => format!("{}: {}", d.kind.title(), file_stem(d.input.trim().trim_end_matches('/'))),
+        Kind::PlanMake => {
+            let what = if d.plan_request.trim().is_empty() { format!("plan {}", d.plan_pick.trim()) } else { d.plan_request.trim().chars().take(50).collect() };
+            format!("{}: {what}", d.kind.title())
+        }
         Kind::Download => format!(
             "{}: {}{}",
             d.kind.title(),
@@ -3475,6 +3520,77 @@ fn hooks_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String
     ui.end_row();
 }
 
+/// The plans of a plans file, one line each ("3. Title · shorts · 55 s"); empty when it cannot be read.
+fn plan_titles(path: &str) -> Vec<String> {
+    let p = Path::new(path.trim());
+    if !p.is_file() || std::fs::metadata(p).map(|m| m.len() > 50_000_000).unwrap_or(true) {
+        return Vec::new();
+    }
+    let Some(v) = std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
+        return Vec::new();
+    };
+    let text = |x: &Value, k: &str| x.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    v.get("plans")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .take(500)
+                .enumerate()
+                .map(|(k, x)| {
+                    let title: String = text(x, "title").chars().take(70).collect();
+                    let made = if x.get("cuts").and_then(Value::as_array).is_some_and(|c| !c.is_empty()) { " · cuts chosen" } else { "" };
+                    format!("{}. {title} · {} · {}{made}", k.saturating_add(1), text(x, "platform"), text(x, "length"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Make Video from Plan: the plan to make (from the file's list), or what is asked for instead.
+fn plan_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
+    ui.label("Plan");
+    ui.horizontal(|ui| {
+        let reload = ui.small_button("↻").on_hover_text("Read the plans file again");
+        elems.push((format!("{p}.reload"), reload.rect, "reload".into()));
+        if reload.clicked() || d.plan_list_for != d.input {
+            d.plan_list = plan_titles(&d.input);
+            d.plan_list_for = d.input.clone();
+        }
+        let number = |line: &str| line.split('.').next().unwrap_or("").to_string();
+        let shown = d.plan_list.iter().find(|l| number(l) == d.plan_pick.trim()).cloned().unwrap_or_else(|| {
+            if d.plan_list.is_empty() { "choose the plans file first".to_string() } else { format!("choose one of {} plans", d.plan_list.len()) }
+        });
+        let r = egui::ComboBox::from_id_salt(format!("{p}.pick")).selected_text(shown.clone()).width(430.0).show_ui(ui, |ui| {
+            for line in d.plan_list.clone() {
+                let n = number(&line);
+                let o = ui.selectable_label(d.plan_pick.trim() == n, &line);
+                if o.clicked() {
+                    d.plan_pick = n.clone();
+                }
+                elems.push((format!("{p}.pick.{n}"), o.rect, line));
+            }
+        });
+        elems.push((format!("{p}.pick"), r.response.rect, shown));
+    });
+    ui.end_row();
+    ui.label("Or ask for a video");
+    ui.vertical(|ui| {
+        let r = ui.add(
+            egui::TextEdit::multiline(&mut d.plan_request)
+                .hint_text("in your own words, e.g.\na short of the funniest death\nevery scene with the wolf, emotional, as a reel\nthe whole story of Jubei, 15 minutes")
+                .desired_rows(3)
+                .desired_width(430.0),
+        );
+        elems.push((format!("{p}.request"), r.rect, d.plan_request.clone()));
+        ui.label(egui::RichText::new("When this is filled in, a new plan is written for it from the recordings, added to the plans file and made.").small().weak());
+    });
+    ui.end_row();
+    ui.label("");
+    let r = ui.checkbox(&mut d.fresh, "Choose the cuts again (drops the cuts saved in the plan)");
+    elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
+    ui.end_row();
+}
+
 /// The optional sound design rows. Returns true when the music folder should be chosen.
 fn sound_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> bool {
     let mut choose = false;
@@ -3777,7 +3893,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     let planning = d.kind == Kind::Talk && d.talk_mode == "plan";
                     if d.kind.needs_input() && !planning {
                         ui.label(d.kind.input_label());
-                        let hint = if d.kind == Kind::Repair { "the folder of a video made by EI (or a file in it)" } else { "a file" };
+                        let hint = match d.kind {
+                            Kind::Repair => "the folder of a video made by EI (or a file in it)",
+                            Kind::PlanMake => "the plans.json made by Plan Videos",
+                            _ => "a file",
+                        };
                         if path_row(ui, &mut d.input, &format!("{p}.input"), hint, &mut elems) {
                             pick = Some(Pick::Input);
                         }
@@ -4006,6 +4126,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         }
                         Kind::Hooks => hooks_rows(ui, &mut d, &p, &mut elems),
                         Kind::Repair => {}
+                        Kind::PlanMake => plan_rows(ui, &mut d, &p, &mut elems),
                         Kind::Script => {
                             ui.label("Topic");
                             let r = ui.add(egui::TextEdit::singleline(&mut d.topic).hint_text("what the video is about").desired_width(380.0));
@@ -4560,7 +4681,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             CharacterAsk::Nothing => {}
                         }
                     }
-                    if !matches!(d.kind, Kind::Voice | Kind::Hooks | Kind::Repair) {
+                    if !matches!(d.kind, Kind::Voice | Kind::Hooks | Kind::Repair | Kind::PlanMake) {
                         let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package) || planning;
                         ui.label(if folder_out { "Output folder" } else { "Save as" });
                         let hint = match d.kind {
@@ -4618,6 +4739,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Topic => "Research and Write",
                     Kind::Hooks => "Sync Hooks",
                     Kind::Repair => "Copy and Repair",
+                    Kind::PlanMake => "Make Video",
                     Kind::Speak => "Speak",
                     Kind::Download => "Download",
                     Kind::Package => "Make Thumbnails",
@@ -4662,6 +4784,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if let Some(pk) = pick {
         let video: Vec<&str> = VIDEO_EXT.to_vec();
         match pk {
+            Pick::Input if d.kind == Kind::PlanMake => {
+                if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f("Plans", &["json"])) {
+                    d.input = f;
+                }
+            }
             Pick::Input if d.kind == Kind::Repair => {
                 if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
                     d.input = dir;
@@ -5432,6 +5559,9 @@ fn description(kind: Kind) -> &'static str {
         }
         Kind::Download => {
             "Downloads a YouTube playlist (or one video) in the highest quality there is: the best video and the best audio, merged. Choose “Audio only” for just the sound, or “Subtitles only” for what is said, as clean English/Hindi text (the creator's own subtitles or YouTube's captions of the real speech, never a translation), optionally learned as a talking style for your scripts. A playlist gets its own folder named after it; running it again downloads only what is new (a stopped download continues), and unavailable videos are skipped and listed. For your own use: respect the creators' licences."
+        }
+        Kind::PlanMake => {
+            "Makes the video of a plan from Plan Videos. Choose the plans file and a plan, or say in your own words what video you want: it is then planned from what happens in the recordings (their analysis, kept next to them) and added to the plans. Claude reads each stretch of the plan in detail and chooses the exact cuts: no line is cut in the middle, and menus, loading, deaths and wandering are left out. Shorts and Reels are made vertical with the hook and captions; long videos are joined as they are, with chapters. The cuts are saved in the plans file and can be changed there. The recordings are never changed."
         }
         Kind::Repair => {
             "For a video whose voice has an odd sound in its pauses (a short burst every few seconds, from a cloned voice made before EI checked its room tone). Give the video's folder: EI makes a copy next to it (“<folder> - fixed”), silences the pauses of the voice and takes the bursts out of the video's sound. The picture is not re-encoded and the original folder is not changed. A folder whose pauses are already quiet is left alone."
@@ -6362,6 +6492,23 @@ mod tests {
     }
 
     #[test]
+    fn plan_make_arguments() {
+        let dir = std::env::temp_dir().join(format!("ei-ai-plan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plans = dir.join("plans.json");
+        std::fs::write(&plans, r#"{"game": "G", "plans": [{"title": "Story Part 1", "platform": "youtube", "length": "27 min"}, {"title": "The Duel", "platform": "shorts", "length": "55 s", "cuts": [{"start": 1}]}]}"#).unwrap();
+        let file = plans.to_string_lossy().to_string();
+        assert_eq!(plan_titles(&file), vec!["1. Story Part 1 · youtube · 27 min", "2. The Duel · shorts · 55 s · cuts chosen"]);
+        assert!(plan_titles("/nowhere/plans.json").is_empty());
+        let mut d = Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": 2, "fresh": true}));
+        assert_eq!(d.engine_args().unwrap(), vec!["plan-make", "--plans", &file, "--pick", "2", "--fresh"]);
+        let mut asked = Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "1", "request": " a short of the wolf "}));
+        assert_eq!(asked.engine_args().unwrap(), vec!["plan-make", "--plans", &file, "--request", "a short of the wolf"]); // (what is asked for wins)
+        assert!(Draft::from_params(Kind::PlanMake, &json!({"input": file})).engine_args().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn settings_round_trip_for_every_tool() {
         let dir = std::env::temp_dir().join(format!("ei-ai-rt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6383,6 +6530,7 @@ mod tests {
             (Kind::Audio, json!({"clips": [vs], "format": "flac", "start": "5", "normalize": true})),
             (Kind::Hooks, json!({"niches": "gaming, travel", "countries": "IN", "hookClaude": false})),
             (Kind::Repair, json!({"input": vs})),
+            (Kind::PlanMake, json!({"input": vs, "pick": "3", "request": "a short of the wolf", "fresh": true})),
             (
                 Kind::Download,
                 json!({"url": "https://youtube.com/playlist?list=PLx", "mode": "audio", "audioFormat": "mp3", "items": "1-20", "out": "/tmp/bgm"}),

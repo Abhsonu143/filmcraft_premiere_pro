@@ -138,6 +138,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("ai.script", "Write Voiceover Script…", ["AI"], None),
     uic!("ai.speak", "Speak Script…", ["AI"], None),
     uic!("ai.hooks", "Hook Library…", ["AI"], None),
+    uic!("ai.planMake", "Make Video from Plan…", ["AI"], None),
     uic!("ai.repair", "Repair Sounds in Pauses…", ["AI"], None),
     uic!("ai.topic", "Video from Topic…", ["AI"], None),
     uic!("ai.tv", "TV Light Sync…", ["AI"], None),
