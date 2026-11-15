@@ -497,7 +497,7 @@ def plan_prompt(game: str, research: dict, digests: list[str], platforms: list[s
             "instagram": "Instagram feed videos"}
     want = ", ".join(plat.get(p, p) for p in platforms)
     return f"""You plan what a gaming creator should publish from their own recordings of "{game}" (recorded on PS5, in playing order).
-They post for {want}. Plan {count} videos, the strongest first.
+They post for {want}. Plan {count} videos, the strongest first, for {"these platforms" if len(platforms) > 1 else "this platform"} only.
 
 ## What is known about the game (researched online)
 {json.dumps({k: research.get(k) for k in ("summary", "acts", "characters", "bosses", "places", "famous_moments", "formats", "title_patterns", "searches") if research.get(k)}, ensure_ascii=False)[:9000]}
@@ -515,7 +515,7 @@ They post for {want}. Plan {count} videos, the strongest first.
 - edit_tool: which EI tool makes it: "talk" (cut silences, long videos), "sections" (continuous clips from a long video),
   "clips" (short highlight clips), "music" (montage to music), "topic" (voiceover explainer with a script).
 Answer with only this JSON:
-{{"plans": [{{"title": "...", "platform": "youtube|shorts|reels|instagram", "format": "...", "length": "e.g. 12 min",
+{{"plans": [{{"title": "...", "platform": "{"|".join(platforms)}", "format": "...", "length": "e.g. 12 min",
   "hook": "...", "why": "why it will work, under 20 words", "edit_tool": "talk|sections|clips|music|topic",
   "parts": [{{"recording": "R1", "start": "0:12:30", "end": "0:20:10", "note": "what happens"}}],
   "thumbnail": "one-line idea", "tags": ["#..."]}}]}}"""
@@ -532,10 +532,12 @@ def parse_t(s) -> float:
     return v
 
 
-def clean_plans(raw: list, analyses: list[dict]) -> list[dict]:
+def clean_plans(raw: list, analyses: list[dict], platforms: list[str] | None = None) -> list[dict]:
     out = []
     for p in raw if isinstance(raw, list) else []:
         if not isinstance(p, dict) or not str(p.get("title", "")).strip():
+            continue
+        if platforms and str(p.get("platform", "youtube")) not in platforms:  # a platform that was not asked for
             continue
         parts = []
         for x in p.get("parts") or []:
@@ -616,7 +618,7 @@ def make(items: list[str], game: str, *, platforms: list[str] | None = None, cou
 
         log(f"Claude is planning {count} video(s) from {len(analyses)} recording(s), {total / 3600:.1f} h ({step} s per line)")
         r = sw.extract_json(sw.ask_claude(plan_prompt(game, research, digests, platforms, count, focus, [p["title"] for p in earlier]), timeout=900))
-        new = clean_plans(r.get("plans", []), analyses)
+        new = clean_plans(r.get("plans", []), analyses, platforms)
         for p in new:
             p["made"] = time.strftime("%Y-%m-%d %H:%M")
         plans = earlier + new

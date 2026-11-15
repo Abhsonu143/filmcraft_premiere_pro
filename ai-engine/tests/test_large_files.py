@@ -95,6 +95,11 @@ def test_planner_inputs_moments_and_plans(tmp_path):
                             {"title": "Bad", "parts": [{"recording": "R9", "start": "0:00:00", "end": "0:00:10"}]},
                             {"title": "Past the end", "parts": [{"recording": "R1", "start": "0:09:00", "end": "0:10:00"}]}], [a])
     assert [p["title"] for p in plans] == ["Boss fight"] and plans[0]["parts"][0]["start"] == 100.0 and plans[0]["total_s"] == 30.0
+    # a plan for a platform that was not asked for is dropped
+    long = {"title": "Story part 1", "platform": "youtube", "parts": [{"recording": "R1", "start": "0:00:00", "end": "0:05:00"}]}
+    assert [p["title"] for p in gp.clean_plans([long], [a])] == ["Story part 1"]
+    assert gp.clean_plans([long], [a], ["shorts", "reels"]) == []
+    assert "shorts|reels" in gp.plan_prompt("G", {}, [], ["shorts", "reels"], 3, "", []) and "youtube|" not in gp.plan_prompt("G", {}, [], ["shorts", "reels"], 3, "", [])
 
 
 def test_model_workers_keep_mlx_cache_small(monkeypatch):
