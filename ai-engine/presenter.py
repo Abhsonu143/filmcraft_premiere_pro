@@ -443,6 +443,15 @@ def add_args(p) -> None:
     r.add_argument("--port", type=int, default=0, help="the page's port on this Mac (default: any free one)")
     r.add_argument("--no-open", action="store_true", help="do not open the browser (the address is printed)")
     r.add_argument("--max-words", type=int, default=MAX_WORDS, help="most words shown to be said in one go (default 10)")
+    v = sub.add_parser("render", help="the video with your takes over it, synced to the voice (a preview up to what is recorded, or the whole video)")
+    v.add_argument("--video", required=True)
+    v.add_argument("--until", type=float, default=None, help="stop at this many seconds (default: as far as is recorded)")
+    v.add_argument("--out", default=None, help="where to write it (default: '<video> - presenter.mp4' when whole, else preview.mp4 in the presenter folder)")
+    v.add_argument("--shape", default=None, choices=["circle", "rounded", "square"])
+    v.add_argument("--size", type=float, default=None, help="width of your picture as a share of the video's shorter side (default 0.4)")
+    v.add_argument("--position", default=None, choices=["bottom-right", "bottom-left", "bottom-center", "top-right", "top-left", "top-center"])
+    v.add_argument("--margin", type=int, default=None, help="distance from the video's edge, in pixels")
+    v.add_argument("--fresh", action="store_true", help="work the plan out again (drops edits made to plan.json)")
     s = sub.add_parser("status", help="what is recorded so far")
     s.add_argument("--video", required=True)
 
@@ -450,6 +459,10 @@ def add_args(p) -> None:
 def run_args(a) -> dict:
     if a.presenter_cmd == "record":
         return serve(a.video, port=a.port, open_browser=not a.no_open, max_words=max(3, a.max_words))
+    if a.presenter_cmd == "render":
+        import presenter_sync
+
+        return presenter_sync.render(a.video, until=a.until, out=a.out, fresh=a.fresh, look={"shape": a.shape, "size": a.size, "position": a.position, "margin": a.margin})
     st = Session(a.video).state()
     print(json.dumps(st, indent=1, ensure_ascii=False))
     return {"outputs": []}
