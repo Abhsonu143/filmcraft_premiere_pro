@@ -8,11 +8,16 @@ Per shot (rendered in parallel, cached by its settings):
   look        one grade for the whole edit (`look` preset), with a per-shot exposure and
               saturation correction (`grade`) so neighbouring shots match.
   flashes     white flashes that decay quickly (`flash`); fades from/to black on the first/last shot.
+  shake       a short camera shake on an impact (`shake`, seconds into the shot; needs a punch-in at
+              the same time, which gives it room to move).
   handles     extra frames before/after when a transition overlaps the cut, so a transition is
               centred on the cut and the edit keeps its exact length.
 
 Then shots joined by transitions are mixed with `xfade` in small chunks (dissolve, dip to
-black/white, zoom, directional slide/whip), the chunks are joined without re-encoding, and the
+black/white, zoom, directional slide/whip; "soft" = a dissolve of a few frames; "blur" = a blurred
+dissolve; "zoomthrough" = the outgoing shot rushes in and the incoming one settles back, with a
+short dissolve between; "push*" = a slide with motion blur along it), the chunks are joined
+without re-encoding, and the
 soundtrack is muxed (music from its chosen start with fades and loudness normalisation, or a
 reference's own sound untouched).
 """
@@ -49,7 +54,15 @@ XFADE = {
     "whipright": "smoothright",
     "whipup": "smoothup",
     "whipdown": "smoothdown",
+    "soft": "fade",
+    "blur": "hblur",
+    "zoomthrough": "fade",
+    "pushleft": "slideleft",
+    "pushright": "slideright",
+    "pushup": "slideup",
+    "pushdown": "slidedown",
 }
+ZOOM_THROUGH = 0.32  # how far a zoom-through rushes in (added to the zoom)
 SHOT_BITRATE = "24M"  # intermediate quality (1080p); chunks with transitions are encoded once more
 
 
@@ -90,7 +103,22 @@ def zoom_expr(shot: dict, pre_frames: int, fps: float) -> str:
     expr = f"({_f(z0)}+{_f(z1 - z0)}*{ease})"
     for tp in shot.get("punches", []):
         expr += f"+0.14*exp(-max(0,{t}-{_f(tp)})/0.22)*gte({t},{_f(tp)})"
+    if shot.get("_enter_zoom"):  # arrives zoomed in, settles back (the second half of a zoom-through)
+        expr += f"+{_f(float(shot['_enter_zoom']))}*exp(-max(0,{t})/0.11)"
+    if shot.get("_exit_zoom"):  # rushes in over its last frames (the first half)
+        expr += f"+{_f(float(shot['_exit_zoom']))}*exp(min(0,{t}-{_f(D)})/0.09)"
     return f"max(1,{expr})"
+
+
+def shake_expr(shot: dict, pre_frames: int, fps: float, phase: float) -> str:
+    """Offset (fraction of the picture width) of a decaying shake at each `shake` time."""
+    t = f"(on/{_f(fps)}-{_f(pre_frames / fps)})"
+    return "+".join(f"0.011*sin(2*PI*13*({t}-{_f(ts)})+{_f(phase)})*exp(-max(0,{t}-{_f(ts)})/0.1)*gte({t},{_f(ts)})" for ts in shot.get("shake", [])) or "0"
+
+
+def is_zoomed(shot: dict) -> bool:
+    return (bool(shot.get("punches")) or bool(shot.get("_enter_zoom")) or bool(shot.get("_exit_zoom"))
+            or any(abs(float((shot.get("zoom") or {}).get(k, 1.0)) - 1.0) > 1e-6 for k in ("from", "to")))
 
 
 def grade_filters(plan: dict, shot: dict) -> str:
@@ -157,14 +185,26 @@ def frame_filters(shot: dict, W: int, H: int, zw: int, zh: int, pre: float) -> l
 def shot_filter(plan: dict, shot: dict, pre: int, post: int) -> str:
     W, H, fps = int(plan["width"]), int(plan["height"]), float(plan["fps"])
     total = shot["frames"] + pre + post
-    zoomed = bool(shot.get("punches")) or any(abs(float((shot.get("zoom") or {}).get(k, 1.0)) - 1.0) > 1e-6 for k in ("from", "to"))
+    zoomed = is_zoomed(shot)
     # Work at 1.5x the output size when zooming: zoom paths stay smooth (sub-pixel) without 4K-sized frames.
     zw, zh = (int(W * 1.5) // 2 * 2, int(H * 1.5) // 2 * 2) if zoomed else (W, H)
     chain = [f"setpts='{pts_expr(shot, pre / fps)}'", f"fps={_f(fps)}", *frame_filters(shot, W, H, zw, zh, pre / fps)]
     if zoomed:
-        chain.append(f"zoompan=z='{zoom_expr(shot, pre, fps)}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={W}x{H}:fps={_f(fps)}")
+        sx = sy = ""
+        if shot.get("shake"):
+            sx, sy = f"+iw*({shake_expr(shot, pre, fps, 0.0)})", f"+iw*0.6*({shake_expr(shot, pre, fps, 1.3)})"
+        chain.append(f"zoompan=z='{zoom_expr(shot, pre, fps)}':x='iw/2-(iw/zoom/2){sx}':y='ih/2-(ih/zoom/2){sy}':d=1:s={W}x{H}:fps={_f(fps)}")
     chain.append(grade_filters(plan, shot))
     t = f"(t-{_f(pre / fps)})"
+    # motion blur along a push, only while the transition plays
+    for key in ("_blur_in", "_blur_out"):
+        bl = shot.get(key)
+        if bl:
+            n, axis = int(bl[0]), bl[1]
+            a_, b_ = (0.0, n / fps) if key == "_blur_in" else ((total - n) / fps, total / fps)
+            big, small = _f(max(4.0, W / 45)), "0.3"
+            sig = f"sigma={big}:sigmaV={small}" if axis == "h" else f"sigma={small}:sigmaV={big}"
+            chain.append(f"gblur={sig}:steps=2:enable='between(t,{_f(a_)},{_f(b_)})'")
     for tf in shot.get("flash", []):
         chain.append(f"eq=brightness='0.55*exp(-max(0,{t}-{_f(tf)})*9)*gte({t},{_f(tf)})':eval=frame")
     if shot.get("fade_in"):
@@ -173,7 +213,6 @@ def shot_filter(plan: dict, shot: dict, pre: int, post: int) -> str:
         st = (pre + shot["frames"] - shot["fade_out"]) / fps
         chain.append(f"fade=t=out:st={_f(st)}:d={_f(shot['fade_out'] / fps)}")
     chain.append("format=yuv420p")
-    _ = total
     return ",".join(chain)
 
 
@@ -213,7 +252,7 @@ def render_shot(plan: dict, shot: dict, pre: int, post: int, dst: Path, codec: s
 def shot_key(plan: dict, shot: dict, pre: int, post: int) -> str:
     st = os.stat(shot["clip"])
     keys = {k: v for k, v in shot.items() if k not in ("score", "why", "tags", "energy")}
-    raw = json.dumps([keys, st.st_size, int(st.st_mtime), pre, post, plan["width"], plan["height"], plan["fps"], plan.get("look"), plan.get("match"), "r3"], sort_keys=True)
+    raw = json.dumps([keys, st.st_size, int(st.st_mtime), pre, post, plan["width"], plan["height"], plan["fps"], plan.get("look"), plan.get("match"), "r4"], sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
 
@@ -251,6 +290,15 @@ def render(plan_path: Path, out: str | None = None, workers: int = 2) -> Path:
         if not os.path.isfile(s["clip"]):
             raise AutocutError(f"clip missing: {s['clip']}")
     shots[0] = {**shots[0], "transition_in": {"type": "cut"}}
+    shots = [dict(s) for s in shots]
+    for i in range(1, len(shots)):  # what a transition asks of the two shots themselves
+        tr = shots[i].get("transition_in") or {}
+        kind, d = tr.get("type", "cut"), int(tr.get("frames", 0))
+        if kind == "zoomthrough" and d > 0:
+            shots[i - 1]["_exit_zoom"], shots[i]["_enter_zoom"] = ZOOM_THROUGH, ZOOM_THROUGH
+        elif kind.startswith("push") and d > 0:
+            axis = "h" if kind in ("pushleft", "pushright") else "v"
+            shots[i - 1]["_blur_out"], shots[i]["_blur_in"] = [d, axis], [d, axis]
     fps = float(plan["fps"])
     total_frames = sum(int(s["frames"]) for s in shots)
     total = total_frames / fps

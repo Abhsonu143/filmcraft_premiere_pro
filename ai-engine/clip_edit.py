@@ -13,7 +13,12 @@ jumps. An editor watches a whole fight or scene and keeps only its beats:
      with the strongest moments, pieces getting shorter as it builds, the climax (best moment)
      in slow motion when the source has the frames for it, and the payoff held longer at the end.
   4. Effects only where motivated: a flash cut out of the teaser, punch-in zooms on the biggest
-     impacts, a slow push-in on longer calm pieces, a short fade at the very end.
+     impacts (with a short camera shake on the teaser and the climax), a speed-up into the
+     slow-motion climax, a slow push-in on longer calm pieces, a short fade at the very end.
+  5. Joins that are not noticed (`add_transitions`): every jump in time gets a short transition
+     chosen for what is on both sides (a zoom-through or a push between two busy shots, a blurred
+     or plain soft dissolve between calm ones, a soft cut around speech), never the same kind
+     twice in a row, and the sound of the two shots overlaps under it instead of switching.
 
 With a music track, cut points move onto its beats.
 """
@@ -29,6 +34,7 @@ import autocut as ac
 from autocut import log
 
 HZ = 10  # signal rate (10 values per second)
+RAMP_TO = 1.7  # the build before a slow-motion climax speeds up to this
 PACE = {"slow": 1.4, "medium": 1.0, "fast": 0.72}
 
 
@@ -441,7 +447,8 @@ def edit_clip(cands: list[dict], s0: float, s1: float, target: float, mn: float,
     show_teaser = hook and tb is not None and (sum(p["out"] - p["in"] for p in pieces[: pieces.index(best)]) > 5.0)
     if show_teaser and tb is not None:
         a = max(best["in"], tb - 0.7)
-        shots.append({"in": a, "len": 1.9, "speed": 1.0, "role": "hook", "zoom": {"from": 1.04, "to": 1.12}, "punches": [round(tb - a, 2)]})
+        shots.append({"in": a, "len": 1.9, "speed": 1.0, "role": "hook", "zoom": {"from": 1.04, "to": 1.12}, "punches": [round(tb - a, 2)],
+                      "shake": [round(tb - a, 2)]})
     words_at = lambda a, b: any(w["end"] > a and w["start"] < b for w in words)  # noqa: E731
     big = sorted((p["score"] for p in acts), reverse=True)
     punch_cut = big[min(len(big) - 1, max(0, len(big) // 3))] if big else 2.0
@@ -452,9 +459,12 @@ def edit_clip(cands: list[dict], s0: float, s1: float, target: float, mn: float,
             s_a = max(p["in"] + 0.3, ti - 0.15)
             s_b = min(p["out"] - 0.2, ti + 0.55)
             if s_a - p["in"] >= 0.3:
-                shots.append({"in": p["in"], "len": s_a - p["in"], "speed": 1.0, "role": "build"})
+                build: dict = {"in": p["in"], "len": s_a - p["in"], "speed": 1.0, "role": "build"}
+                if build["len"] >= 0.8 and not words_at(p["in"], s_a):  # speeds up into the slow motion
+                    build.update(ramp_to=RAMP_TO, len=build["len"] / ((1.0 + RAMP_TO) / 2))
+                shots.append(build)
             slow = max(0.4, 30.0 / src_fps)  # one real source frame per output frame (60 fps -> 0.5x)
-            shots.append({"in": s_a, "len": (s_b - s_a) / slow, "speed": slow, "role": "climax", "punches": [0.0], "flash": [0.0]})
+            shots.append({"in": s_a, "len": (s_b - s_a) / slow, "speed": slow, "role": "climax", "punches": [0.0], "flash": [0.0], "shake": [0.0]})
             if p["out"] - s_b >= 0.3:
                 shots.append({"in": s_b, "len": p["out"] - s_b, "speed": 1.0, "role": "climax-after"})
             continue
@@ -474,6 +484,73 @@ def edit_clip(cands: list[dict], s0: float, s1: float, target: float, mn: float,
             "lines": [p.get("text") for p in pieces if p["kind"] == "line"]}
 
 
+def avg_speed(shot: dict) -> float:
+    """Source seconds per output second over the whole shot (a ramp changes speed evenly)."""
+    v0 = float(shot.get("speed", 1.0))
+    return (v0 + float(shot.get("ramp_to", v0))) / 2
+
+
+# frames at 30 fps; short enough not to be noticed as an effect
+TRANSITION_FRAMES = {"soft": 4, "dissolve": 7, "blur": 6, "zoomthrough": 6, "pushleft": 7, "pushright": 7, "pushup": 7, "pushdown": 7}
+BUSY = ["zoomthrough", "pushleft", "blur", "pushup", "zoomthrough", "pushright", "soft", "pushdown"]
+CALM = ["dissolve", "blur", "soft"]
+
+
+def add_transitions(shots: list[dict], sig: dict[str, np.ndarray] | None = None, seed: int = 0, fps: float = 30.0) -> dict[str, int]:
+    """Give every jump in time a short transition that fits both sides, and overlap the sound
+    under it (`xfade_s`). Shots that continue each other in the source (a slow-motion climax and
+    what is around it) stay plain cuts. Returns how many of each kind were used."""
+    used: dict[str, int] = {}
+    motion = np.asarray(sig["motion"], dtype=np.float32) if sig and len(sig.get("motion", [])) else None
+    busy_at = float(np.percentile(motion, 60)) if motion is not None else 0.0
+
+    def level(a: float, b: float) -> float:
+        if motion is None:
+            return 0.0
+        seg = motion[max(0, int(a * HZ)) : max(int(a * HZ) + 1, int(b * HZ))]
+        return float(seg.mean()) if len(seg) else 0.0
+
+    last = None
+    turn = {"busy": seed, "calm": seed}
+    for k in range(1, len(shots)):
+        prev, cur = shots[k - 1], shots[k]
+        prev_end = float(prev["in"]) + float(prev["len"]) * avg_speed(prev)
+        short = min(float(prev["len"]), float(cur["len"]))
+        if abs(float(cur["in"]) - prev_end) < 0.12:  # the same moment goes on: nothing to hide
+            cur["xfade_s"] = 0.03
+            continue
+        if cur.get("transition_in"):
+            last = cur["transition_in"].get("type")
+            cur.setdefault("xfade_s", 0.12)
+            continue
+        if short < 0.9:  # too short to carry a transition: a clean cut, the sound still overlaps
+            cur["xfade_s"] = 0.08
+            continue
+        roles = (str(prev.get("role", "")), str(cur.get("role", "")))
+        if any(r.startswith(("line", "talk")) for r in roles):
+            pool, key = ["soft"], "calm"
+        elif motion is not None and level(prev_end - 0.5, prev_end) >= busy_at and level(float(cur["in"]), float(cur["in"]) + 0.5) >= busy_at:
+            pool, key = BUSY, "busy"
+        elif motion is None:
+            pool, key = BUSY, "busy"
+        else:
+            pool, key = CALM, "calm"
+        kind = pool[turn[key] % len(pool)]
+        if kind == last and len(pool) > 1:  # never the same twice running
+            turn[key] += 1
+            kind = pool[turn[key] % len(pool)]
+        turn[key] += 1
+        frames = int(min(TRANSITION_FRAMES[kind] * fps / 30.0, short * fps * 0.3))
+        if frames < 3:
+            cur["xfade_s"] = 0.08
+            continue
+        cur["transition_in"] = {"type": kind, "frames": frames}
+        cur["xfade_s"] = round(max(0.12, frames / fps) if "line" not in roles[0] + roles[1] and "talk" not in roles[0] + roles[1] else 0.05, 3)
+        used[kind] = used.get(kind, 0) + 1
+        last = kind
+    return used
+
+
 def snap_to_beats(shots: list[dict], beats: list[float], tol: float = 0.3, min_len: float = 0.8) -> None:
     """Move each cut onto the nearest music beat (by lengthening/shortening the shot before it)."""
     if not beats:
@@ -484,7 +561,7 @@ def snap_to_beats(shots: list[dict], beats: list[float], tol: float = 0.3, min_l
         end = t + s["len"]
         j = int(np.argmin(np.abs(b - end)))
         d = float(b[j] - end)
-        if abs(d) <= tol and s["len"] + d >= min_len and s.get("speed", 1.0) == 1.0:
+        if abs(d) <= tol and s["len"] + d >= min_len and s.get("speed", 1.0) == 1.0 and "ramp_to" not in s:
             s["len"] += d
         t += s["len"]
 

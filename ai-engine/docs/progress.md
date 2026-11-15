@@ -1,5 +1,22 @@
 # Progress
 
+## 2026-11-15: short clips, joins that are not noticed and a livelier edit
+
+- **Why:** every join inside an action clip was a hard cut, in picture and in sound (only a 30 ms fade), so
+  clips felt abrupt; and the edit itself was plain.
+- **Transitions** (`clip_edit.add_transitions`): every jump in time gets a 4–7 frame transition chosen for both
+  sides: zoom-through or a push with motion blur between busy shots, a blurred or plain dissolve between calm
+  ones, a 4-frame soft cut around speech. Never the same kind twice running; the order differs per clip. Shots
+  that continue each other (around the slow motion) and shots under 0.9 s stay clean cuts.
+- **Sound** (`highlights.build_audio`): the two sides of each cut overlap in an equal-power crossfade
+  (0.12–0.23 s in action, 0.05 s next to speech) instead of switching. The clip keeps its exact length.
+- **Livelier:** the build speeds up (1 → 1.7x, pitch kept) into the slow-motion climax; the teaser and the
+  climax get a short camera shake with their punch-in. Talk clips get a soft cut where the talk jumps.
+- Renderer (`render.py`): new transition types `soft`, `blur`, `zoomthrough`, `pushleft/right/up/down`, and
+  `shake` on a shot. All are in the plan (`.clips.json`), so they can be changed per cut.
+- Checked on goy-…-11 (30 min): 2 clips in 83 s, 0.38 GB peak; frames across the transitions looked at.
+  Not judged by ear or in motion: that needs the owner.
+
 ## 2026-11-14: the voice step no longer gets stuck
 
 Measured on a running queue: one voice take = ~28 s of work for ~4 s of speech, the voice model 3.4–3.9 GB,

@@ -115,3 +115,33 @@ def test_caption_remap_with_slow_motion_and_title_modes():
     intro = cap.build_ass(out, "My clip", 1080, 1920, 4, "clean", "intro")
     assert "0:00:03.00,Title" in intro and "\\fad" in intro
     assert "BOOM" in cap.build_ass(out, None, 1080, 1920, 4, "pop", "off")
+
+
+def test_every_jump_gets_a_transition_and_none_repeats():
+    clip = ce.edit_clip(cands(), 0, 150, 30, 10, 60, hook=True, src_fps=60, words=[])
+    shots = clip["shots"]
+    used = ce.add_transitions(shots, {"motion": np.full(1500, 5.0, np.float32)}, seed=1)
+    kinds = [(s.get("transition_in") or {}).get("type", "cut") for s in shots]
+    assert kinds[1] == "fadewhite"  # the flash out of the teaser stays
+    for k in range(1, len(shots)):
+        prev, cur = shots[k - 1], shots[k]
+        joined = abs(cur["in"] - (prev["in"] + prev["len"] * ce.avg_speed(prev))) < 0.12
+        if joined:  # the slow-motion climax continues the shot before it: no transition
+            assert kinds[k] == "cut" and cur["xfade_s"] == 0.03
+        elif min(prev["len"], cur["len"]) >= 0.9:
+            assert kinds[k] != "cut" and cur["transition_in"]["frames"] <= 8 and cur["xfade_s"] >= 0.12
+    real = [k for k in kinds[1:] if k != "cut"]
+    assert all(a != b for a, b in zip(real, real[1:]))
+    assert len(used) >= 3  # several kinds in one clip
+    assert all(k in render.XFADE for k in real)
+    # the build speeds up into the slow motion, and the climax shakes
+    build = [s for s in shots if s.get("role") == "build"]
+    assert build and build[0]["ramp_to"] == ce.RAMP_TO
+    assert [s for s in shots if s.get("role") == "climax"][0]["shake"] == [0.0]
+
+
+def test_transitions_around_speech_are_soft():
+    shots = [{"in": 0.0, "len": 3.0, "role": "line"}, {"in": 20.0, "len": 3.0, "role": "action"}, {"in": 40.0, "len": 0.5, "role": "action"}]
+    ce.add_transitions(shots, None)
+    assert shots[1]["transition_in"] == {"type": "soft", "frames": 4} and shots[1]["xfade_s"] == 0.05
+    assert "transition_in" not in shots[2] and shots[2]["xfade_s"] == 0.08  # too short: a clean cut

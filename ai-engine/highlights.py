@@ -470,6 +470,8 @@ def talk_shots(pieces: list[tuple[float, float]], teaser: bool) -> list[dict]:
             z = 1.0
         elif prev_end is not None and 0 <= a - prev_end < 4.0:
             z = 1.12 if z == 1.0 else 1.0
+        elif prev_end is not None and b - a >= 1.2 and shots[-1]["len"] >= 1.2:
+            sh["transition_in"] = {"type": "soft", "frames": 4}  # a jump to another part of the talk
         if z != 1.0:
             sh["zoom"] = {"from": z, "to": z}
         elif b - a >= 4.0:
@@ -512,10 +514,12 @@ def frame_shots(src: str, shots: list[dict], src_w: int, src_h: int, W: int, H: 
         if same_shape:
             return "same shape"
         return mode
-    ranges = [(float(s["in"]), float(s["in"]) + s["frames"] / fps * float(s.get("speed", 1.0))) for s in shots]
+    import clip_edit as ce
+
+    ranges = [(float(s["in"]), float(s["in"]) + s["frames"] / fps * ce.avg_speed(s)) for s in shots]
     frames = reframe.reframe_pieces(src, ranges, src_w, src_h, W, H, talk)
     for s, fr in zip(shots, frames):
-        track, active = reframe.track_for_shot(fr, float(s["in"]), float(s.get("speed", 1.0)), s["frames"] / fps)
+        track, active = reframe.track_for_shot(fr, float(s["in"]), ce.avg_speed(s), s["frames"] / fps)
         if track:
             s["track"] = track
         if active:
@@ -525,25 +529,47 @@ def frame_shots(src: str, shots: list[dict], src_w: int, src_h: int, W: int, H: 
 
 def build_audio(src: str, shots: list[dict], fps: float, dst: Path, music: dict | None, fade: float) -> None:
     """The clip's sound: each shot's own source audio (slow motion pitched down, like a film
-    slow-mo), tiny fades at every cut so nothing clicks, optional music ducked under it, then
-    loudness for social platforms (-14 LUFS)."""
+    slow-mo; a speed ramp keeps its pitch), the two sides of every cut overlapped in a short
+    crossfade (the shot's `xfade_s`, else `fade`) so the sound never switches, optional music
+    ducked under it, then loudness for social platforms (-14 LUFS)."""
+    import clip_edit as ce
+
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
-    parts, labels = [], []
-    total = 0.0
+    parts = []
+    durs = [s["frames"] / fps for s in shots]
+    total = sum(durs)
+    # how much of each shot's neighbours is heard under it: half the crossfade on each side
+    half = [0.0] * (len(shots) + 1)  # half[k]: at the cut before shot k
+    for k in range(1, len(shots)):
+        half[k] = max(0.005, min(float(shots[k].get("xfade_s", fade)), durs[k - 1] / 3, durs[k] / 3) / 2)
+    cur = ""
     for k, s in enumerate(shots):
-        d = s["frames"] / fps
-        sp = float(s.get("speed", 1.0))
-        src_len = d * sp
-        cmd += ["-ss", f"{float(s['in']):.3f}", "-t", f"{src_len + 0.25:.3f}", "-i", src]
-        chain = f"[{k}:a]aresample=48000,asetpts=PTS-STARTPTS,atrim=0:{src_len:.4f}"
-        if abs(sp - 1.0) > 1e-3:
+        d = durs[k]
+        sp = ce.avg_speed(s)
+        lead = min(half[k], float(s["in"]) / sp)  # sound from before the cut in (none before the file starts)
+        tail = half[k + 1]
+        seg = lead + d + tail
+        cmd += ["-ss", f"{float(s['in']) - lead * sp:.3f}", "-t", f"{seg * sp + 0.25:.3f}", "-i", src]
+        chain = f"[{k}:a]aresample=48000,asetpts=PTS-STARTPTS,atrim=0:{seg * sp:.4f}"
+        if "ramp_to" in s and abs(sp - 1.0) > 1e-3:
+            chain += f",atempo={min(2.0, max(0.5, sp)):.4f}"
+        elif abs(sp - 1.0) > 1e-3:
             chain += f",asetrate={48000 * sp:.0f},aresample=48000"
-        fd = min(fade, d / 3)
-        chain += f",apad,atrim=0:{d:.4f},afade=t=in:d={fd:.4f},afade=t=out:st={max(0.0, d - fd):.4f}:d={fd:.4f}[a{k}]"
-        parts.append(chain)
-        labels.append(f"[a{k}]")
-        total += d
-    parts.append(f"{''.join(labels)}concat=n={len(shots)}:v=0:a=1[mix]")
+        chain += f",apad,atrim=0:{seg:.4f}"
+        if k == 0:
+            chain += f",afade=t=in:d={min(fade, d / 3):.4f}"
+        if k == len(shots) - 1:
+            fd = min(fade, d / 3)
+            chain += f",afade=t=out:st={max(0.0, seg - fd):.4f}:d={fd:.4f}"
+        parts.append(chain + f"[a{k}]")
+        if k == 0:
+            cur = "[a0]"
+        else:
+            x = half[k] + lead  # the previous shot's tail + this one's lead
+            nxt = f"[c{k}]"
+            parts.append(f"{cur}[a{k}]acrossfade=d={x:.4f}:c1=qsin:c2=qsin{nxt}")
+            cur = nxt
+    parts.append(f"{cur}anull[mix]")
     out = "[mix]"
     if music:
         m = len(shots)
@@ -663,6 +689,7 @@ def action_clips(src: str, duration: float, words: list[dict], count: int, targe
         c = ce.edit_clip(ce.moments(score, sig, words, s0, s1, pf), s0, s1, target, mn, mx, hook=hook, src_fps=src_fps, words=words, pace=pf)
         if c is None:
             continue
+        c["transitions"] = ce.add_transitions(c["shots"], sig, seed=len(clips))
         dur = sum(s["len"] for s in c["shots"])
         if dur < mn:
             continue
