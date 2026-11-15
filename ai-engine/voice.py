@@ -172,6 +172,68 @@ def open_pauses(y: np.ndarray, bounds: list[float], want: float, tone: np.ndarra
     return np.concatenate(out).astype(np.float32), new
 
 
+STRESS = (0.88, 2.5, 0.09)  # a stressed word: its speed, how many dB louder, seconds of pause before it
+
+
+def _words_worker(items: list[tuple[str, str]], models: dict[str, str]) -> list[list[list]]:
+    import mlx_whisper
+
+    out = []
+    for p, lang in items:
+        r = mlx_whisper.transcribe(p, path_or_hf_repo=models.get(lang, models["en"]), language=lang, condition_on_previous_text=False, word_timestamps=True)
+        out.append([[str(w.get("word", "")), float(w.get("start", 0)), float(w.get("end", 0))] for sg in r.get("segments", []) for w in sg.get("words", [])])
+    return out
+
+
+def find_words(words: list[list], wanted: list[str]) -> list[tuple[float, float]]:
+    """When each wanted word (or short phrase) is said, from a word-by-word transcript: its first
+    place after the wanted one before it. A word that was not heard is left out."""
+    norm = lambda w: re.sub(r"[^\w]+", "", unicodedata.normalize("NFKC", str(w)).lower())  # noqa: E731
+    heard = [(norm(w[0]), float(w[1]), float(w[2])) for w in words if norm(w[0])]
+    spans, at = [], 0
+    for want in wanted:
+        parts = [p for p in (norm(x) for x in str(want).split()) if p]
+        if not parts:
+            continue
+        for i in range(at, len(heard) - len(parts) + 1):
+            if [h[0] for h in heard[i : i + len(parts)]] == parts and heard[i + len(parts) - 1][2] > heard[i][1]:
+                spans.append((heard[i][1], heard[i + len(parts) - 1][2]))
+                at = i + len(parts)
+                break
+    return spans
+
+
+def stress(y: np.ndarray, spans: list[tuple[float, float]], tone: np.ndarray) -> np.ndarray:
+    """The words at `spans` (seconds) said with weight: a little slower and louder, after a short
+    pause where the voice dips before them. The cuts are moved to the quietest moment nearby."""
+    speed, db_up, pause = STRESS
+    win = int(0.01 * SR)
+
+    def quietest(t: float) -> int:
+        c = int(t * SR)
+        lo, hi = max(0, c - int(0.04 * SR)), min(len(y) - win, c + int(0.04 * SR))
+        if hi <= lo:
+            return int(np.clip(c, 0, len(y)))
+        e = np.convolve(y[lo : hi + win].astype(np.float64) ** 2, np.ones(win), mode="valid")
+        return lo + int(np.argmin(e)) + win // 2
+
+    peak = float(np.percentile(frame_db(y), 95)) if len(y) > SR // 10 else 0.0
+    for a, b in sorted(spans, reverse=True):
+        i0, i1 = quietest(a), quietest(b)
+        if i1 - i0 < int(0.08 * SR) or i1 - i0 > int(2.0 * SR):
+            continue
+        word = tempo(y[i0:i1], speed)
+        ramp = min(len(word) // 3, int(0.03 * SR))
+        env = np.full(len(word), 10 ** (db_up / 20), np.float32)
+        if ramp > 0:
+            env[:ramp] = np.linspace(1, env[0], ramp)
+            env[-ramp:] = np.linspace(env[0], 1, ramp)
+        before = y[max(0, i0 - win) : i0 + win]
+        dips = i0 > int(0.15 * SR) and len(before) and 10 * np.log10(max(1e-10, float(np.mean(before.astype(np.float64) ** 2)))) < peak - 20
+        y = np.concatenate([y[:i0], pause_fill(tone, int(pause * SR)) if dips else np.zeros(0, np.float32), word * env, y[i1:]]).astype(np.float32)
+    return np.clip(y, -1.0, 1.0)
+
+
 def fit_length(speech: float, gaps: float, pause_scale: float, seconds: float | None) -> tuple[float, float]:
     """(length of the pauses, speed of the speech) that make a narration `seconds` long: first the pauses
     give or take (0.6–1.6 times the pace's own), then the speech a little (at most 6% either way)."""
@@ -1016,10 +1078,11 @@ def speak_mac(voice: str, script: str, out: str, language: str | None = None) ->
 
 
 def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, takes: int = 2, language: str | None = None,
-          whisper_model: str | None = None, pace: str = "reference", seconds: float | None = None) -> dict:
+          whisper_model: str | None = None, pace: str = "reference", seconds: float | None = None, expressive: bool = True) -> dict:
     """Script -> narration in the cloned voice (wav + narration.json). `mac` / `mac:<name>` uses a macOS voice.
     `pace`: how fast it talks next to the voice's recordings (PACES). `seconds`: the length it should have
-    (the pauses, then the speed a little, are fitted to it)."""
+    (the pauses, then the speed a little, are fitted to it). `expressive`: a passage said flatter than the
+    voice's recordings gets another take, and the script's emphasis words are said with weight."""
     if pace not in PACES:
         raise AutocutError(f"the pace is one of {', '.join(PACES)}")
     sample_speed, spoken_speed, pause_scale, _ = PACES[pace]
@@ -1073,6 +1136,9 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
     langs = {c["lang"] for c in chunks}
     check_models = {lg: (whisper_model or CHECK_WHISPER.get(lg, CHECK_WHISPER["en"])) for lg in langs}
     keep_loaded = all("large" not in m for m in check_models.values())
+    # how much the pitch moves in the voice's own recordings: a take is wanted as lively as that
+    moves = [r["features"]["pitch_range"] for r in prof.get("refs", []) if (r.get("features") or {}).get("pitch_range") and r.get("quality", 0) >= 0.5]
+    lively = float(np.median(moves)) if expressive and len(moves) >= 3 else None
     iso = ac.Isolated("voice model", stall=300.0)
     with iso, tempfile.TemporaryDirectory(prefix="ei-speak-") as tmp:
         cands: dict[int, list[dict]] = {}
@@ -1121,7 +1187,7 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
                     for j, h, e in zip(ok, heard, embs):
                         y = read_wav(j["out"])
                         cps = len(norm_text(chunks[j["chunk"]]["text"])) / max(0.3, len(y) / SR)
-                        meta = {"cer": round(speech_error(h, chunks[j["chunk"]]["text"]), 3),
+                        meta = {"cer": round(speech_error(h, chunks[j["chunk"]]["text"]), 3), "prange": features(y).get("pitch_range"),
                                 "sim": None if e is None or centroid is None else round(float(e @ centroid), 3),
                                 "emb": None if e is None else [float(x) for x in e], "heard": h.strip(), "cps": round(cps, 1)}
                         Path(j["meta"]).write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
@@ -1133,13 +1199,14 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
                         continue
                     emb = np.asarray(meta["emb"], dtype=np.float32) if meta.get("emb") is not None else None
                     cands.setdefault(j["chunk"], []).append({"file": j["out"], "cer": meta["cer"], "sim": meta["sim"], "emb": emb,
-                                                             "heard": meta.get("heard", ""), "cps": meta.get("cps", 0.0)})
-            best = pick_takes(chunks, cands)
+                                                             "heard": meta.get("heard", ""), "cps": meta.get("cps", 0.0), "prange": meta.get("prange")})
+            best = pick_takes(chunks, cands, lively)
+            flat = lambda b: bool(lively and b.get("prange") and b["prange"] < 0.9 * lively)  # noqa: E731
             sims = [b["sim"] for b in best.values() if b.get("sim") is not None]
             med = float(np.median(sims)) if sims else None
             bad = [ci for ci in range(len(chunks)) if ci not in best or best[ci]["cer"] > 0.35 or (best[ci]["sim"] is not None and best[ci]["sim"] < 0.5)]
             weak = [ci for ci in range(len(chunks)) if ci in best and ci not in bad and len(cands.get(ci, [])) < takes
-                    and (best[ci]["cer"] > 0.12 or (med is not None and best[ci]["sim"] is not None and best[ci]["sim"] < med - 0.05))]
+                    and (best[ci]["cer"] > 0.12 or (med is not None and best[ci]["sim"] is not None and best[ci]["sim"] < med - 0.05) or flat(best[ci]))]
             if round_ == 0 and (bad or weak) and takes >= 1:
                 # a weak passage gets one more take (best of two); a wrong one two fresh takes
                 rounds.append(("better takes", sorted(set(bad) | set(weak)), {**{ci: max(1, takes - 1) for ci in weak}, **{ci: max(2, takes - 1) for ci in bad}}))
@@ -1151,16 +1218,35 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
                 log(f"all {len(chunks)} passage(s) are good at the first take")
         with ac.stage("better takes"):  # (done, or not needed)
             pass
-        best = pick_takes(chunks, cands)
+        best = pick_takes(chunks, cands, lively)
         missing = [ci for ci in range(len(chunks)) if ci not in best]
         if missing:
             raise AutocutError(f"{len(missing)} passage(s) could not be spoken")
         # assemble: passages joined by the script's pauses (your room tone), one gentle level for all
         tone = read_wav(d / "roomtone.wav") if (d / "roomtone.wav").is_file() else np.zeros(0, np.float32)
         fade = int(0.012 * SR)
+        trimmed = {ci: trim_silence(read_wav(best[ci]["file"]), pad=0.05) for ci in range(len(chunks))}
+        if expressive:  # the script's emphasis words, said with weight
+            # (one per line, two in an intense one: more would be shouting)
+            wanted = {ci: [w for i in c["lines"] for w in (segs[i].get("emphasis") or [])[: 2 if float(segs[i].get("intensity", 0.6)) >= 0.8 else 1]] for ci, c in enumerate(chunks)}
+            todo = [ci for ci in wanted if wanted[ci]]
+            if todo:
+                iso.close()  # (room for Whisper)
+                for ci in todo:
+                    write_wav(Path(tmp) / f"p{ci}.wav", trimmed[ci])
+                try:
+                    heard_words = ac.run_isolated(_words_worker, [(str(Path(tmp) / f"p{ci}.wav"), chunks[ci]["lang"]) for ci in todo], check_models)
+                    n_stressed = 0
+                    for ci, ws in zip(todo, heard_words):
+                        spans = find_words(ws, wanted[ci])
+                        n_stressed += len(spans)
+                        trimmed[ci] = stress(trimmed[ci], spans, tone)
+                    log(f"emphasis: {n_stressed} of {sum(len(wanted[ci]) for ci in todo)} marked word(s) found and said with weight")
+                except Exception as e:  # noqa: BLE001 (the narration is whole without it)
+                    log(f"emphasis left out ({type(e).__name__}: {e})")
         spoken = []  # per passage: its sound at this pace, where its lines start and end, the pause after it
         for ci, c in enumerate(chunks):
-            y = trim_silence(read_wav(best[ci]["file"]), pad=0.05)
+            y = trimmed[ci]
             if spoken_speed != 1.0:
                 y = tempo(y, spoken_speed)
             if len(y) > 2 * fade:
@@ -1289,9 +1375,10 @@ def anchor_ref(prof: dict, d: Path, lang: str, target: float = 9.0) -> tuple[str
     return str(path), [r["file"] for r in chosen]
 
 
-def pick_takes(chunks: list[dict], cands: dict[int, list[dict]]) -> dict[int, dict]:
+def pick_takes(chunks: list[dict], cands: dict[int, list[dict]], lively: float | None = None) -> dict[int, dict]:
     """Best take per passage, in order: says the words, sounds like you, and like the passage
-    before it (so the narration stays one person)."""
+    before it (so the narration stays one person); with `lively` (how much the pitch moves in the
+    voice's recordings), a take whose pitch moves as much is preferred to a flat one."""
     best: dict[int, dict] = {}
     prev = None
     for ci in range(len(chunks)):
@@ -1305,6 +1392,8 @@ def pick_takes(chunks: list[dict], cands: dict[int, list[dict]]) -> dict[int, di
             if prev is not None and c["emb"] is not None and prev.get("emb") is not None:
                 s += 0.6 * float(c["emb"] @ prev["emb"])
             s -= 0.4 if not 6 <= c["cps"] <= 22 else 0.0
+            if lively and c.get("prange"):
+                s += 0.6 * min(1.1, c["prange"] / lively)
             return s
 
         best[ci] = max(cs, key=score)
@@ -1375,6 +1464,7 @@ def add_args(sub) -> None:
     p.add_argument("--language", choices=["en", "hi"])
     p.add_argument("--pace", default="relaxed", choices=list(PACES), help="how fast the voice talks next to its recordings (default relaxed)")
     p.add_argument("--seconds", type=float, default=None, help="the length the narration should have (pauses and speed are fitted to it)")
+    p.add_argument("--plain", action="store_true", help="no extra takes for flat passages and no weight on the emphasis words")
     import score
 
     score.add_sound_args(p)
@@ -1403,7 +1493,7 @@ def run_args(a) -> dict:
         import score
 
         opts = score.options(a)
-        res = speak(a.voice, a.script, a.out, engine=a.engine, takes=a.takes, language=a.language, pace=a.pace, seconds=a.seconds)
+        res = speak(a.voice, a.script, a.out, engine=a.engine, takes=a.takes, language=a.language, pace=a.pace, seconds=a.seconds, expressive=not a.plain)
         if opts:  # the voice alone stays; the scored version is written next to it
             wav = res["outputs"][0]
             scored = str(Path(wav).with_name(Path(wav).stem + " - scored.wav"))

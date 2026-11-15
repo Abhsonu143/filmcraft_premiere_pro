@@ -274,3 +274,22 @@ def test_the_script_is_sized_to_what_the_voice_does(tmp_path, monkeypatch):
     res = sw.write_script("a topic", str(tmp_path / "s"), seconds=30, pace_voice="me", pace="relaxed")
     script = json.loads(open(res["script"]).read())
     assert len(asked) == 2 and "has 120 words" in asked[1] and script["words"] == 78  # 30 s at 160 words a minute: 80 words
+
+
+def test_emphasis_words_are_found_and_said_with_weight(monkeypatch):
+    words = [[" Do", 0.0, 0.2], [" these", 0.2, 0.5], [" eight", 0.5, 0.9], [" things,", 0.9, 1.3], [" first.", 1.4, 1.9], [" Day", 2.0, 2.2], [" one!", 2.2, 2.6]]
+    assert vo.find_words(words, ["eight", "FIRST", "day one", "missing"]) == [(0.5, 0.9), (1.4, 1.9), (2.0, 2.6)]
+    assert vo.find_words(words, ["first", "eight"]) == [(1.4, 1.9)] and vo.find_words([], ["x"]) == []  # (in the order they are said)
+    monkeypatch.setattr(vo, "tempo", lambda y, f: np.repeat(y, 2)[: int(len(y) / f)])  # (stands in for ffmpeg)
+    sr = vo.SR
+    tone = lambda f: (0.2 * np.sin(2 * np.pi * f * np.arange(int(0.4 * sr)) / sr)).astype(np.float32)  # noqa: E731
+    gap = np.zeros(int(0.06 * sr), np.float32)
+    y = np.concatenate([tone(200), gap, tone(300), gap, tone(250)])
+    out = vo.stress(y, [(0.46, 0.86)], np.zeros(0, np.float32))  # the second "word"
+    speed, db_up, pause = vo.STRESS
+    assert len(out) / sr == pytest.approx(len(y) / sr + 0.4 / speed - 0.4 + pause, abs=0.03)  # slower, after a short pause
+    assert np.abs(out[int(0.65 * sr) : int(0.85 * sr)]).max() == pytest.approx(0.2 * 10 ** (db_up / 20), rel=0.05)  # and louder
+    assert np.abs(out[: int(0.38 * sr)] - y[: int(0.38 * sr)]).max() == 0  # nothing before it is touched
+    assert len(vo.stress(y, [(0.46, 0.47)], np.zeros(0, np.float32))) == len(y)  # too short to be a word: left alone
+    takes = {0: [{"cer": 0.0, "sim": 0.8, "emb": None, "cps": 14, "prange": 1.5, "heard": ""}, {"cer": 0.0, "sim": 0.8, "emb": None, "cps": 14, "prange": 2.1, "heard": ""}]}
+    assert vo.pick_takes([{}], takes, 2.0)[0]["prange"] == 2.1 and vo.pick_takes([{}], takes)[0]["prange"] == 1.5  # the livelier take, when asked
