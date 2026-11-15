@@ -263,6 +263,19 @@ fn ai_menu_and_dialogs() {
         ),
         ("audio", &["clips.add", "clips.addFolder", "format", "quality", "start", "end", "mono", "normalize", "out", "run"]),
     ];
+    // Voice Clone ▸ the talking style only: no languages, recordings only
+    d.run("ai.voice", json!({}));
+    d.frames(8);
+    d.ok("ui.click", json!({"id": "ai.voice.make.style"}));
+    d.frames(4);
+    d.snapshot("voice-style");
+    let ids = d.ids("ai.voice.");
+    for want in ["ai.voice.make.voice", "ai.voice.make.both", "ai.voice.name", "ai.voice.clips.add"] {
+        assert!(ids.iter().any(|i| i == want), "{want} in {ids:?}");
+    }
+    assert!(!ids.iter().any(|i| i.starts_with("ai.voice.lang.")), "no languages for a style: {ids:?}");
+    d.ok("ui.click", json!({"id": "ai.voice.cancel"}));
+    d.frames(2);
     // Talking Head Auto-Cut ▸ plan videos from recordings
     d.run("ai.talk", json!({}));
     d.frames(8); // (the centred dialog settles its size before a click lands where it should)

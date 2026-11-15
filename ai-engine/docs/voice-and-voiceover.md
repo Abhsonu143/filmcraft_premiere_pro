@@ -174,3 +174,14 @@ Measured on 9 GTA Shorts (8 min): without separation, 12 phrases (1.4 min) passe
 ## Talking style from recordings
 
 Learn Style (Script ▸ Learn a style, or `script-style --name N <files>`) also takes audio and video recordings. They're transcribed on this Mac, and the pace is measured from their timing.
+
+## Voice, talking style, or both (one place)
+
+The Voice Clone dialog has a **Make** choice:
+- **Clone the voice:** as before.
+- **Learn the talking style only:** pace, sentence length, hooks, fillers and endings, saved as a style for the script writer.
+- **Both.**
+
+The style is saved under the same name as the voice. It's learned only from recordings of free talking, not from sentences read aloud from EI's prompts.
+
+Engine: `voice-enroll --make voice|style|both`.

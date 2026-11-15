@@ -266,6 +266,8 @@ struct Draft {
     queue_edit: Option<u64>,
     /// Talking Head Auto-Cut: "cut" (the pauses of one video) or "plan" (videos from a list of gameplay recordings).
     talk_mode: &'static str,
+    /// Voice Clone: "voice", "style" (the talking style only) or "both".
+    voice_make: &'static str,
     /// Plan mode: the game (researched online), how many plans, only analyse.
     game: String,
     plan_count: f64,
@@ -464,6 +466,7 @@ impl Draft {
             find_hook: false,
             queue_edit: None,
             talk_mode: "cut",
+            voice_make: "voice",
             game: String::new(),
             plan_count: 12.0,
             analyse_only: false,
@@ -642,6 +645,7 @@ impl Draft {
         }
         d.pk_style = pick("thumbStyle", &THUMB_STYLES.map(|a| a.0), d.pk_style);
         d.talk_mode = pick("talkMode", &TALK_MODES.map(|a| a.0), d.talk_mode);
+        d.voice_make = pick("voiceMake", &VOICE_MAKES.map(|a| a.0), d.voice_make);
         if let Some(v) = s("game") {
             d.game = v;
         }
@@ -777,6 +781,7 @@ impl Draft {
         p["variants"] = json!(self.pk_variants);
         p["thumbStyle"] = json!(self.pk_style);
         p["talkMode"] = json!(self.talk_mode);
+        p["voiceMake"] = json!(self.voice_make);
         p["game"] = json!(self.game);
         p["planCount"] = json!(self.plan_count);
         p["analyseOnly"] = json!(self.analyse_only);
@@ -1261,6 +1266,20 @@ impl Draft {
                 }
                 push(&mut a, "--out-dir", self.out.trim());
             }
+            Kind::Voice if self.voice_make == "style" => {
+                let name = self.voice_name.trim();
+                if name.is_empty() {
+                    return Err("Give the style a name.".into());
+                }
+                if self.source != "files" || self.clips.is_empty() {
+                    return Err("A talking style is learned from recordings of free talking: choose “Recordings I already have” and add them.".into());
+                }
+                a = vec!["voice-enroll".into()];
+                push(&mut a, "--name", name);
+                push(&mut a, "--make", "style");
+                a.push("--files".into());
+                a.extend(self.clips.iter().cloned());
+            }
             Kind::Voice => {
                 let name = self.voice_name.trim();
                 if name.is_empty() {
@@ -1269,8 +1288,16 @@ impl Draft {
                 if !self.lang_en && !self.lang_hi && !self.lang_mix {
                     return Err("Choose at least one language.".into());
                 }
+                if self.voice_make == "both" && self.source != "files" {
+                    return Err(
+                        "The talking style is learned from recordings of free talking: choose “Recordings I already have” (or make the voice only).".into()
+                    );
+                }
                 a = vec!["voice-enroll".into()];
                 push(&mut a, "--name", name);
+                if self.voice_make == "both" {
+                    push(&mut a, "--make", "both");
+                }
                 a.push("--languages".into());
                 if self.lang_en {
                     a.push("en".into());
@@ -1607,6 +1634,12 @@ const PLATFORMS: [(&str, &str); 4] = [
     ("shorts", "YouTube Shorts (1080×1920)"),
     ("instagram", "Instagram video, feed (1080×1350)"),
     ("reels", "Instagram Reels (1080×1920)"),
+];
+/// Voice Clone: what to make from the recordings.
+const VOICE_MAKES: [(&str, &str); 3] = [
+    ("voice", "Clone the voice"),
+    ("style", "Learn the talking style only (pace, hooks, phrases: for scripts)"),
+    ("both", "Both: the voice and its talking style"),
 ];
 /// Talking Head Auto-Cut: one video, or plans from a list of recordings.
 const TALK_MODES: [(&str, &str); 2] = [("cut", "Cut the pauses (one video)"), ("plan", "Plan videos from recordings (a list, in playing order)")];
@@ -2834,7 +2867,11 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
         }
         Kind::Split | Kind::Reference | Kind::Talk | Kind::Voiceover | Kind::Clips => format!("{}: {}", d.kind.title(), file_stem(&d.input)),
         Kind::Script => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
-        Kind::Voice => format!("{}: {}", d.kind.title(), d.voice_name.trim()),
+        Kind::Voice => match d.voice_make {
+            "style" => format!("Learn talking style: {}", d.voice_name.trim()),
+            "both" => format!("{} and talking style: {}", d.kind.title(), d.voice_name.trim()),
+            _ => format!("{}: {}", d.kind.title(), d.voice_name.trim()),
+        },
         Kind::Topic | Kind::Package => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Speak => format!("{}: {}", d.kind.title(), file_stem(&d.out)),
         Kind::Hooks => format!("{}: sync {}", d.kind.title(), d.hook_niches.trim().chars().take(40).collect::<String>()),
@@ -3351,6 +3388,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         });
                         ui.end_row();
                     }
+                    if d.kind == Kind::Voice {
+                        ui.label("Make");
+                        radio_row(ui, &mut d.voice_make, &VOICE_MAKES, &format!("{p}.make"), &mut elems);
+                        ui.end_row();
+                    }
                     if d.kind == Kind::Talk {
                         ui.label("What to do");
                         radio_row(ui, &mut d.talk_mode, &TALK_MODES, &format!("{p}.mode"), &mut elems);
@@ -3863,10 +3905,16 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             }
                         }
                         Kind::Voice => {
-                            ui.label("Voice name");
-                            let r = ui.add(egui::TextEdit::singleline(&mut d.voice_name).hint_text("e.g. my voice").desired_width(240.0));
-                            elems.push((format!("{p}.name"), r.rect, d.voice_name.clone()));
+                            ui.label("Name");
+                            ui.vertical(|ui| {
+                                let r = ui.add(egui::TextEdit::singleline(&mut d.voice_name).hint_text("e.g. my voice").desired_width(240.0));
+                                elems.push((format!("{p}.name"), r.rect, d.voice_name.clone()));
+                                if d.voice_make != "voice" {
+                                    ui.label(egui::RichText::new("The style is saved under this name too: pick it as the Style when writing a script.").small().weak());
+                                }
+                            });
                             ui.end_row();
+                            if d.voice_make != "style" {
                             ui.label("Languages");
                             ui.horizontal(|ui| {
                                 let r = ui.checkbox(&mut d.lang_hi, "Hindi");
@@ -3877,6 +3925,10 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                                 elems.push((format!("{p}.lang.en"), r.rect, d.lang_en.to_string()));
                             });
                             ui.end_row();
+                            }
+                            if d.voice_make != "voice" && d.source != "files" {
+                                d.source = "files"; // (a style comes from free talking, not read sentences)
+                            }
                             ui.label("Source");
                             radio_row(ui, &mut d.source, &VOICE_SOURCES, &format!("{p}.source"), &mut elems);
                             ui.end_row();
@@ -4163,7 +4215,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     close = true;
                 }
                 let run_label = match d.kind {
-                    Kind::Voice => "Create Voice",
+                    Kind::Voice => match d.voice_make {
+                        "style" => "Learn Style",
+                        "both" => "Create Voice & Style",
+                        _ => "Create Voice",
+                    },
                     Kind::Script if !d.voice.is_empty() => "Write and Speak",
                     Kind::Script => "Write Script",
                     Kind::Topic if d.make_video => "Make Video",
@@ -4996,7 +5052,7 @@ fn description(kind: Kind) -> &'static str {
             "Give a topic or a link to a post. Claude researches it on the web (facts with sources), writes the script, and EI makes the video: your cloned voice (or a macOS voice), credited free-licensed photos and videos, fact cards, your own footage, optional YouTube clips. Or make only the script with its sources."
         }
         Kind::Voice => {
-            "Clones your voice on this Mac (Chatterbox Multilingual, Hindi + English). Read the sentences EI shows (they cover every sound and the deliveries a video needs), or use recordings you already have. Use only your own voice, or a voice you have permission to use."
+            "Clones your voice on this Mac (Chatterbox Multilingual, Hindi + English). Read the sentences EI shows (they cover every sound and the deliveries a video needs), or use recordings you already have (music under the voice is taken out). It can also learn the talking style of the recordings (pace, hooks, phrases) for scripts, on its own or with the voice. Use only your own voice, or a voice you have permission to use."
         }
         Kind::Clips => {
             "Edits each clip from a whole scene of a long video: only its best beats, cut on the action, a teaser first, slow motion on the climax, punch-ins on the big hits. Reframed to truly fill the shape (following the action and faces). Talk clips are built from sentences and topics. Optional captions, title card and music (cuts move onto its beats).\n\nContinuous sections: each output is one uninterrupted part of the video (15 s – 3 min). EI chooses where it starts and ends: on a cut of the video, between sentences, before the action builds and after it settles, never mid-sentence or on black."
@@ -5765,6 +5821,32 @@ mod tests {
         assert!(ta.windows(2).any(|w| w == ["--feedback", "the hook is boring"]), "{ta:?}");
         let mut back = Draft::from_params(Kind::Topic, &t.to_params());
         assert_eq!(back.engine_args().unwrap(), ta, "feedback survives the queue");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn voice_clone_makes_the_voice_the_style_or_both() {
+        let dir = std::env::temp_dir().join(format!("ei-voice-make-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let rec = dir.join("talk.mp3");
+        std::fs::write(&rec, b"x").unwrap();
+        let rec = rec.to_string_lossy().to_string();
+        let base = json!({"name": "roddy-game", "source": "files", "clips": [rec], "languages": ["en"]});
+        let args = |make: &str| {
+            let mut p = base.clone();
+            p["voiceMake"] = json!(make);
+            Draft::from_params(Kind::Voice, &p).engine_args()
+        };
+        let voice = args("voice").unwrap();
+        assert!(!voice.contains(&"--make".to_string()), "{voice:?}");
+        let style = args("style").unwrap();
+        assert!(style.windows(2).any(|w| w == ["--make", "style"]) && !style.contains(&"--languages".to_string()), "{style:?}");
+        let both = args("both").unwrap();
+        assert!(both.windows(2).any(|w| w == ["--make", "both"]) && both.contains(&"--languages".to_string()), "{both:?}");
+        let mut rt = Draft::from_params(Kind::Voice, &Draft::from_params(Kind::Voice, &json!({"name": "x", "voiceMake": "both"})).to_params());
+        assert_eq!(rt.voice_make, "both", "kept in the queue");
+        assert!(Draft::from_params(Kind::Voice, &json!({"name": "x", "voiceMake": "style", "source": "record"})).engine_args().is_err());
+        let _ = rt.engine_args();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

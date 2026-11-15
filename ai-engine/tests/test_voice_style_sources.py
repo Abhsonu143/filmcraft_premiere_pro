@@ -29,3 +29,23 @@ def test_music_under_the_voice_is_noticed(tmp_path, under, low):
         cmd = ["-f", "lavfi", "-i", talk]
     subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", *cmd, "-ar", "24000", str(out)], check=True)
     assert (voice.music_under(str(out), tmp_path) < voice.SEPARATE_BELOW) is low
+
+
+def test_voice_enroll_can_make_the_style_only_or_both(monkeypatch, tmp_path):
+    rec = tmp_path / "talk.mp3"
+    rec.write_bytes(b"x")
+    calls = []
+    monkeypatch.setattr(voice, "enroll", lambda *a, **k: calls.append("voice") or {"outputs": ["/v/profile.json"], "voice": "n"})
+    monkeypatch.setenv("EI_SETTINGS", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(ac, "transcribe", lambda p, **k: {"segments": [{"start": 0.0, "end": 3.0, "text": "So the update is out. Right, here is what changed."}]})
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd")
+    voice.add_args(sub)
+    only = voice.run_args(ap.parse_args(["voice-enroll", "--name", "Roddy Game", "--make", "style", "--files", str(rec)]))
+    assert calls == [] and only["outputs"] == [only["style"]] and (tmp_path / "styles").is_dir()
+    both = voice.run_args(ap.parse_args(["voice-enroll", "--name", "Roddy Game", "--make", "both", "--files", str(rec)]))
+    assert calls == ["voice"] and both["outputs"] == ["/v/profile.json", both["style"]] and both["voice"] == "n"
+    with pytest.raises(ac.AutocutError):
+        voice.run_args(ap.parse_args(["voice-enroll", "--name", "x", "--make", "style"]))

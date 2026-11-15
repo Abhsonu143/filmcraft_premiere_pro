@@ -538,6 +538,30 @@ def music_under(src: str, tmp: Path) -> float:
     return float(features(read_wav(probe)).get("snr_db", 99))
 
 
+def learn_style(name: str, files: list[str] | None) -> dict:
+    """The talking style of the same recordings (pace, sentence length, hooks, fillers, endings),
+    saved as a style of the same name for the script writer. Free talking only: read prompts are
+    someone else's sentences."""
+    import script_writer as sw
+
+    if not files:
+        raise AutocutError("a talking style is learned from recordings of free talking: add recordings (audio or video)")
+    srcs = sw.load_sources(list(files))
+    if not srcs:
+        raise AutocutError("no speech found in the recordings to learn a talking style from")
+    prof = sw.analyse_style(srcs)
+    path = sw.save_style(name, prof)
+    log(f"talking style '{name}': {prof['words']} words from {len(srcs)} recording(s), {prof['language']}, {prof['words_per_minute'] or '?'} words a minute")
+    return {"style": str(path), "style_profile": {k: prof.get(k) for k in ("language", "words", "words_per_minute", "avg_sentence_words")}}
+
+
+def merge_style(res: dict, st: dict) -> dict:
+    out = {**res, **st}
+    out["outputs"] = [*res.get("outputs", []), st["style"]]
+    out.setdefault("out_dir", str(Path(st["style"]).parent))
+    return out
+
+
 def enroll(name: str, files: list[str] | None = None, takes: list[dict] | None = None, languages: list[str] | None = None,
            engine: str = DEFAULT_ENGINE, add: bool = False, separate: str = "auto") -> dict:
     """Build (or extend) a voice profile from recordings of your voice.
@@ -1226,6 +1250,8 @@ def add_args(sub) -> None:
     p.add_argument("--languages", nargs="*")
     p.add_argument("--engine", default=DEFAULT_ENGINE, choices=list(ENGINES))
     p.add_argument("--add", action="store_true", help="add to an existing voice instead of replacing its references")
+    p.add_argument("--make", default="voice", choices=["voice", "style", "both"],
+                   help="clone the voice, learn the talking style (saved as a style of the same name), or both")
     p.add_argument("--separate", default="auto", choices=["auto", "always", "never"],
                    help="take background music out of the recordings first (auto: when there is music under the voice)")
     sub.add_parser("voice-list", help="saved voices")
@@ -1254,7 +1280,12 @@ def run_args(a) -> dict:
         return {"voices": list_voices(), "mac": list_mac_voices()}
     if a.cmd == "voice-enroll":
         takes = json.loads(Path(a.takes).read_text(encoding="utf-8")) if a.takes else None
-        return enroll(a.name, a.files, takes, a.languages, a.engine, a.add, a.separate)
+        res: dict = {"outputs": []}
+        if a.make in ("voice", "both"):
+            res = enroll(a.name, a.files, takes, a.languages, a.engine, a.add, a.separate)
+        if a.make in ("style", "both"):
+            res = merge_style(res, learn_style(a.name, a.files))
+        return res
     if a.cmd == "speak":
         import score
 
