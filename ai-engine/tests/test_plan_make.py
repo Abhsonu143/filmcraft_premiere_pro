@@ -68,6 +68,7 @@ def test_a_plan_becomes_a_video(tmp_path, monkeypatch):
     p = plan()
     p["parts"] = [{"recording": str(rec), "r": 1, "start": 5.5, "end": 12.0, "note": "hello"}, {"recording": str(rec), "r": 1, "start": 20.3, "end": 31.0, "note": "later"}]
     short = {**plan("shorts"), "parts": p["parts"]}
+    monkeypatch.setattr(pm, "hear", lambda rec, pieces, lang: None)  # (no listening model in tests: the planner's times are used)
     pj = tmp_path / "plans" / "plans.json"
     pj.parent.mkdir()
     pj.write_text(json.dumps({"game": "Game", "recordings": [str(rec)], "plans": [p, short]}))
@@ -122,4 +123,32 @@ def test_the_hook_comes_from_inside_the_pieces():
     assert 296 <= h["start"] <= 304 and h["end"] - h["start"] == 2.5  # nothing said: the peak of the action
     text = pm.publish_text(plan(), [{"recording": "/r/a.mov", "start": 120.0, "end": 123.0, "note": ""}, *[{**c, "note": "the sword"} for c in cuts]], True)
     assert "0:00 the sword" in text  # the first chapter starts at 0:00, teaser included
+
+
+def test_lines_are_heard_again_at_their_real_time(monkeypatch):
+    a = {"duration": 600.0, "dialogue": [{"start": 50.0, "end": 52.0, "text": "Far away."}, {"start": 112.0, "end": 114.0, "text": "Where did you get that sword?"},
+                                         {"start": 119.0, "end": 126.0, "text": "Don't lie to me."}, {"start": 144.0, "end": 148.0, "text": "You don't recognize your own brother."},
+                                         {"start": 150.0, "end": 152.0, "text": "Never said at all."}]}
+    line = lambda s, text: {"start": s, "end": s + 0.4 * len(text.split()), "text": text, "words": [[w, s + 0.4 * k, s + 0.4 * (k + 1)] for k, w in enumerate(text.split())]}  # noqa: E731
+    asked = []
+
+    def hear(rec, pieces, lang):
+        asked.append((pieces, lang))
+        if len(asked) == 1:  # the stretch: two lines heard (one 18 s later than the planner had it), two not
+            return [[line(126.5, "Don't lie to me."), line(162.6, "You don't recognise your own brother?")]]
+        return [[line(111.5, "Where did you get that sword?")] if p[0] == 100.0 else [] for p in pieces]  # around each lost line
+
+    monkeypatch.setattr(pm, "hear", hear)
+    got = pm.listen_again("/r/a.mov", a, [(100.0, 170.0)])
+    assert asked[0] == ([(96.0, 174.0)], "en") and asked[1][0] == [(100.0, 126.0), (138.0, 164.0)]
+    assert [(d["start"], d["text"]) for d in got["dialogue"]] == [(50.0, "Far away."), (111.5, "Where did you get that sword?"), (126.5, "Don't lie to me."),
+                                                                  (162.6, "You don't recognise your own brother?")]  # (the line never heard is left out)
+    cuts = [{"recording": "/r/a.mov", "start": 162.0, "end": 166.0}, {"recording": "/r/a.mov", "start": 110.0, "end": 130.0}]
+    words = pm.heard_words(cuts, {"/r/a.mov": got})
+    assert (words[0]["word"], words[0]["start"]) == ("You", pytest.approx(0.6)) and (words[6]["word"], words[6]["start"]) == ("Where", pytest.approx(5.5))
+    assert pm.heard_words(cuts[1:], {"/r/a.mov": a})[0] == {"word": "Where", "start": 2.0, "end": pytest.approx(2.333, abs=0.001)}  # not heard again: spread over the line
+    monkeypatch.setattr(pm, "hear", lambda rec, pieces, lang: None)
+    assert pm.listen_again("/r/a.mov", a, [(100.0, 170.0)]) is a and pm.listen_again("/r/a.mov", None, [(0.0, 9.0)]) is None
+    assert pm.merge_spans([(5.0, 9.0), (0.0, 4.5), (20.0, 30.0)]) == [(0.0, 9.0), (20.0, 30.0)]
+    assert pm.same_line("For dead man.", "Not for dead man") and not pm.same_line("It's me.", "Jubei.")
 

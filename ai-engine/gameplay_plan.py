@@ -124,7 +124,8 @@ def _whisper_worker(wavs: list[str], model: str, hint: str = "") -> list[list[di
     for w in wavs:
         try:
             kw = {"initial_prompt": hint} if hint else {}
-            r = mlx_whisper.transcribe(w, path_or_hf_repo=model, word_timestamps=False, verbose=None, condition_on_previous_text=False, **kw)
+            # (with word times: without them a line can be placed many seconds from where it is said)
+            r = mlx_whisper.transcribe(w, path_or_hf_repo=model, word_timestamps=True, verbose=None, condition_on_previous_text=False, **kw)
         except Exception:
             out.append([])
             continue
@@ -133,7 +134,11 @@ def _whisper_worker(wavs: list[str], model: str, hint: str = "") -> list[list[di
             text = str(s.get("text", "")).strip()
             if float(s.get("no_speech_prob", 0)) > 0.6 or float(s.get("compression_ratio", 1)) > 2.6 or len(text.split()) < 2:
                 continue  # (music and game noise make Whisper imagine words)
-            segs.append({"start": round(float(s["start"]), 2), "end": round(float(s["end"]), 2), "text": text})
+            ws = [w for w in s.get("words", []) or [] if float(w.get("end", 0)) - float(w.get("start", 0)) >= 0.02]
+            if s.get("words") and len(ws) * 2 <= len(s["words"]):
+                continue  # (imagined words have no length)
+            a, b = (float(ws[0]["start"]), float(ws[-1]["end"])) if ws else (float(s["start"]), float(s["end"]))
+            segs.append({"start": round(a, 2), "end": round(b, 2), "text": text})
         out.append(segs)
     return out
 

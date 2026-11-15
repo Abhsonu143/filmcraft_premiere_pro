@@ -343,20 +343,164 @@ def hook_text(plan: dict) -> str | None:
     return m.group(1).strip() if m else None
 
 
-def said_words(cuts: list[dict], analyses: dict[str, dict | None]) -> list[dict]:
-    """What is said in the pieces, word by word, in the video's own time (a line's words are spread
-    evenly over it)."""
+LISTEN_PIECE = 600.0  # seconds listened to at once
+LISTEN_PAD = 4.0  # seconds listened to before and after what is asked for
+
+
+def _listen_worker(wavs: list[str], model: str, lang: str | None) -> list[list[dict]]:
+    """Runs in its own process: each sound heard word by word. A line's times are those of its
+    words (without word times Whisper places a line seconds away from where it is said when there
+    is music or silence around it)."""
+    import mlx_whisper
+
+    out = []
+    for wav in wavs:
+        try:
+            kw = {"language": lang} if lang else {}
+            r = mlx_whisper.transcribe(wav, path_or_hf_repo=model, word_timestamps=True, verbose=None, condition_on_previous_text=False, **kw)
+        except Exception:  # noqa: BLE001
+            out.append([])
+            continue
+        lines = []
+        for sg in r.get("segments", []):
+            words = [[str(w.get("word", "")).strip(), float(w.get("start", 0)), float(w.get("end", 0))] for w in sg.get("words", []) or [] if str(w.get("word", "")).strip()]
+            text = str(sg.get("text", "")).strip()
+            empty = sum(1 for w in words if w[2] - w[1] < 0.02)
+            if not words or not text or float(sg.get("no_speech_prob", 0)) > 0.6 or float(sg.get("compression_ratio", 1)) > 2.6 or empty * 2 >= len(words):
+                continue  # (music and game noise make Whisper imagine words: they have no length)
+            lines.append({"start": words[0][1], "end": words[-1][2], "text": text, "words": words})
+        out.append(lines)
+    return out
+
+
+def merge_spans(spans: list[tuple[float, float]], gap: float = 1.0) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1] + gap:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        elif b > a:
+            out.append((a, b))
+    return out
+
+
+def hear(rec: str, pieces: list[tuple[float, float]], lang: str | None) -> list[list[dict]] | None:
+    """The lines said in each piece of the recording ({start, end, text, words} in the recording's
+    time). Heard pieces are kept in the cache folder, so each is listened to once. None: it failed."""
+    store = ac.CACHE_DIR / "heard"
+    out: list[list[dict] | None] = [None] * len(pieces)
+    todo = []
+    for k, (s, e) in enumerate(pieces):
+        cache = store / f"{ac.file_key(rec, ac.DEFAULT_WHISPER, f'{s:.1f}-{e:.1f}', lang or '')}.json"
+        try:
+            out[k] = json.loads(cache.read_text())
+        except (OSError, ValueError):
+            todo.append((k, s, e, cache))
+    if todo:
+        try:
+            with tempfile.TemporaryDirectory(prefix="ei-heard-") as tmp:
+                wavs = []
+                for k, s, e, _ in todo:
+                    wavs.append(str(Path(tmp) / f"p{k}.wav"))
+                    ac.extract_audio(rec, wavs[-1], start=s, end=e)
+                got = ac.run_isolated(_listen_worker, wavs, ac.DEFAULT_WHISPER, lang)
+            store.mkdir(parents=True, exist_ok=True)
+            for (k, s, e, cache), lines in zip(todo, got):
+                out[k] = []
+                for ln in lines:
+                    words = [[w[0], round(max(w[1], w[2] - 0.6) + s, 2), round(w[2] + s, 2)] for w in ln["words"]]  # (no word takes seconds: a long one is its end)
+                    out[k].append({"start": words[0][1], "end": words[-1][2], "text": ln["text"], "words": words})
+                cache.write_text(json.dumps(out[k], ensure_ascii=False), encoding="utf-8")
+        except Exception as e:  # noqa: BLE001
+            log(f"could not listen again ({type(e).__name__}: {e})")
+            return None
+    return [x or [] for x in out]
+
+
+def same_line(a: str, b: str) -> bool:
+    import difflib
+
+    norm = lambda t: re.sub(r"[^\w ]+", "", str(t).lower()).split()  # noqa: E731
+    return difflib.SequenceMatcher(None, norm(a), norm(b), autojunk=False).ratio() >= 0.6
+
+
+def listen_again(rec: str, a: dict | None, spans: list[tuple[float, float]]) -> dict | None:
+    """The recording's analysis with what is said in `spans` heard again, word by word: the planner's
+    lines are right in what is said but can be many seconds off in when (it listened without word
+    times). A planner's line that was not heard this time is looked for once more around its rough
+    time; when it is still not heard it is left out (a caption at the wrong moment is worse than none)."""
+    if not a:
+        return a
+    dur = float(a.get("duration") or 0)
+    spans = merge_spans([(max(0.0, s - LISTEN_PAD), min(dur, e + LISTEN_PAD) if dur else e + LISTEN_PAD) for s, e in spans])
+    pieces = [(s + k * LISTEN_PIECE, min(e, s + (k + 1) * LISTEN_PIECE)) for s, e in spans for k in range(int((e - s) // LISTEN_PIECE) + 1) if s + k * LISTEN_PIECE < e - 0.5]
+    said = " ".join(str(d.get("text", "")) for d in a.get("dialogue", [])[:200])
+    lang = "en" if said and sum(1 for ch in said if ord(ch) < 128) > 0.95 * len(said) else None
+    log(f"the exact time of each line: {sum(e - s for s, e in pieces) / 60:.1f} min of {Path(rec).name} (listened to once, then remembered)")
+    got = hear(rec, pieces, lang)
+    if got is None:
+        log("the planner's rough line times are used")
+        return a
+    lines = sorted((ln for piece in got for ln in piece), key=lambda d: d["start"])
+    inside = lambda t: any(s <= t < e for s, e in spans)  # noqa: E731
+    rough = [d for d in a.get("dialogue", []) if inside(float(d["start"]))]
+    lost = [d for d in rough if not any(same_line(d["text"], ln["text"]) and abs(ln["start"] - float(d["start"])) < 45 for ln in lines)]
+    if lost:
+        around = [(max(0.0, float(d["start"]) - 12.0), float(d["end"]) + 12.0) for d in lost]
+        again = hear(rec, around, lang) or []
+        found = 0
+        for d, piece in zip(lost, again):
+            for ln in piece:
+                if same_line(d["text"], ln["text"]) and not any(x["start"] < ln["end"] and ln["start"] < x["end"] for x in lines):
+                    lines.append(ln)
+                    found += 1
+                    break
+        lines.sort(key=lambda d: d["start"])
+        log(f"{len(lost)} line(s) were not heard the first time: {found} found on a second listen, {len(lost) - found} left out")
+    moved = [abs(ln["start"] - float(d["start"])) for d in rough for ln in lines if same_line(d["text"], ln["text"]) and abs(ln["start"] - float(d["start"])) < 45]
+    if moved:
+        log(f"lines were up to {max(moved):.0f} s from where the planner had them")
+    return {**a, "dialogue": sorted([d for d in a.get("dialogue", []) if not inside(float(d["start"]))] + lines, key=lambda d: d["start"]), "heard": spans}
+
+
+def said_lines(cuts: list[dict], analyses: dict[str, dict | None]) -> list[dict]:
+    """The lines said in the pieces: {text, rec, start, end (in the recording), at (where the line
+    starts in the video)}."""
     out, t = [], 0.0
     for c in cuts:
         a = analyses.get(c["recording"])
         for d in (a or {}).get("dialogue", []):
             s, e = max(float(d["start"]), c["start"]), min(float(d["end"]), c["end"])
-            ws = str(d.get("text", "")).split()
-            if e - s < 0.2 or not ws or not c["start"] - 0.5 <= d["start"] < c["end"]:
+            text = str(d.get("text", "")).strip()
+            if e - s < 0.2 or not text.split() or not c["start"] - 0.5 <= d["start"] < c["end"]:
                 continue
-            per = (e - s) / len(ws)
-            out += [{"word": w, "start": round(t + s - c["start"] + k * per, 3), "end": round(t + s - c["start"] + (k + 1) * per, 3)} for k, w in enumerate(ws)]
+            out.append({"text": text, "rec": c["recording"], "start": s, "end": e, "at": t + s - c["start"], "lo": c["start"], "hi": c["end"], "words": d.get("words")})
         t += c["end"] - c["start"]
+    return out
+
+
+def spread(words: list[str], start: float, end: float) -> list[dict]:
+    per = (end - start) / max(1, len(words))
+    return [{"word": w, "start": round(start + k * per, 3), "end": round(start + (k + 1) * per, 3)} for k, w in enumerate(words)]
+
+
+def said_words(cuts: list[dict], analyses: dict[str, dict | None]) -> list[dict]:
+    """What is said in the pieces, word by word, in the video's own time (a line's words are spread
+    evenly over it: rough, the planner times a line only to a second or two)."""
+    return [w for ln in said_lines(cuts, analyses) for w in spread(ln["text"].split(), ln["at"], ln["at"] + ln["end"] - ln["start"])]
+
+
+def heard_words(cuts: list[dict], analyses: dict[str, dict | None]) -> list[dict]:
+    """What is said in the pieces, each word at its time in the video. A line that was listened to
+    again (`listen_again`) has its words' real times; any other line's words are spread over it."""
+    out = []
+    for ln in said_lines(cuts, analyses):
+        shift = ln["at"] - ln["start"]
+        if ln.get("words"):
+            ws = [{"word": str(w[0]).strip(), "start": round(float(w[1]) + shift, 3), "end": round(float(w[2]) + shift, 3)}
+                  for w in ln["words"] if ln["lo"] - 0.05 <= float(w[1]) and float(w[2]) <= ln["hi"] + 0.05 and str(w[0]).strip()]
+        else:
+            ws = spread(ln["text"].split(), ln["at"], ln["at"] + ln["end"] - ln["start"])
+        out += [w for w in ws if not out or w["start"] >= out[-1]["end"] - 0.05]  # (lines never overlap)
     return out
 
 
@@ -543,6 +687,11 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
             raise AutocutError(f"recording(s) not found: {', '.join(missing)} (is the disk connected?)")
     with ac.stage("cuts"):
         by_rec = {str(p["recording"]): analysis_of(str(p["recording"])) for p in parts}
+        for rec in by_rec:  # what is said, at its real time (before anything is chosen by it)
+            by_rec[rec] = listen_again(rec, by_rec[rec], [(float(p["start"]) - REACH / 2, float(p["end"]) + REACH / 2) for p in parts if str(p["recording"]) == rec])
+        if plan.get("cuts") and not fresh and plan.get("times") != "heard":
+            log("the saved cuts were chosen from rough line times: they are chosen again")
+            fresh = True
         if plan.get("cuts") and not fresh and all(Path(str(c.get("recording", ""))).is_file() for c in plan["cuts"]):
             cuts = [c for c in plan["cuts"] if float(c.get("end", 0)) - float(c.get("start", 0)) >= MIN_PIECE]
             log(f"using the {len(cuts)} cut(s) saved in the plan")
@@ -569,6 +718,7 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
                 log("no hook: nothing in the pieces stands out enough to show first (or the video is very short)")
         plan.pop("hook_idea", None)
         plan["cuts"] = cuts
+        plan["times"] = "heard"
         plan["cut_s"] = round(sum(c["end"] - c["start"] for c in cuts), 1)
         plan["cuts_made"] = time.strftime("%Y-%m-%d %H:%M")
         tmp = pj.with_name(pj.name + ".part")
@@ -589,11 +739,12 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
         folder.mkdir(parents=True, exist_ok=True)
         video = folder / f"{name}.mp4"
         info = ac.probe(cuts[0]["recording"])
-        words = said_words(cuts, by_rec)
+        words = heard_words(cuts, by_rec)
         if vertical:
             import captions as cp
 
-            if captions and words and game_shows_subtitles(cuts, by_rec):
+            bars = any(picture_area(str(c["recording"]), c["start"] + min(2.0, (c["end"] - c["start"]) / 2), info.width, info.height)[3] > 0 for c in cuts)
+            if captions and words and not bars and game_shows_subtitles(cuts, by_rec):  # (subtitles in a cutscene's black bar are cropped away with it)
                 log("the game shows its own subtitles: no captions are added over them")
                 captions = False
             ass = cp.build_ass(words if captions else [], hook_text(plan), 1080, 1920, sum(c["end"] - c["start"] for c in cuts), "pop", "intro") if (captions and words) or hook_text(plan) else None
