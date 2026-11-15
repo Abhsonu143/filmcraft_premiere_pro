@@ -216,3 +216,45 @@ fn relinking_later_resolves_the_anchor_that_waited_for_the_real_size() {
     assert_eq!(motion_point(&first_clip(&t, seq), "anchor"), Vec2::new(160.0, 90.0));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Files on disk, except that a movie can't be read whole: only through the in-place reader.
+struct NoWholeMovies(std::sync::atomic::AtomicUsize);
+impl crate::Services for NoWholeMovies {
+    fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        if path.ends_with(".mov") {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(std::io::Error::other(format!("{path}: read whole")));
+        }
+        crate::FsServices.read_file(path)
+    }
+    fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+        crate::FsServices.write_file(path, data)
+    }
+    fn file_size(&self, path: &str) -> std::io::Result<u64> {
+        crate::FsServices.file_size(path)
+    }
+    fn read_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        crate::FsServices.read_range(path, offset, len)
+    }
+    fn reader(&self, path: &str) -> Option<std::io::Result<filmcraft_media::SharedReader>> {
+        crate::FsServices.reader(path)
+    }
+}
+
+/// An edit's linked media is opened in place, never read whole: importing the edit of a 4-hour
+/// recording read the 17 GB file into memory twice (EI reached 34 GB).
+#[test]
+fn an_interchange_import_opens_linked_media_in_place() {
+    let d = tmp_dir("ix-in-place");
+    std::fs::create_dir_all(d.join("media")).unwrap();
+    make_movie(&d.join("media/shot.mov"), DemoScene::OceanSunset, 320, 180, 24);
+    let doc = d.join("cut.xml");
+    std::fs::write(&doc, xml_with_a_scale_only_motion_filter()).unwrap();
+    let files = std::sync::Arc::new(NoWholeMovies(std::sync::atomic::AtomicUsize::new(0)));
+    let mut s = Session { services: files.clone(), ..Default::default() };
+    let (r, seq) = import(&mut s, &doc);
+    assert_eq!(r["linkedMedia"], 1, "{r}");
+    assert_eq!(s.project.source_size(first_clip(&s, seq).item), Some((320, 180)));
+    assert_eq!(files.0.load(std::sync::atomic::Ordering::SeqCst), 0, "the movie was read whole");
+    let _ = std::fs::remove_dir_all(&d);
+}
