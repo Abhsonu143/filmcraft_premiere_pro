@@ -25,6 +25,8 @@
 //! - `ai.clips {input, outDir?, clipType?=edited|sections, count?=5, min?=10, target?=48, max?=60,
 //!   aspect?=vertical|square|horizontal|same, content?=auto|talk|gameplay, framing?=auto|center|blur|bars, captionMode?=auto|on|off, captionStyle?=pop|clean|boxed,
 //!   titleMode?=off|intro|always, pace?=fast|medium|slow, music?, llm?=default|<model>|none, hook?, import?}`
+//! - `ai.repair {input}`: the folder of a video made by EI (or a file in it) → a copy “<folder> - fixed” whose
+//!   voice pauses are silent and whose sound track has the bursts in them taken out (the picture is not re-encoded).
 //! - `ai.speak {script (file) or notes (text), voice, takes?, out?}`: a script spoken (audio only).
 //! - sound design (speak, voiceover, topic, clips, music): `soundDesign?, musicSource?=internet|folder|ai|none,
 //!   musicFolder?, licence?=monetized|personal, soundEffects?, musicLevel?` (dB).
@@ -86,6 +88,7 @@ pub enum Kind {
     Hooks,
     Download,
     Package,
+    Repair,
 }
 
 impl Kind {
@@ -106,6 +109,7 @@ impl Kind {
             Kind::Hooks => "hooks",
             Kind::Download => "download",
             Kind::Package => "package",
+            Kind::Repair => "repair",
         }
     }
     fn from_command(id: &str) -> Option<Kind> {
@@ -125,6 +129,7 @@ impl Kind {
             "ai.hooks" => Kind::Hooks,
             "ai.download" => Kind::Download,
             "ai.package" => Kind::Package,
+            "ai.repair" => Kind::Repair,
             _ => return None,
         })
     }
@@ -145,6 +150,7 @@ impl Kind {
             Kind::Hooks => "Hook Library",
             Kind::Download => "Download from YouTube",
             Kind::Package => "Thumbnails, Titles & Hashtags",
+            Kind::Repair => "Repair Sounds in Pauses",
         }
     }
     fn input_label(self) -> &'static str {
@@ -153,6 +159,7 @@ impl Kind {
             Kind::Voiceover => "Voiceover audio",
             Kind::Clips => "Long video",
             Kind::Tv => "Your clip",
+            Kind::Repair => "Video folder",
             _ => "Video",
         }
     }
@@ -1251,6 +1258,9 @@ impl Draft {
                     a.push("--script-only".into());
                 }
             }
+            Kind::Repair => {
+                a = vec!["repair-pauses".into(), "--folder".into(), self.input.trim().into()];
+            }
             Kind::Hooks => {
                 let list = |v: &str| v.split([',', ' ']).map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect::<Vec<_>>();
                 let niches = list(&self.hook_niches);
@@ -1848,8 +1858,9 @@ fn default_output(d: &Draft) -> String {
         Kind::Audio => d.clips.first().map(|c| parent_dir(c).to_string_lossy().to_string()).unwrap_or_else(|| movies_dir().to_string_lossy().to_string()),
         Kind::Script => movies_dir().join("Scripts").join(slug(if d.topic.trim().is_empty() { "script" } else { &d.topic })).to_string_lossy().to_string(),
         Kind::Voice => voices_dir().join(slug(&d.voice_name)).to_string_lossy().to_string(),
-        Kind::Topic => String::new(), // the engine names the folder after the topic (Movies/EI/Topics/…)
-        Kind::Hooks => String::new(), // the library has one place (Application Support/EI/hooks)
+        Kind::Topic => String::new(),  // the engine names the folder after the topic (Movies/EI/Topics/…)
+        Kind::Hooks => String::new(),  // the library has one place (Application Support/EI/hooks)
+        Kind::Repair => String::new(), // a copy next to the folder ("<folder> - fixed")
         Kind::Package => movies_dir().join("Thumbnails").to_string_lossy().to_string(),
         // the folder chosen last time (a playlist gets a folder of its own inside it)
         Kind::Download => setting_str("download_dir").unwrap_or_else(|| movies_dir().join("Downloads").to_string_lossy().to_string()),
@@ -3112,6 +3123,7 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
         Kind::Topic | Kind::Package => format!("{}: {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>()),
         Kind::Speak => format!("{}: {}", d.kind.title(), file_stem(&d.out)),
         Kind::Hooks => format!("{}: sync {}", d.kind.title(), d.hook_niches.trim().chars().take(40).collect::<String>()),
+        Kind::Repair => format!("{}: {}", d.kind.title(), file_stem(d.input.trim().trim_end_matches('/'))),
         Kind::Download => format!(
             "{}: {}{}",
             d.kind.title(),
@@ -3752,7 +3764,8 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     let planning = d.kind == Kind::Talk && d.talk_mode == "plan";
                     if d.kind.needs_input() && !planning {
                         ui.label(d.kind.input_label());
-                        if path_row(ui, &mut d.input, &format!("{p}.input"), "a file", &mut elems) {
+                        let hint = if d.kind == Kind::Repair { "the folder of a video made by EI (or a file in it)" } else { "a file" };
+                        if path_row(ui, &mut d.input, &format!("{p}.input"), hint, &mut elems) {
                             pick = Some(Pick::Input);
                         }
                         ui.end_row();
@@ -3979,6 +3992,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             }
                         }
                         Kind::Hooks => hooks_rows(ui, &mut d, &p, &mut elems),
+                        Kind::Repair => {}
                         Kind::Script => {
                             ui.label("Topic");
                             let r = ui.add(egui::TextEdit::singleline(&mut d.topic).hint_text("what the video is about").desired_width(380.0));
@@ -4527,7 +4541,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             CharacterAsk::Nothing => {}
                         }
                     }
-                    if !matches!(d.kind, Kind::Voice | Kind::Hooks) {
+                    if !matches!(d.kind, Kind::Voice | Kind::Hooks | Kind::Repair) {
                         let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package) || planning;
                         ui.label(if folder_out { "Output folder" } else { "Save as" });
                         let hint = match d.kind {
@@ -4544,7 +4558,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         }
                         ui.end_row();
                     }
-                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic | Kind::Hooks | Kind::Package) && !planning {
+                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic | Kind::Hooks | Kind::Package | Kind::Repair) && !planning {
                         ui.label("");
                         let label = match d.kind {
                             Kind::Split | Kind::Clips | Kind::Tv | Kind::Download => "Import the files into the project",
@@ -4584,6 +4598,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Tv => "Make Video",
                     Kind::Topic => "Research and Write",
                     Kind::Hooks => "Sync Hooks",
+                    Kind::Repair => "Copy and Repair",
                     Kind::Speak => "Speak",
                     Kind::Download => "Download",
                     Kind::Package => "Make Thumbnails",
@@ -4628,6 +4643,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if let Some(pk) = pick {
         let video: Vec<&str> = VIDEO_EXT.to_vec();
         match pk {
+            Pick::Input if d.kind == Kind::Repair => {
+                if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
+                    d.input = dir;
+                }
+            }
             Pick::Input => {
                 let exts: Vec<&str> = if d.kind == Kind::Voiceover { AUDIO_EXT.iter().chain(VIDEO_EXT.iter()).copied().collect() } else { video.clone() };
                 let filter = if d.kind == Kind::Voiceover { "Audio" } else { "Video" };
@@ -5394,6 +5414,9 @@ fn description(kind: Kind) -> &'static str {
         Kind::Download => {
             "Downloads a YouTube playlist (or one video) in the highest quality there is: the best video and the best audio, merged. Choose “Audio only” for just the sound, or “Subtitles only” for what is said, as clean English/Hindi text (the creator's own subtitles or YouTube's captions of the real speech, never a translation), optionally learned as a talking style for your scripts. A playlist gets its own folder named after it; running it again downloads only what is new (a stopped download continues), and unavailable videos are skipped and listed. For your own use: respect the creators' licences."
         }
+        Kind::Repair => {
+            "For a video whose voice has an odd sound in its pauses (a short burst every few seconds, from a cloned voice made before EI checked its room tone). Give the video's folder: EI makes a copy next to it (“<folder> - fixed”), silences the pauses of the voice and takes the bursts out of the video's sound. The picture is not re-encoded and the original folder is not changed. A folder whose pauses are already quiet is left alone."
+        }
         Kind::Hooks => {
             "Your hook library: proven opening lines (the first 3 seconds that keep viewers watching), kept on this Mac so the script writer, Video from Topic and the voiceover edit can use them offline. Sync fetches what is hot now (Google Trends for your countries, this week's most-viewed YouTube videos in your niches), and Claude (with web search) turns it into new hooks in English, Hindi and Hinglish."
         }
@@ -5880,7 +5903,7 @@ fn import_finished(app: &mut FilmcraftApp) {
         };
         let one = |k: &str| result.get(k).and_then(Value::as_str).map(str::to_string);
         let paths: Vec<String> = match kind {
-            Kind::Package => Vec::new(), // (thumbnails and text files, not media for the timeline)
+            Kind::Package | Kind::Repair => Vec::new(), // (thumbnails and text files, or a repaired copy: not media for the timeline)
             Kind::Split | Kind::Clips | Kind::Audio | Kind::Speak | Kind::Download => strs("outputs"),
             _ => match one("otio") {
                 Some(o) => std::iter::once(o).chain(one("srt")).collect(),
@@ -6340,6 +6363,7 @@ mod tests {
             (Kind::Split, json!({"input": vs, "clipLength": 30, "quality": "high"})),
             (Kind::Audio, json!({"clips": [vs], "format": "flac", "start": "5", "normalize": true})),
             (Kind::Hooks, json!({"niches": "gaming, travel", "countries": "IN", "hookClaude": false})),
+            (Kind::Repair, json!({"input": vs})),
             (
                 Kind::Download,
                 json!({"url": "https://youtube.com/playlist?list=PLx", "mode": "audio", "audioFormat": "mp3", "items": "1-20", "out": "/tmp/bgm"}),

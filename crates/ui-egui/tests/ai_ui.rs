@@ -115,6 +115,7 @@ fn ai_menu_and_dialogs() {
         "ai.audio",
         "ai.speak",
         "ai.hooks",
+        "ai.repair",
         "ai.download",
         "ai.package",
         "ai.social",
@@ -123,7 +124,7 @@ fn ai_menu_and_dialogs() {
     ] {
         assert!(menu.contains(id), "{id} in the menus");
     }
-    let expect: [(&str, &[&str]); 15] = [
+    let expect: [(&str, &[&str]); 16] = [
         ("split", &["input", "clipLength", "quality.same", "quality.exact", "out", "import", "run"]),
         (
             "music",
@@ -211,6 +212,7 @@ fn ai_menu_and_dialogs() {
         ("voice", &["name", "lang.hi", "lang.mix", "lang.en", "source.record", "source.files", "run"]),
         ("speak", &["script", "text", "voice", "sound", "out", "run"]),
         ("hooks", &["niches", "countries", "claude", "run"]),
+        ("repair", &["input", "input.choose", "run"]),
         ("download", &["url", "mode.video", "mode.audio", "mode.subs", "container", "items", "out", "queue", "run"]),
         (
             "package",
