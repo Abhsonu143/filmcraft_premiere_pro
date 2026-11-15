@@ -258,3 +258,28 @@ fn an_interchange_import_opens_linked_media_in_place() {
     assert_eq!(files.0.load(std::sync::atomic::Ordering::SeqCst), 0, "the movie was read whole");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Opt-in: EI_BIG_EDIT=/path/to/edit.otio imports a real (large) edit and reads pictures and sound
+/// across it, to measure memory (`/usr/bin/time -l` on the test binary).
+#[test]
+fn a_big_real_edit_opens_and_plays() {
+    let Ok(doc) = std::env::var("EI_BIG_EDIT") else { return };
+    let mut s = Session::default();
+    let t0 = std::time::Instant::now();
+    let r = s.execute("file.import", json!({"paths": [doc]})).unwrap();
+    eprintln!("imported in {:?}: {}", t0.elapsed(), r["documents"][0]);
+    let seq = ItemId(r["sequences"][0].as_u64().unwrap());
+    let items: Vec<ItemId> = s.project.items.values().filter(|i| i.as_media().is_some()).map(|i| i.id).collect();
+    for id in items {
+        let Some(src) = s.media.source_for(&s.project, id, &*s.services) else { continue };
+        let dur = src.info().duration.to_units_floor(48_000).max(0);
+        // pictures and 4 s of sound at 20 points across the whole recording
+        for k in 0..20i64 {
+            let at = dur * k / 20;
+            let _ = src.video_frame(filmcraft_media::FrameRequest { time: Tick::from_units(at, 48_000), scale: 0.25 });
+            let _ = src.audio(at, 48_000 * 4, 48_000);
+        }
+        eprintln!("read {} across {} s", s.project.item(id).map(|i| i.name.clone()).unwrap_or_default(), dur / 48_000);
+    }
+    assert!(s.project.sequence(seq).is_some());
+}
