@@ -590,7 +590,7 @@ def merge_style(res: dict, st: dict) -> dict:
 
 
 def enroll(name: str, files: list[str] | None = None, takes: list[dict] | None = None, languages: list[str] | None = None,
-           engine: str = DEFAULT_ENGINE, add: bool = False, separate: str = "auto") -> dict:
+           engine: str = DEFAULT_ENGINE, add: bool = False, separate: str = "always") -> dict:
     """Build (or extend) a voice profile from recordings of your voice.
     files: any audio/video of you talking.  takes: [{file, text, lang, emotion}] read from the prompts."""
     ac.require_tools()
@@ -628,7 +628,7 @@ def enroll(name: str, files: list[str] | None = None, takes: list[dict] | None =
         if separate != "never" and files:
             todo = [s for s in files if separate == "always" or music_under(s, Path(tmp)) < SEPARATE_BELOW]
             if todo:
-                log(f"{len(todo)} of {len(files)} recording(s) have music under the voice: taking it out (once per recording)")
+                log(f"taking the voice out of {len(todo)} of {len(files)} recording(s) (music, game sound and noise are left behind; once per recording)")
                 pairs = [(s, str(Path(tmp) / f"v{i}.wav")) for i, s in enumerate(todo)]
                 done = ac.run_isolated(_separate_worker, pairs)
                 voiced = {s: d for (s, d), ok in zip(pairs, done) if ok}
@@ -1273,8 +1273,8 @@ def add_args(sub) -> None:
     p.add_argument("--add", action="store_true", help="add to an existing voice instead of replacing its references")
     p.add_argument("--make", default="voice", choices=["voice", "style", "both"],
                    help="clone the voice, learn the talking style (saved as a style of the same name), or both")
-    p.add_argument("--separate", default="auto", choices=["auto", "always", "never"],
-                   help="take background music out of the recordings first (auto: when there is music under the voice)")
+    p.add_argument("--separate", default="always", choices=["auto", "always", "never"],
+                   help="take the voice out of music, game sound and noise first (always: every recording; auto: only when there is music under the voice)")
     sub.add_parser("voice-list", help="saved voices")
     p = sub.add_parser("speak", help="speak a script (or text) with a cloned voice")
     p.add_argument("--voice", required=True)

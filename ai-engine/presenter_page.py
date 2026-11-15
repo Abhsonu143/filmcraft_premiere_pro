@@ -124,7 +124,7 @@ function draw() {
     $("say").textContent = "Just look at the camera. Don't talk.";
     $("hint").textContent = "Breathe, blink, small natural movements. It is shown where nothing is being said. It stops by itself after 10 s.";
   } else {
-    $("where").textContent = `Line ${cur + 1} of ${S.lines.length} · the voice takes ${fmt(l.seconds)}` + (l.emotion ? ` · ${l.emotion}` : "");
+    $("where").textContent = `${cur + 1} of ${S.lines.length}` + (l.parts > 1 ? ` · part ${l.part} of ${l.parts} of this sentence` : "") + ` · the voice takes ${fmt(l.seconds)}` + (l.emotion ? ` · ${l.emotion}` : "");
     $("say").textContent = l.text;
     $("hint").textContent = l.take ? `Recorded (take ${l.take.n}${l.take.seconds ? ", " + fmt(l.take.seconds) : ""}). Record again to replace it.` : "Say it at the voice's pace, looking at the camera.";
   }

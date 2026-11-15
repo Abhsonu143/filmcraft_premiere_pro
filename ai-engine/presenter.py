@@ -39,9 +39,67 @@ def _atomic(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def lines_of(video: Path) -> tuple[Path, list[dict]]:
-    """The voice file and the lines of a generated video, in the video's time.
-    `src` is where the line starts in the voice file (it differs when the edit moved lines)."""
+MAX_WORDS = 10  # what is shown to be said in one go
+
+
+def split_words(text: str, limit: int = MAX_WORDS) -> list[str]:
+    """A sentence in parts of at most `limit` words, cut at its punctuation where it can be."""
+    words = text.split()
+    if len(words) <= limit:
+        return [text.strip()] if words else []
+    phrases, cur = [], []
+    for w in words:  # phrases end at , ; : . ! ? and dashes
+        cur.append(w)
+        if re.search(r"[,;:.!?…—–]$", w.rstrip("\"')”’")):
+            phrases.append(cur)
+            cur = []
+    if cur:
+        phrases.append(cur)
+    parts: list[list[str]] = []
+    for ph in phrases:
+        if len(ph) > limit:  # one long phrase: equal pieces
+            n = -(-len(ph) // limit)
+            size = -(-len(ph) // n)
+            parts += [ph[i : i + size] for i in range(0, len(ph), size)]
+        elif parts and len(parts[-1]) + len(ph) <= limit and (len(parts[-1]) <= 3 or not re.search(r"[.!?…]$", parts[-1][-1].rstrip("\"')”’"))):
+            parts[-1] = parts[-1] + ph  # phrases of one sentence stay together, and a very short sentence joins the next
+        else:
+            parts.append(ph)
+    return [" ".join(p) for p in parts]
+
+
+def part_times(line: dict, parts: list[str], words: list[dict]) -> list[tuple[float, float]]:
+    """When each part of a line is said, in the voice file's time: by its share of the letters, moved
+    to the nearest gap between two heard words (`words`, from Whisper) when there is one close by."""
+    a, dur = line["src"], line["end"] - line["start"]
+    total = sum(len(p) for p in parts) or 1
+    gaps = [((float(u["end"]) + float(v["start"])) / 2, float(v["start"]) - float(u["end"])) for u, v in zip(words, words[1:])
+            if a + 0.15 < float(u["end"]) and float(v["start"]) < a + dur - 0.15]
+    cuts, acc = [a], 0
+    for p in parts[:-1]:
+        acc += len(p)
+        t = a + dur * acc / total
+        near = [(abs(g - t) - 0.5 * min(w, 0.4), g) for g, w in gaps if abs(g - t) < 0.7 and g > cuts[-1] + 0.3]
+        cuts.append(min(near)[1] if near else max(t, cuts[-1] + 0.05))
+    cuts.append(a + dur)
+    return list(zip(cuts, cuts[1:]))
+
+
+def heard_words(voice: Path) -> list[dict]:
+    """Word timings of the voice (Whisper, kept in the cache); empty when it cannot listen."""
+    try:
+        import autocut as ac
+
+        return ac.transcribe(str(voice), language=None).get("words") or []
+    except Exception as e:  # noqa: BLE001 (parts are then timed by their share of the letters)
+        log(f"presenter: could not listen for word timings ({e})")
+        return []
+
+
+def lines_of(video: Path, *, max_words: int = MAX_WORDS, listen: bool = True) -> tuple[Path, list[dict]]:
+    """The voice file and what is to be said, piece by piece (at most `max_words` words each), in the
+    video's time. `src` is where a piece starts in the voice file (it differs when the edit moved lines);
+    `line` is the sentence it belongs to, `part`/`parts` its place in it."""
     base = video.with_suffix("")
     timeline_path = Path(f"{base}.narrate.json")
     narration_path = Path(f"{base}.narration.json")
@@ -62,21 +120,28 @@ def lines_of(video: Path) -> tuple[Path, list[dict]]:
         if b <= a:
             continue
         text = str(ln["text"]).strip()
-        lines.append({"index": len(lines), "start": a, "end": b, "src": src_of.get(re.sub(r"\W+", " ", text).strip().lower(), a), "text": text,
+        lines.append({"line": len(lines), "start": a, "end": b, "src": src_of.get(re.sub(r"\W+", " ", text).strip().lower(), a), "text": text,
                       "emotion": ln.get("emotion")})
     if not lines:
         raise AutocutError(f"{video.name} has no spoken lines")
-    return voice, lines
+    split = [split_words(ln["text"], max_words) for ln in lines]
+    words = heard_words(voice) if listen and any(len(p) > 1 for p in split) else []
+    out = []
+    for ln, parts in zip(lines, split):
+        for k, (text, (a, b)) in enumerate(zip(parts, part_times(ln, parts, words))):
+            out.append({"index": len(out), "line": ln["line"], "part": k + 1, "parts": len(parts), "text": text, "emotion": ln["emotion"],
+                        "src": round(a, 3), "start": round(ln["start"] + a - ln["src"], 3), "end": round(ln["start"] + b - ln["src"], 3)})
+    return voice, out
 
 
 class Session:
     """The takes recorded for one video. Saved after every change."""
 
-    def __init__(self, video: str | Path):
+    def __init__(self, video: str | Path, *, max_words: int = MAX_WORDS, listen: bool = True):
         self.video = Path(video).expanduser().resolve()
         if not self.video.is_file():
             raise AutocutError(f"no such video: {video}")
-        self.voice, self.lines = lines_of(self.video)
+        self.voice, self.lines = lines_of(self.video, max_words=max_words, listen=listen)
         self.dir = self.video.with_name(self.video.stem + ".presenter")
         self.path = self.dir / "session.json"
         self.takes: dict[str, dict] = {}  # "3" or "idle" -> {"file", "chosen", "n", "seconds", "at"}
@@ -268,9 +333,10 @@ class _Server(ThreadingHTTPServer):
         self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
 
 
-def serve(video: str, *, port: int = 0, open_browser: bool = True, ready=None, stop: threading.Event | None = None) -> dict:
+def serve(video: str, *, port: int = 0, open_browser: bool = True, ready=None, stop: threading.Event | None = None,
+          max_words: int = MAX_WORDS, listen: bool = True) -> dict:
     """Run the recording page until the owner presses Done (or the job is cancelled)."""
-    session = Session(video)
+    session = Session(video, max_words=max_words, listen=listen)
     session.save()
     token = secrets.token_urlsafe(16)
     stop = stop or threading.Event()
@@ -302,13 +368,14 @@ def add_args(p) -> None:
     r.add_argument("--video", required=True, help="a video made by Video from Topic or a voiceover edit")
     r.add_argument("--port", type=int, default=0, help="the page's port on this Mac (default: any free one)")
     r.add_argument("--no-open", action="store_true", help="do not open the browser (the address is printed)")
+    r.add_argument("--max-words", type=int, default=MAX_WORDS, help="most words shown to be said in one go (default 10)")
     s = sub.add_parser("status", help="what is recorded so far")
     s.add_argument("--video", required=True)
 
 
 def run_args(a) -> dict:
     if a.presenter_cmd == "record":
-        return serve(a.video, port=a.port, open_browser=not a.no_open)
+        return serve(a.video, port=a.port, open_browser=not a.no_open, max_words=max(3, a.max_words))
     st = Session(a.video).state()
     print(json.dumps(st, indent=1, ensure_ascii=False))
     return {"outputs": []}

@@ -113,3 +113,37 @@ def test_the_page_server(tmp_path):
     call("/api/done", b"")
     th.join(10)
     assert not th.is_alive() and got["recorded"] == 1 and got["lines"] == 2
+
+
+def test_a_sentence_is_shown_ten_words_at_a_time():
+    assert pr.split_words("Short one.") == ["Short one."] and pr.split_words("   ") == []
+    long = "Story one. Guys, GTA Six is finally days away. According to Rockstar, it drops this Thursday, nineteenth November."
+    parts = pr.split_words(long)
+    assert parts == ["Story one. Guys, GTA Six is finally days away.", "According to Rockstar, it drops this Thursday, nineteenth November."]
+    assert all(len(p.split()) <= 10 for p in parts) and " ".join(parts) == long
+    run_on = " ".join(f"w{k}" for k in range(23))  # no punctuation at all: equal pieces
+    assert [len(p.split()) for p in pr.split_words(run_on)] == [8, 8, 7]
+    for limit in (4, 5, 7):
+        got = pr.split_words(long, limit)
+        assert max(len(p.split()) for p in got) <= limit and " ".join(got) == long
+
+
+def test_parts_are_cut_where_the_voice_pauses():
+    line = {"src": 10.0, "start": 20.0, "end": 26.0}
+    parts = ["aaaa bbbb", "cccc dddd"]  # by letters the cut would be at 13.0
+    assert pr.part_times(line, parts, []) == [(10.0, 13.0), (13.0, 16.0)]
+    heard = [{"start": 10.0, "end": 11.0}, {"start": 11.1, "end": 12.4}, {"start": 12.8, "end": 14.0}, {"start": 14.1, "end": 16.0}]
+    (a, cut), (cut2, b) = pr.part_times(line, parts, heard)
+    assert (a, b) == (10.0, 16.0) and cut == cut2 == pytest.approx(12.6)  # the breath between two words
+
+
+def test_long_lines_become_parts_in_the_session(tmp_path):
+    video = topic(tmp_path)
+    segs = [{"start": 0.0, "end": 6.0, "text": "One two three four five six, seven eight nine ten eleven twelve."}]
+    (tmp_path / "news.narration.json").write_text(json.dumps({"segments": segs}))
+    s = pr.Session(video, listen=False)
+    assert [(ln["index"], ln["line"], ln["part"], ln["parts"], ln["text"]) for ln in s.lines] == [
+        (0, 0, 1, 2, "One two three four five six,"), (1, 0, 2, 2, "seven eight nine ten eleven twelve.")]
+    assert s.lines[0]["start"] == 0.0 and s.lines[0]["end"] == s.lines[1]["start"] and s.lines[1]["end"] == 6.0
+    s.add_take("0", b"x", "webm")
+    assert s.recorded_until() == s.lines[0]["end"]
