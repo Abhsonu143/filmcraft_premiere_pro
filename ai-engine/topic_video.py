@@ -541,7 +541,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
          sources: list[str] | None = None, footage: list[str] | None = None, music: str | None = None, captions: bool = True,
          caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False, sound: dict | None = None,
          resolution: str = "1080p", hook_line: str | None = None, find_hook: bool = False, hints: str = "", feedback: str = "",
-         character: dict | None = None) -> dict:
+         character: dict | None = None, speech_pace: str = "relaxed") -> dict:
     import script_writer as sw
 
     hints = (hints or "").strip()
@@ -594,7 +594,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
     clone = voice if (voice and not voice.startswith("mac") and not script_only) else None
     # 2. script: kept when it was written with these same settings (a retry does not rewrite it)
     script_path = folder / f"{name}.script.json"
-    script_sig = state.sig(rj.read_bytes(), seconds, language, tone, niche, style, writer, hook_line, find_hook, clone, hints, fb_text)
+    script_sig = state.sig(rj.read_bytes(), seconds, language, tone, niche, style, writer, hook_line, find_hook, clone, hints, fb_text, speech_pace if clone else None)
     found = []
     if state.done("script", script_sig) and script_path.is_file() and not fresh:
         log(f"reusing the script from {time.strftime('%d %b %H:%M', time.localtime(script_path.stat().st_mtime))}")
@@ -613,7 +613,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         with ac.stage("script"):
             res = sw.write_script(data.get("title_idea") or topic, str(folder / name), niche=niche, seconds=seconds, language=language, tone=tone,
                                   notes=(hints_block(hints).strip() + "\n\n" if hints else "") + feedback_block(fb_text, script_path) + facts_notes(data), style=style, backend=writer, model=model if writer == "claude" else None, pace_voice=clone,
-                                  hook_line=hook_line, found_hooks=found)
+                                  hook_line=hook_line, found_hooks=found, pace=speech_pace)
         script_path = Path(res["script"])
         state.mark("script", script_sig)
     script = json.loads(script_path.read_text(encoding="utf-8"))
@@ -649,13 +649,13 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         mt = threading.Thread(target=media_job, name="ei-topic-media", daemon=True)
         mt.start()
         wav = folder / f"{name}.wav"
-        voice_sig = state.sig(script_path.read_bytes(), voice, takes)
+        voice_sig = state.sig(script_path.read_bytes(), voice, takes, speech_pace, seconds)
         with ac.stage("voice"):
             if state.done("voice", voice_sig) and wav.is_file() and wav.with_suffix(".narration.json").is_file():
                 log("reusing the narration (the script and voice did not change)")
                 sp = {"outputs": [str(wav)], "narration": str(wav.with_suffix(".narration.json"))}
             else:
-                sp = vo.speak(voice, str(script_path), str(wav), takes=takes)
+                sp = vo.speak(voice, str(script_path), str(wav), takes=takes, pace=speech_pace, seconds=seconds)
                 state.mark("voice", voice_sig)
         outputs.append(sp["outputs"][0])
         mt.join()
@@ -734,6 +734,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--caption-style", choices=["pop", "clean", "boxed"])
     p.add_argument("--takes", type=int, default=2)
     p.add_argument("--pace", default="medium", choices=["slow", "medium", "fast"])
+    p.add_argument("--speech-pace", default="relaxed", choices=["reference", "relaxed", "slow"],
+                   help="how fast the voice talks next to its own recordings: reference (as fast), relaxed (slower, longer pauses; default), slow")
     p.add_argument("--fresh", action="store_true", help="research again even if this folder has research for the topic")
     p.add_argument("--hook-line", help="your own first line, spoken word for word (the rest of the script follows from it)")
     p.add_argument("--find-hook", action="store_true", help="look online for hooks that work for this exact topic first")
@@ -754,7 +756,7 @@ def run_args(a) -> dict:
         footage = vc.collect_clips(a.footage)
     return make(a.topic, a.out_dir, seconds=a.seconds, language=a.language, aspect=a.aspect, voice=a.voice, script_only=a.script_only, style=a.style,
                 writer=a.writer, model=a.model, tone=a.tone, niche=a.niche, sources=a.sources, footage=footage, music=a.music,
-                captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, fresh=a.fresh,
+                captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, speech_pace=a.speech_pace, fresh=a.fresh,
                 sound=__import__("score").options(a), resolution=a.resolution, hook_line=a.hook_line, find_hook=a.find_hook,
                 hints=a.hints or "", feedback=a.feedback or "", character=__import__("character").options(a))
 

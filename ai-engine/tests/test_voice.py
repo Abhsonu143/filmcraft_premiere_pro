@@ -222,3 +222,55 @@ def test_pauses_never_carry_a_piece_of_speech():
     assert not vo.pause_fill(bad, sr // 2).any() and not vo.pause_fill(np.zeros(0, np.float32), 100).any()
     assert len(vo.pause_fill(tone, 0)) == 0
 
+
+
+# ---------------------------------------------------------------- the pace of the voice
+
+
+def test_pauses_between_sentences_are_opened():
+    sr = vo.SR
+    word = (0.3 * np.sin(2 * np.pi * 200 * np.arange(sr) / sr)).astype(np.float32)  # 1 s of "speech"
+    y = np.concatenate([word, np.zeros(int(0.1 * sr), np.float32), word, word])  # a breath after the first sentence, none after the second
+    out, bounds = vo.open_pauses(y, [0.0, 1.05, 2.1, 3.1], 0.5, np.zeros(0, np.float32))
+    assert len(out) / sr == pytest.approx(3.1 + 0.4, abs=0.05)  # the breath is now half a second
+    assert bounds[1] == pytest.approx(1.25, abs=0.05) and bounds[2] == pytest.approx(2.5, abs=0.05) and bounds[-1] == pytest.approx(len(out) / sr, abs=0.01)
+    assert np.abs(out[int(1.05 * sr) : int(1.45 * sr)]).max() == 0 and np.abs(out[int(2.45 * sr) : int(2.55 * sr)]).max() > 0.2  # no silence put into speech
+    same, b = vo.open_pauses(word, [0.0, 1.0], 0.5, np.zeros(0, np.float32))
+    assert len(same) == len(word) and b == [0.0, 1.0]
+
+
+def test_a_narration_is_fitted_to_the_asked_length():
+    assert vo.fit_length(50.0, 5.0, 1.5, None) == (1.5, 1.0)
+    scale, speed = vo.fit_length(50.0, 5.0, 1.5, 60.0)  # 58.1 s by itself: the pauses give the rest
+    assert speed == 1.0 and 50.0 + 5.0 * scale + vo.END_GAP == pytest.approx(60.0)
+    scale, speed = vo.fit_length(50.0, 5.0, 1.5, 54.0)  # too long: shortest pauses, then a little faster
+    assert scale == pytest.approx(0.9) and 1.0 < speed <= 1.06 and 50.0 / speed + 5.0 * scale + vo.END_GAP == pytest.approx(54.0, abs=0.1)
+    scale, speed = vo.fit_length(50.0, 5.0, 1.5, 30.0)  # far too long: never more than 6% faster
+    assert speed == 1.06
+    assert vo.fit_length(50.0, 5.0, 1.0, 90.0) == (1.6, 0.94)  # far too short: never more than 6% slower
+    assert set(vo.PACES) == {"reference", "relaxed", "slow"} and vo.PACES["slow"][3] < vo.PACES["relaxed"][3] < 1.0
+
+
+def test_the_script_is_sized_to_what_the_voice_does(tmp_path, monkeypatch):
+    monkeypatch.setattr(vo, "voices_dir", lambda: tmp_path)
+    (tmp_path / "me").mkdir()
+    prof = {"name": "me", "refs": [], "stats": {"en": {"words_per_s": 3.5}}}
+    (tmp_path / "me" / "profile.json").write_text(json.dumps(prof))
+    assert sw.voice_wpm("me", "en") == pytest.approx(189) and sw.voice_wpm("me", "en", "relaxed") == pytest.approx(189 * 0.8)
+    prof["paces"] = {"en": {"relaxed": 160.0}}
+    (tmp_path / "me" / "profile.json").write_text(json.dumps(prof))
+    assert sw.voice_wpm("me", "en", "relaxed") == 160.0 and sw.voice_wpm("me", "en", "reference") == pytest.approx(200.0)  # (measured wins)
+    assert sw.voice_wpm("nobody", "en") is None
+    assert sw.target_words(120, "en", None, wpm_override=160.0) == 320  # two minutes at this voice's pace
+    # a script far over the length is written once more, and the closer one is kept
+    asked = []
+
+    def claude(prompt, model=None):
+        asked.append(prompt)
+        n = 120 if len(asked) == 1 else 78
+        return json.dumps({"title": "T", "segments": [{"text": " ".join(["word"] * n), "emotion": "neutral"}]})
+
+    monkeypatch.setattr(sw, "ask_claude", claude)
+    res = sw.write_script("a topic", str(tmp_path / "s"), seconds=30, pace_voice="me", pace="relaxed")
+    script = json.loads(open(res["script"]).read())
+    assert len(asked) == 2 and "has 120 words" in asked[1] and script["words"] == 78  # 30 s at 160 words a minute: 80 words

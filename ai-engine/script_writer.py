@@ -336,8 +336,9 @@ def safe(name: str) -> str:
 # ---------------------------------------------------------------------------------------------
 
 
-def voice_wpm(voice_name: str | None, language: str) -> float | None:
-    """Speaking rate of a cloned voice (its references), so the script fits the asked length."""
+def voice_wpm(voice_name: str | None, language: str, pace: str = "reference") -> float | None:
+    """Words a minute (pauses included) of a cloned voice at a pace, so the script fits the asked length:
+    what the voice really did the last time it spoke at that pace, else worked out from its recordings."""
     if not voice_name:
         return None
     try:
@@ -346,13 +347,22 @@ def voice_wpm(voice_name: str | None, language: str) -> float | None:
         prof, _ = vo.load_profile(voice_name)
     except AutocutError:
         return None
+    rel = lambda p: vo.PACES.get(p, vo.PACES["reference"])[3]  # noqa: E731
+    did = {p: float(v) for p, v in ((prof.get("paces") or {}).get("hi" if language in ("hi", "hinglish") else "en") or {}).items() if p in vo.PACES and v}
+    if pace in did:
+        return did[pace]
+    if did:  # known at another pace
+        p, v = next(iter(did.items()))
+        return v * rel(pace) / rel(p)
     st = prof.get("stats", {}).get("hi" if language in ("hi", "hinglish") else "en") or next(iter(prof.get("stats", {}).values()), {})
     wps = st.get("words_per_s")
-    return float(wps) * 60 * 0.9 if wps else None  # the clone keeps a little of the read pace
+    return float(wps) * 60 * 0.9 * rel(pace) if wps else None  # (pauses take a tenth)
 
 
 def target_words(seconds: float, language: str, style: dict | None, wpm_override: float | None = None) -> int:
-    wpm = wpm_override or (style or {}).get("words_per_minute") or {"en": 150, "hi": 135, "hinglish": 140}.get(language, 145)
+    if wpm_override:  # a voice's own words a minute, pauses included
+        return max(15, int(seconds / 60 * min(260, max(70, wpm_override))))
+    wpm = (style or {}).get("words_per_minute") or {"en": 150, "hi": 135, "hinglish": 140}.get(language, 145)
     wpm = min(190, max(100, wpm))
     return max(15, int(seconds / 60 * wpm * 0.92))  # pauses take time too
 
@@ -390,7 +400,8 @@ def build_prompt(topic: str, *, niche: str, seconds: float, language: str, tone:
 - Niche / channel type: {niche or "general creator"}
 - Audience: {audience or "the creator's regular viewers"}
 - Tone: {tone or "match the speaker's style"}
-- Length: about {seconds:.0f} seconds of speech, about {nwords} words in total.
+- Length: about {seconds:.0f} seconds of speech, about {nwords} words in total. This is a hard limit: the voice speaks at a fixed pace and
+  takes its time (pauses between sentences), so {int(nwords * 1.06)} words or more will not fit. Count the words. Say fewer things well rather than many things in a hurry.
 - Language: {lang_rule}
 {('- Notes from the creator: ' + notes) if notes else ''}
 {style_txt}{foot}{hooks}
@@ -506,8 +517,8 @@ def with_hook_line(segs: list[dict], hook_line: str) -> list[dict]:
 def write_script(topic: str, out: str, *, niche: str = "", seconds: float = 60, language: str = "en", tone: str = "", audience: str = "",
                  notes: str = "", style: str | None = None, footage: list[str] | None = None, backend: str = "claude",
                  model: str | None = None, voice: str | None = None, speak_takes: int = 2, pace_voice: str | None = None,
-                 hook_line: str | None = None, found_hooks: list[dict] | None = None) -> dict:
-    """`hook_line`: the creator's own first line, used word for word. `found_hooks`: hooks found
+                 hook_line: str | None = None, found_hooks: list[dict] | None = None, pace: str = "reference") -> dict:
+    """`pace`: how fast the voice will talk (voice.PACES): a slower voice gets fewer words. `hook_line`: the creator's own first line, used word for word. `found_hooks`: hooks found
     online for this exact topic (hooks.find_for_topic), which lead the hook suggestions."""
     hook_line = re.sub(r"\s+", " ", hook_line or "").strip() or None
     if language not in LANGUAGES:
@@ -515,7 +526,7 @@ def write_script(topic: str, out: str, *, niche: str = "", seconds: float = 60, 
     if not (5 <= seconds <= 1800):
         raise AutocutError("length must be 5–1800 seconds")
     prof = load_style(style)
-    wpm = voice_wpm(voice or pace_voice, language)
+    wpm = voice_wpm(voice or pace_voice, language, pace)
     try:  # the best-fitting hooks of the local hook library (no internet needed)
         import hooks as hk
 
@@ -539,6 +550,23 @@ def write_script(topic: str, out: str, *, niche: str = "", seconds: float = 60, 
     segs = [c for c in (clean_segment(s) for s in data.get("segments", []) if isinstance(s, dict)) if c]
     if not segs:
         raise AutocutError("the script has no segments")
+    aim = target_words(seconds, language, prof, wpm)
+    count = lambda sg: sum(len(words_of(x["text"])) for x in sg)  # noqa: E731
+    if backend == "claude" and aim >= 40 and not 0.85 * aim <= count(segs) <= 1.1 * aim:
+        # too long is spoken in a hurry or runs over; too short ends early: written once more at the right length
+        n = count(segs)
+        log(f"the script has {n} words where about {aim} fit: Claude writes it again at that length")
+        fix = (f"{prompt}\n\n## Correction\nYour script below has {n} words. It must have between {int(aim * 0.93)} and {int(aim * 1.04)} words, "
+               f"because it must last {seconds:.0f} seconds at the voice's pace. Write it again at that length, in the same JSON format: "
+               + ("cut the least important points and tighten every sentence; keep the hook and the strongest facts." if n > aim else "add the next most interesting facts.")
+               + "\n\nYour script:\n" + json.dumps([x["text"] for x in segs], ensure_ascii=False))
+        try:
+            again = [c for c in (clean_segment(x) for x in extract_json(ask_claude(fix, model)).get("segments", []) if isinstance(x, dict)) if c]
+        except (AutocutError, ValueError) as e:
+            again = []
+            log(f"the shorter script could not be written ({e}): the first one is kept")
+        if again and abs(count(again) - aim) < abs(n - aim):
+            data["segments"], segs = again, again
     if hook_line:
         segs = with_hook_line(segs, hook_line)
     script = {"version": 1, "title": str(data.get("title", topic)).strip(), "topic": topic, "language": language, "niche": niche,

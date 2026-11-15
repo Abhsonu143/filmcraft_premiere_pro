@@ -132,6 +132,59 @@ def pause_fill(tone: np.ndarray, n: int) -> np.ndarray:
     return (np.tile(tone, int(np.ceil(n / len(tone))))[:n] * 0.9).astype(np.float32)
 
 
+# How fast the voice talks, next to the recordings it was made from. A clone copies the pace of its voice
+# sample, so the sample itself is slowed (the voice then talks slower by itself, with nothing stretched);
+# what was spoken is slowed a little more, and the pauses made longer.
+# name: (speed of the voice sample, speed of what was spoken, length of the pauses, words a minute next to "reference")
+PACES = {"reference": (1.0, 1.0, 1.0, 1.0), "relaxed": (0.85, 0.95, 1.5, 0.8), "slow": (0.8, 0.88, 2.0, 0.68)}
+SENTENCE_GAP = 0.28  # seconds of breath between the sentences of a passage, times the pace's pause length
+END_GAP = 0.6  # silence after the last word
+
+
+def open_pauses(y: np.ndarray, bounds: list[float], want: float, tone: np.ndarray) -> tuple[np.ndarray, list[float]]:
+    """Longer breaths between the sentences of a passage: where the voice is quiet at a sentence's end,
+    that silence is made `want` seconds long. Returns the sound and where the lines now start and end."""
+    db = frame_db(y)
+    if len(db) == 0 or len(bounds) < 3:
+        return y, bounds
+    quiet = float(np.percentile(db, 95)) - 35
+    out, new, at, added = [], [bounds[0]], 0, 0.0
+    for b in bounds[1:-1]:
+        i = min(len(db) - 1, max(0, int(b * 50)))
+        more = 0.0
+        if db[i] <= quiet:
+            lo = hi = i
+            while lo > 0 and db[lo - 1] <= quiet:
+                lo -= 1
+            while hi < len(db) - 1 and db[hi + 1] <= quiet:
+                hi += 1
+            more = want - (hi - lo + 1) * 0.02
+        if more > 0.02:
+            cut = min(len(y), max(at, int(b * SR)))
+            out += [y[at:cut], pause_fill(tone, int(more * SR))]
+            at = cut
+            new.append(b + added + more / 2)
+            added += more
+        else:
+            new.append(b + added)
+    out.append(y[at:])
+    new.append(bounds[-1] + added)
+    return np.concatenate(out).astype(np.float32), new
+
+
+def fit_length(speech: float, gaps: float, pause_scale: float, seconds: float | None) -> tuple[float, float]:
+    """(length of the pauses, speed of the speech) that make a narration `seconds` long: first the pauses
+    give or take (0.6–1.6 times the pace's own), then the speech a little (at most 6% either way)."""
+    if not seconds or seconds <= 0 or speech <= 0:
+        return pause_scale, 1.0
+    scale = pause_scale
+    if gaps > 0:
+        scale = float(np.clip((seconds - END_GAP - speech) / gaps, 0.6 * pause_scale, 1.6 * pause_scale))
+    room = seconds - END_GAP - gaps * scale
+    speed = float(np.clip(speech / room, 0.94, 1.06)) if room > 0 else 1.06
+    return scale, 1.0 if abs(speed - 1) < 0.015 else speed
+
+
 def pitch_track(y: np.ndarray, sr: int = SR, hop: int = 480, lo: float = 70, hi: float = 400) -> np.ndarray:
     """F0 per 20 ms frame (Hz, 0 = unvoiced): normalised autocorrelation, cheap and robust enough
     for a speaker's median pitch and range."""
@@ -963,8 +1016,13 @@ def speak_mac(voice: str, script: str, out: str, language: str | None = None) ->
 
 
 def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, takes: int = 2, language: str | None = None,
-          whisper_model: str | None = None) -> dict:
-    """Script -> narration in the cloned voice (wav + narration.json). `mac` / `mac:<name>` uses a macOS voice."""
+          whisper_model: str | None = None, pace: str = "reference", seconds: float | None = None) -> dict:
+    """Script -> narration in the cloned voice (wav + narration.json). `mac` / `mac:<name>` uses a macOS voice.
+    `pace`: how fast it talks next to the voice's recordings (PACES). `seconds`: the length it should have
+    (the pauses, then the speed a little, are fitted to it)."""
+    if pace not in PACES:
+        raise AutocutError(f"the pace is one of {', '.join(PACES)}")
+    sample_speed, spoken_speed, pause_scale, _ = PACES[pace]
     if voice_name == "mac" or voice_name.startswith("mac:"):
         return speak_mac(voice_name, script, out, language)
     ac.require_tools()
@@ -1002,6 +1060,12 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
     # continues where it was (only the missing takes are spoken again)
     work = outp.parent / ".ei-work" / outp.stem / "takes"
     work.mkdir(parents=True, exist_ok=True)
+    if sample_speed != 1.0:  # a slower voice sample: the clone talks slower by itself
+        for lg, (path, refs) in list(anchors.items()):
+            slow = work / f"sample-{lg}-{int(sample_speed * 100)}.wav"
+            write_wav(slow, tempo(read_wav(path), sample_speed))
+            anchors[lg] = (str(slow), refs)
+        log(f"pace: {pace} (the voice sample at {sample_speed:.2f}× speed, pauses {pause_scale:.1f}× as long)")
     anchor_keys = {lg: hashlib.sha1(Path(a[0]).read_bytes()).hexdigest()[:12] for lg, a in anchors.items()}
     ac.progress_plan({"first takes": 0.62, "checking": 0.13, "better takes": 0.2, "assembling": 0.05})
     # the clone model stays loaded across rounds when the checks are light (English: Whisper small);
@@ -1093,14 +1157,33 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
             raise AutocutError(f"{len(missing)} passage(s) could not be spoken")
         # assemble: passages joined by the script's pauses (your room tone), one gentle level for all
         tone = read_wav(d / "roomtone.wav") if (d / "roomtone.wav").is_file() else np.zeros(0, np.float32)
-        parts, timeline, t = [], [], 0.0
         fade = int(0.012 * SR)
+        spoken = []  # per passage: its sound at this pace, where its lines start and end, the pause after it
         for ci, c in enumerate(chunks):
             y = trim_silence(read_wav(best[ci]["file"]), pad=0.05)
+            if spoken_speed != 1.0:
+                y = tempo(y, spoken_speed)
             if len(y) > 2 * fade:
                 y[:fade] *= np.linspace(0, 1, fade)
                 y[-fade:] *= np.linspace(1, 0, fade)
             bounds = split_points(y, [segs[i]["text"] for i in c["lines"]])
+            if pause_scale > 1.0:
+                y, bounds = open_pauses(y, bounds, SENTENCE_GAP * pause_scale, tone)
+            last = c["lines"][-1]
+            # the script's pause, or the dramatic pause the next line's emotion asks for (before a reveal, awe, grief)
+            gap = max(float(segs[last].get("pause_after", 0.35)), pause_before(segs[chunks[ci + 1]["lines"][0]])) if ci < len(chunks) - 1 else 0.0
+            spoken.append((y, bounds, gap))
+        speech, gaps = sum(len(y) for y, _, _ in spoken) / SR, sum(g for _, _, g in spoken)
+        n_words = sum(len(sg["text"].split()) for sg in segs)
+        own = speech + gaps * pause_scale + END_GAP  # how long it is at this pace, before any fitting
+        scale, speed = fit_length(speech, gaps, pause_scale, seconds)
+        if seconds:
+            log(f"length: {own:.1f}s at the {pace} pace, {seconds:.0f}s asked: pauses {scale / pause_scale:.2f}×" + (f", speech {speed:.2f}×" if speed != 1.0 else ""))
+        parts, timeline, t = [], [], 0.0
+        for ci, (c, (y, bounds, gap)) in enumerate(zip(chunks, spoken)):
+            if speed != 1.0:
+                y = tempo(y, speed)
+                bounds = [b / speed for b in bounds[:-1]] + [len(y) / SR]
             for k, i in enumerate(c["lines"]):
                 a_, b_ = bounds[k], bounds[k + 1]
                 timeline.append({"start": round(t + a_, 3), "end": round(t + b_, 3), "text": segs[i]["text"], "emotion": segs[i].get("emotion", "neutral"),
@@ -1109,17 +1192,24 @@ def speak(voice_name: str, script: str, out: str, *, engine: str | None = None, 
                                  "check": {"cer": best[ci]["cer"], "sim": best[ci]["sim"], "heard": best[ci]["heard"], "ref": "anchor", "passage": ci}})
             parts.append(y)
             t += len(y) / SR
-            last = c["lines"][-1]
-            # the script's pause, or the dramatic pause the next line's emotion asks for (before a reveal, awe, grief)
-            gap = max(float(segs[last].get("pause_after", 0.35)), pause_before(segs[chunks[ci + 1]["lines"][0]])) if ci < len(chunks) - 1 else 0.6
-            n = int(gap * SR)
-            parts.append(pause_fill(tone, n))
-            t += gap
+            pause = gap * scale if ci < len(chunks) - 1 else END_GAP
+            parts.append(pause_fill(tone, int(pause * SR)))
+            t += pause
+        if n_words >= 40 and own > 0:  # what this voice really does at this pace: the next script is sized with it
+            try:
+                lang_most = max({c["lang"] for c in chunks}, key=lambda lg: sum(len(c["lines"]) for c in chunks if c["lang"] == lg))
+                fresh_prof = json.loads((d / "profile.json").read_text(encoding="utf-8"))
+                fresh_prof.setdefault("paces", {}).setdefault(lang_most, {})[pace] = round(n_words / own * 60, 1)
+                tmp_prof = d / "profile.json.part"
+                tmp_prof.write_text(json.dumps(fresh_prof, ensure_ascii=False, indent=1), encoding="utf-8")
+                os.replace(tmp_prof, d / "profile.json")
+            except (OSError, ValueError) as e:
+                log(f"the voice's pace could not be noted ({type(e).__name__})")
         raw = Path(tmp) / "raw.wav"
         write_wav(raw, np.concatenate(parts))
         ac.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-ar", "48000", str(outp)])
     worst = sorted(timeline, key=lambda x: -(x["check"]["cer"] or 0))[:1]
-    narration = {"version": 2, "voice": voice_name, "engine": eng, "script": str(script) if Path(str(script)).is_file() else None,
+    narration = {"version": 2, "voice": voice_name, "engine": eng, "pace": pace, "words_per_minute": round(sum(len(sg["text"].split()) for sg in segs) / max(1.0, t) * 60), "script": str(script) if Path(str(script)).is_file() else None,
                  "duration": round(t, 3), "segments": timeline}
     nj = outp.with_suffix(".narration.json")
     nj.write_text(json.dumps(narration, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -1283,6 +1373,8 @@ def add_args(sub) -> None:
     p.add_argument("--engine", choices=list(ENGINES))
     p.add_argument("--takes", type=int, default=2, help="takes per line (best one kept): 1 fast … 4 best")
     p.add_argument("--language", choices=["en", "hi"])
+    p.add_argument("--pace", default="relaxed", choices=list(PACES), help="how fast the voice talks next to its recordings (default relaxed)")
+    p.add_argument("--seconds", type=float, default=None, help="the length the narration should have (pauses and speed are fitted to it)")
     import score
 
     score.add_sound_args(p)
@@ -1311,7 +1403,7 @@ def run_args(a) -> dict:
         import score
 
         opts = score.options(a)
-        res = speak(a.voice, a.script, a.out, engine=a.engine, takes=a.takes, language=a.language)
+        res = speak(a.voice, a.script, a.out, engine=a.engine, takes=a.takes, language=a.language, pace=a.pace, seconds=a.seconds)
         if opts:  # the voice alone stays; the scored version is written next to it
             wav = res["outputs"][0]
             scored = str(Path(wav).with_name(Path(wav).stem + " - scored.wav"))
