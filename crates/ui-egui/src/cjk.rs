@@ -59,10 +59,42 @@ fn system_font() -> Option<Arc<FontData>> {
     .clone()
 }
 
+const DEVANAGARI_SAMPLE: &str = "हिंदी आवाज़ की भाषा";
+const DEVANAGARI: &[&str] =
+    &["Kohinoor Devanagari", "Devanagari Sangam MN", "ITF Devanagari", "Devanagari MT", "Noto Sans Devanagari", "Nirmala UI", "Mangal", "Arial Unicode MS"];
+
+/// One installed face for Hindi (Devanagari): without it Hindi sentences, voice names and scripts
+/// show as empty boxes. (The interface draws letter by letter, so joined letters look simpler than
+/// in a text editor, but every word is readable.)
+fn system_devanagari() -> Option<Arc<FontData>> {
+    static FONT: OnceLock<Option<Arc<FontData>>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        if cfg!(target_arch = "wasm32") {
+            return None;
+        }
+        filmcraft_text::fonts::scan_system();
+        let faces: Vec<_> = filmcraft_text::fonts::all_faces().into_iter().filter(|f| f.info.origin == "system" && !f.info.italic).collect();
+        let covers = |f: &filmcraft_text::fonts::Face| f.covers_unloaded(DEVANAGARI_SAMPLE);
+        let by_weight = |f: &&Arc<filmcraft_text::fonts::Face>| f.info.weight.abs_diff(400);
+        let face = DEVANAGARI
+            .iter()
+            .find_map(|name| faces.iter().filter(|f| f.info.family.eq_ignore_ascii_case(name)).min_by_key(by_weight).filter(|f| covers(f)))
+            .or_else(|| faces.iter().filter(|f| f.info.family.to_ascii_lowercase().contains("devanagari")).find(|f| covers(f)))?;
+        Some(Arc::new(FontData { font: std::borrow::Cow::Owned(face.data_unloaded()?), index: face.info.index, tweak: Default::default() }))
+    })
+    .clone()
+}
+
 /// Append Chinese faces after the Latin UI fonts and the Japanese fallbacks. This keeps the
 /// interface's Latin typography and Japanese glyph forms, and covers the simplified and
 /// traditional hanzi in media and track names that Japanese fonts lack.
 pub(crate) fn install(fonts: &mut FontDefinitions) {
+    if let Some(font) = system_devanagari() {
+        fonts.font_data.insert("system-devanagari".into(), font);
+        for stack in fonts.families.values_mut() {
+            stack.push("system-devanagari".into());
+        }
+    }
     let chinese: Vec<_> = craft_fonts().collect();
     if chinese.is_empty() {
         if let Some(font) = system_font() {
@@ -94,6 +126,7 @@ mod tests {
     #[test]
     fn finding_the_chinese_font_keeps_no_font_files() {
         let font = system_font();
+        let hindi = system_devanagari();
         // a Mac always has one (Hiragino Sans GB, Heiti, Songti, Arial Unicode)
         assert!(!cfg!(target_os = "macos") || font.is_some());
         let loaded: Vec<String> = filmcraft_text::fonts::all_faces()
@@ -102,6 +135,8 @@ mod tests {
             .map(|f| format!("{} {}", f.info.family, f.info.style))
             .collect();
         assert!(loaded.len() <= 4, "system fonts left in memory: {loaded:?}");
+        // Hindi shows as letters, not boxes (a Mac always has Kohinoor Devanagari or Devanagari Sangam MN)
+        assert!(!cfg!(target_os = "macos") || hindi.is_some());
         assert!(likely_chinese("Hiragino Sans GB") && likely_chinese("Noto Sans CJK SC") && !likely_chinese("Helvetica Neue"));
     }
 }

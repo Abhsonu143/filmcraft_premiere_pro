@@ -141,6 +141,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("ai.planMake", "Make Video from Plan…", ["AI"], None),
     uic!("ai.repair", "Repair Sounds in Pauses…", ["AI"], None),
     uic!("ai.topic", "Video from Topic…", ["AI"], None),
+    uic!("ai.explain", "Explainer Video…", ["AI"], None),
     uic!("ai.tv", "TV Light Sync…", ["AI"], None),
     uic!("ai.voiceover", "Voiceover Edit…", ["AI"], None),
     uic!("ai.clips", "Make Short Clips from Long Video…", ["AI"], None),

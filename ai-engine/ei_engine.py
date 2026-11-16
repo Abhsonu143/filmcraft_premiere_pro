@@ -154,6 +154,9 @@ def run(argv: list[str]) -> dict:
     pause_repair.add_args(sub.add_parser("repair-pauses", help="a copy of a video folder with the sound taken out of the voice's pauses"))
     plan_make.add_args(sub.add_parser("plan-make", help="make the video of a plan from Plan Videos (or of a new plan for what you ask)"))
     gameplay_plan.add_args(sub.add_parser("gameplay-plan", help="plan videos from a list of gameplay recordings (analysed once, kept next to them)"))
+    import explainer
+
+    explainer.add_args(sub.add_parser("explain", help="an explainer video (coding, research, social…): researched and planned in chapters you can review, change and approve"))
     import thumbnails
 
     thumbnails.add_args(sub.add_parser("package", help="thumbnails, titles, hooks and hashtags for YouTube and Instagram (English, Hindi)"))
@@ -206,6 +209,8 @@ def run(argv: list[str]) -> dict:
         return presenter.run_args(a)
     if a.cmd == "plan-make":
         return plan_make.run_args(a)
+    if a.cmd == "explain":
+        return explainer.run_args(a)
     if a.cmd == "repair-pauses":
         return pause_repair.run_args(a)
     if a.cmd == "voiceover":

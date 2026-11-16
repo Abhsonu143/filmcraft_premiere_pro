@@ -29,6 +29,11 @@
 //!   check?}`: the video of a plan from Plan Videos, or of a new plan written for what is asked; the result (`.otio` + `.srt`) opens in
 //!   the timeline. `fix`: what is wrong with the video made before (corrected in the plan, then made again); `captionFix`: caption words
 //!   corrected in this and every later make; `check`: nothing is made, the finished video is checked (`check.txt` next to it).
+//! - `ai.explain {topic (what to explain), hints?, explainKind?=auto|coding|technical|research|science|history|social|political|business|general,
+//!   seconds?=360, language?, to?=plan|script|video, review?=true, approve?, explainNotes? (one per line; "3: …" is chapter 3),
+//!   noteFor?=auto|plan|script, voice?, takes?, speechPace?, design?=clean|dark|viral, aspect?, explainCaptions?=auto|sentence|words|none,
+//!   clipsAs?=same|vertical|none, music?, outDir?, fresh?}`: an explainer video in steps (researched plan → checked script → voice,
+//!   drawn pictures, video and a clip per chapter); with `review` each step waits in its folder (plan.md, script.md) for `approve` or notes.
 //! - `ai.repair {input}`: the folder of a video made by EI (or a file in it) → a copy “<folder> - fixed” whose
 //!   voice pauses are silent and whose sound track has the bursts in them taken out (the picture is not re-encoded).
 //! - `ai.speak {script (file) or notes (text), voice, takes?, out?}`: a script spoken (audio only).
@@ -94,6 +99,7 @@ pub enum Kind {
     Package,
     Repair,
     PlanMake,
+    Explain,
 }
 
 impl Kind {
@@ -116,6 +122,7 @@ impl Kind {
             Kind::Package => "package",
             Kind::Repair => "repair",
             Kind::PlanMake => "planMake",
+            Kind::Explain => "explain",
         }
     }
     fn from_command(id: &str) -> Option<Kind> {
@@ -137,6 +144,7 @@ impl Kind {
             "ai.package" => Kind::Package,
             "ai.repair" => Kind::Repair,
             "ai.planMake" => Kind::PlanMake,
+            "ai.explain" => Kind::Explain,
             _ => return None,
         })
     }
@@ -159,6 +167,7 @@ impl Kind {
             Kind::Package => "Thumbnails, Titles & Hashtags",
             Kind::Repair => "Repair Sounds in Pauses",
             Kind::PlanMake => "Make Video from Plan",
+            Kind::Explain => "Explainer Video",
         }
     }
     fn input_label(self) -> &'static str {
@@ -175,7 +184,17 @@ impl Kind {
     fn needs_input(self) -> bool {
         !matches!(
             self,
-            Kind::Music | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Tv | Kind::Speak | Kind::Hooks | Kind::Download | Kind::Package
+            Kind::Music
+                | Kind::Audio
+                | Kind::Script
+                | Kind::Voice
+                | Kind::Topic
+                | Kind::Tv
+                | Kind::Speak
+                | Kind::Hooks
+                | Kind::Download
+                | Kind::Package
+                | Kind::Explain
         )
     }
     /// Tools that render a video in a chosen shape (and so offer 1080p or 4K).
@@ -279,6 +298,20 @@ struct Draft {
     plan_check: bool,
     plan_list: Vec<String>,
     plan_list_for: String,
+    /// Explainer Video: the kind of topic, how far to go (plan | script | video), whether the plan and the script wait for
+    /// approval, the approval itself, notes (one per line; "3: …" is about chapter 3) and what they change, the look,
+    /// the captions, how chapters become clips, and the explainers already begun (folder, what it explains, where it stands).
+    explain_kind: &'static str,
+    explain_to: &'static str,
+    explain_review: bool,
+    explain_approve: bool,
+    explain_notes: String,
+    explain_note_for: &'static str,
+    explain_look: &'static str,
+    explain_captions: &'static str,
+    explain_clips: &'static str,
+    explain_list: Vec<(String, String, String)>,
+    explain_listed: bool,
     // TV light sync
     tv_folder: String,
     relight: f64,
@@ -445,7 +478,7 @@ impl Draft {
             length: 30.0,
             aspect: match kind {
                 Kind::Reference => "same",
-                Kind::Voiceover => "horizontal",
+                Kind::Voiceover | Kind::Explain => "horizontal",
                 _ => "vertical",
             },
             pace: "medium",
@@ -473,7 +506,7 @@ impl Draft {
             mono: false,
             normalize: false,
             captions: kind == Kind::Topic,
-            import: !matches!(kind, Kind::Split | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic),
+            import: !matches!(kind, Kind::Split | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Explain),
             error: String::new(),
             describe: "local",
             ambience: true,
@@ -483,7 +516,7 @@ impl Draft {
             audience: String::new(),
             notes: String::new(),
             language: "hinglish",
-            seconds: 60.0,
+            seconds: if kind == Kind::Explain { 360.0 } else { 60.0 },
             style: String::new(),
             style_sources: Vec::new(),
             style_links: String::new(),
@@ -508,6 +541,17 @@ impl Draft {
             plan_fix: String::new(),
             plan_caption_fix: String::new(),
             plan_check: false,
+            explain_kind: "auto",
+            explain_to: "video",
+            explain_review: true,
+            explain_approve: false,
+            explain_notes: String::new(),
+            explain_note_for: "auto",
+            explain_look: "clean",
+            explain_captions: "auto",
+            explain_clips: "same",
+            explain_list: Vec::new(),
+            explain_listed: false,
             plan_list: Vec::new(),
             plan_list_for: String::new(),
             tv_folder: setting_str("tv_recordings").unwrap_or_default(),
@@ -681,6 +725,17 @@ impl Draft {
             d.plan_caption_fix = v;
         }
         d.plan_check = flag("check", d.plan_check);
+        d.explain_kind = pick("explainKind", &EXPLAIN_KINDS.map(|a| a.0), d.explain_kind);
+        d.explain_to = pick("to", &EXPLAIN_STEPS.map(|a| a.0), d.explain_to);
+        d.explain_review = flag("review", d.explain_review);
+        d.explain_approve = flag("approve", d.explain_approve);
+        if let Some(v) = s("explainNotes") {
+            d.explain_notes = v;
+        }
+        d.explain_note_for = pick("noteFor", &EXPLAIN_NOTE_FOR.map(|a| a.0), d.explain_note_for);
+        d.explain_look = pick("design", &EXPLAIN_LOOKS.map(|a| a.0), d.explain_look);
+        d.explain_captions = pick("explainCaptions", &EXPLAIN_CAPTIONS.map(|a| a.0), d.explain_captions);
+        d.explain_clips = pick("clipsAs", &EXPLAIN_CLIPS.map(|a| a.0), d.explain_clips);
         if let Some(v) = p.get("recordings").and_then(Value::as_str) {
             d.tv_folder = v.to_string();
         }
@@ -854,6 +909,15 @@ impl Draft {
         m.insert("fix".into(), json!(self.plan_fix));
         m.insert("captionFix".into(), json!(self.plan_caption_fix));
         m.insert("check".into(), json!(self.plan_check));
+        m.insert("explainKind".into(), json!(self.explain_kind));
+        m.insert("to".into(), json!(self.explain_to));
+        m.insert("review".into(), json!(self.explain_review));
+        m.insert("approve".into(), json!(self.explain_approve));
+        m.insert("explainNotes".into(), json!(self.explain_notes));
+        m.insert("noteFor".into(), json!(self.explain_note_for));
+        m.insert("design".into(), json!(self.explain_look));
+        m.insert("explainCaptions".into(), json!(self.explain_captions));
+        m.insert("clipsAs".into(), json!(self.explain_clips));
         m.insert("feedback".into(), json!(self.feedback));
         m.insert("recordings".into(), json!(self.tv_folder));
         m.insert("relight".into(), json!(self.relight));
@@ -1309,6 +1373,59 @@ impl Draft {
                     }
                 } else {
                     a.push("--script-only".into());
+                }
+            }
+            Kind::Explain => {
+                if self.topic.trim().is_empty() {
+                    return Err("Say what the video should explain (or choose one you began).".into());
+                }
+                if !(60.0..=3600.0).contains(&self.seconds) {
+                    return Err("Length must be 1 to 60 minutes.".into());
+                }
+                let video = self.explain_to == "video";
+                if video && self.voice.trim().is_empty() {
+                    return Err("Choose the voice for the video (or go only as far as the plan or the script).".into());
+                }
+                a = vec!["explain".into(), self.topic.trim().into()];
+                push(&mut a, "--minutes", &format!("{}", (self.seconds / 6.0).round() / 10.0));
+                push(&mut a, "--language", self.language);
+                push(&mut a, "--kind", self.explain_kind);
+                push(&mut a, "--to", self.explain_to);
+                if !self.hints.trim().is_empty() {
+                    push(&mut a, "--hints", self.hints.trim());
+                }
+                if !self.out.trim().is_empty() {
+                    push(&mut a, "--out-dir", self.out.trim());
+                }
+                if self.explain_review {
+                    a.push("--review".into());
+                }
+                if self.explain_approve {
+                    a.push("--approve".into());
+                }
+                let notes: Vec<&str> = self.explain_notes.lines().map(|n| n.trim().trim_start_matches('-').trim()).filter(|n| !n.is_empty()).collect();
+                for n in &notes {
+                    push(&mut a, "--note", n);
+                }
+                if !notes.is_empty() && self.explain_note_for != "auto" {
+                    push(&mut a, "--note-for", self.explain_note_for);
+                }
+                if self.fresh {
+                    a.push("--fresh".into());
+                }
+                if video {
+                    push(&mut a, "--voice", self.voice.trim());
+                    push(&mut a, "--takes", &format!("{}", self.takes.round()));
+                    if !self.voice.starts_with("mac") {
+                        push(&mut a, "--speech-pace", self.speech_pace);
+                    }
+                    push(&mut a, "--look", self.explain_look);
+                    push(&mut a, "--aspect", if self.aspect == "same" { "horizontal" } else { self.aspect });
+                    push(&mut a, "--captions", self.explain_captions);
+                    push(&mut a, "--clips", self.explain_clips);
+                    if !self.music.trim().is_empty() {
+                        push(&mut a, "--music", self.music.trim());
+                    }
                 }
             }
             Kind::PlanMake => {
@@ -1907,6 +2024,40 @@ const VOICE_SOURCES: [(&str, &str); 2] =
     [("record", "Record with the microphone (EI gives the sentences)"), ("files", "Recordings I already have (audio or video)")];
 const TV_SHAPES: [(&str, &str); 2] =
     [("horizontal", "Horizontal (16:9, from the horizontal recordings)"), ("vertical", "Vertical (9:16, from the vertical recordings)")];
+const EXPLAIN_KINDS: [(&str, &str); 10] = [
+    ("auto", "Automatic (from what you wrote)"),
+    ("coding", "Coding (code, a bug found and fixed, the terminal)"),
+    ("technical", "Technical (how something works: flows, examples)"),
+    ("research", "Research (papers, data, what is and is not known)"),
+    ("science", "Science"),
+    ("history", "History (dates in order, sources)"),
+    ("social", "Social (each side at its strongest, the evidence)"),
+    ("political", "Political (the law, ruling or speech itself, each side)"),
+    ("business", "Business"),
+    ("general", "General"),
+];
+const EXPLAIN_STEPS: [(&str, &str); 3] = [
+    ("plan", "The plan: chapters, what is said and shown, every claim with its source"),
+    ("script", "The script: every spoken line and what is on screen, checked against the research"),
+    ("video", "The video: voice, drawn pictures, captions, each chapter also as a clip"),
+];
+const EXPLAIN_NOTE_FOR: [(&str, &str); 3] = [
+    ("auto", "The step I read last (the script when there is one, else the plan)"),
+    ("plan", "The plan (the script is then written again)"),
+    ("script", "The script"),
+];
+const EXPLAIN_LOOKS: [(&str, &str); 3] = [
+    ("clean", "Clean: paper and ink, like a documentary"),
+    ("dark", "Dark: for code and technical topics"),
+    ("viral", "Viral: bold colours, big word-by-word captions, a push on every change"),
+];
+const EXPLAIN_CAPTIONS: [(&str, &str); 4] =
+    [("auto", "As the look has them"), ("sentence", "A line at the bottom"), ("words", "Big, word by word"), ("none", "No captions")];
+const EXPLAIN_CLIPS: [(&str, &str); 3] = [
+    ("same", "Each chapter cut out of the video, in its shape"),
+    ("vertical", "Each chapter drawn again tall (9:16) for Shorts and Reels"),
+    ("none", "No clips"),
+];
 const MAC_VOICES: [(&str, &str); 5] = [
     ("mac:Rishi", "Rishi: Indian English (macOS voice, quick preview)"),
     ("mac:Tara", "Tara: Indian English (macOS voice)"),
@@ -1959,6 +2110,7 @@ fn default_output(d: &Draft) -> String {
         Kind::Hooks => String::new(),    // the library has one place (Application Support/EI/hooks)
         Kind::Repair => String::new(),   // a copy next to the folder ("<folder> - fixed")
         Kind::PlanMake => String::new(), // a folder per video in "videos" next to the plans file
+        Kind::Explain => String::new(),  // the engine names the folder after what is explained (Movies/EI/Explainers/…)
         Kind::Package => movies_dir().join("Thumbnails").to_string_lossy().to_string(),
         // the folder chosen last time (a playlist gets a folder of its own inside it)
         Kind::Download => setting_str("download_dir").unwrap_or_else(|| movies_dir().join("Downloads").to_string_lossy().to_string()),
@@ -2466,6 +2618,8 @@ struct Job {
     queued: bool,
     /// The dialog's settings it was started with (Edit & Retry reopens them).
     params: Option<Value>,
+    /// A quick helper of a dialog (the microphones, the sentences to read): not listed in AI Jobs unless it fails.
+    quiet: bool,
 }
 
 impl Job {
@@ -2519,6 +2673,15 @@ fn start_job(title: String, kind: Option<Kind>, steps: Vec<Vec<String>>, import:
     start_job_ex(title, kind, steps, import, cwd, false)
 }
 
+/// A quick helper job of a dialog: it runs like any job, but AI Jobs lists it only if it fails.
+fn start_quiet_job(title: String, step: Vec<String>, cwd: PathBuf) -> u64 {
+    let id = start_job(title, None, vec![step], false, Some(cwd));
+    if let Some(j) = jobs().lock().unwrap_or_else(PoisonError::into_inner).iter_mut().find(|j| j.id == id) {
+        j.quiet = true;
+    }
+    id
+}
+
 fn start_job_ex(title: String, kind: Option<Kind>, steps: Vec<Vec<String>>, import: bool, cwd: Option<PathBuf>, queued: bool) -> u64 {
     static NEXT: OnceLock<Mutex<u64>> = OnceLock::new();
     let id = {
@@ -2559,6 +2722,7 @@ fn start_job_ex(title: String, kind: Option<Kind>, steps: Vec<Vec<String>>, impo
             paused_total: Duration::ZERO,
             queued,
             params: None,
+            quiet: false,
         });
     }
     let spawned = std::thread::Builder::new().name(format!("ei-ai-job-{id}")).spawn(move || {
@@ -3223,6 +3387,16 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
         Kind::Speak => format!("{}: {}", d.kind.title(), file_stem(&d.out)),
         Kind::Hooks => format!("{}: sync {}", d.kind.title(), d.hook_niches.trim().chars().take(40).collect::<String>()),
         Kind::Repair => format!("{}: {}", d.kind.title(), file_stem(d.input.trim().trim_end_matches('/'))),
+        Kind::Explain => {
+            let what = if !d.explain_notes.trim().is_empty() {
+                "your notes"
+            } else if d.explain_approve {
+                "approved, next step"
+            } else {
+                d.explain_to
+            };
+            format!("{} ({what}): {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>())
+        }
         Kind::PlanMake => {
             let corrected = !d.plan_fix.trim().is_empty() || !d.plan_caption_fix.trim().is_empty();
             let what = if d.plan_check {
@@ -3673,6 +3847,170 @@ fn plan_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String,
     ui.end_row();
 }
 
+/// Explainers already begun: (folder, what it explains, where it stands), newest first.
+fn saved_explainers() -> Vec<(String, String, String)> {
+    let root = movies_dir().join("Explainers");
+    let mut found: Vec<(std::time::SystemTime, (String, String, String))> = Vec::new();
+    for e in std::fs::read_dir(&root).into_iter().flatten().flatten().take(400) {
+        let dir = e.path();
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        let Some(plan) = read("plan.json") else { continue };
+        let Some(want) = plan.get("want").and_then(Value::as_str).filter(|w| !w.trim().is_empty()) else { continue };
+        let status = |v: &Value| v.get("status").and_then(Value::as_str).unwrap_or("draft").to_string();
+        let made = std::fs::read_dir(&dir).into_iter().flatten().flatten().any(|f| f.path().extension().is_some_and(|x| x == "mp4"));
+        let stands = match read("script.json") {
+            _ if made => "video made".to_string(),
+            Some(sc) if status(&sc) == "approved" => "script approved".to_string(),
+            Some(sc) => format!("script: {}", status(&sc)),
+            None if status(&plan) == "approved" => "plan approved".to_string(),
+            None => format!("plan: {}", status(&plan)),
+        };
+        let when = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+        found.push((when, (dir.to_string_lossy().to_string(), want.to_string(), stands)));
+    }
+    found.sort_by_key(|a| std::cmp::Reverse(a.0));
+    found.into_iter().map(|f| f.1).take(60).collect()
+}
+
+fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
+    ui.label("What to explain");
+    ui.vertical(|ui| {
+        let r = ui.add(
+            egui::TextEdit::multiline(&mut d.topic)
+                .hint_text("in your own words, e.g.\nwhy Python's mutable default argument bug happens, how to spot it, the right fix\nwhat the new data protection law changes for a small shop, with the sections themselves")
+                .desired_rows(3)
+                .desired_width(430.0),
+        );
+        elems.push((format!("{p}.topic"), r.rect, d.topic.clone()));
+        ui.horizontal(|ui| {
+            let reload = ui.small_button("↻").on_hover_text("Look for explainers again");
+            elems.push((format!("{p}.reload"), reload.rect, "reload".into()));
+            if reload.clicked() || !d.explain_listed {
+                d.explain_list = saved_explainers();
+                d.explain_listed = true;
+            }
+            let here = d.explain_list.iter().find(|e| e.1 == d.topic.trim());
+            let shown = match here {
+                Some(e) => format!("{} · {}", e.2, e.1.chars().take(40).collect::<String>()),
+                None if d.explain_list.is_empty() => "none begun yet".to_string(),
+                None => format!("or continue one of {} begun", d.explain_list.len()),
+            };
+            let r = egui::ComboBox::from_id_salt(format!("{p}.continue")).selected_text(shown.clone()).width(400.0).show_ui(ui, |ui| {
+                for (k, (folder, want, stands)) in d.explain_list.clone().into_iter().enumerate() {
+                    let line = format!("{stands} · {}", want.chars().take(70).collect::<String>());
+                    let o = ui.selectable_label(d.topic.trim() == want, &line);
+                    if o.clicked() {
+                        d.topic = want;
+                        d.out = folder;
+                    }
+                    elems.push((format!("{p}.continue.{k}"), o.rect, line));
+                }
+            });
+            elems.push((format!("{p}.continue"), r.response.rect, shown));
+        });
+    });
+    ui.end_row();
+    ui.label("Hints (optional)");
+    let r = ui.add(
+        egui::TextEdit::multiline(&mut d.hints)
+            .hint_text("what to focus on, what to leave out, how it should come out, one per line")
+            .desired_rows(2)
+            .desired_width(430.0),
+    );
+    elems.push((format!("{p}.hints"), r.rect, d.hints.clone()));
+    ui.end_row();
+    ui.label("Kind of topic");
+    combo_row(ui, &mut d.explain_kind, &EXPLAIN_KINDS, &format!("{p}.kind"), elems);
+    ui.end_row();
+    ui.label("Length (minutes)");
+    ui.horizontal(|ui| {
+        let mut minutes = d.seconds / 60.0;
+        let r = ui.add(egui::DragValue::new(&mut minutes).range(1.0..=60.0).speed(0.1).max_decimals(0));
+        d.seconds = minutes * 60.0;
+        elems.push((format!("{p}.minutes"), r.rect, minutes.to_string()));
+        for v in [3.0, 6.0, 10.0, 15.0] {
+            let label = format!("{v} min");
+            let b = ui.small_button(&label);
+            elems.push((format!("{p}.minutes.{}", v as u32), b.rect, label));
+            if b.clicked() {
+                d.seconds = v * 60.0;
+            }
+        }
+    });
+    ui.end_row();
+    ui.label("Language");
+    radio_row(ui, &mut d.language, &SCRIPT_LANGUAGES, &format!("{p}.language"), elems);
+    ui.end_row();
+    ui.label("Go as far as");
+    radio_row(ui, &mut d.explain_to, &EXPLAIN_STEPS, &format!("{p}.to"), elems);
+    ui.end_row();
+    ui.label("Review");
+    ui.vertical(|ui| {
+        let r = ui.checkbox(&mut d.explain_review, "Wait for my approval after the plan and after the script");
+        elems.push((format!("{p}.review"), r.rect, d.explain_review.to_string()));
+        let r = ui.checkbox(&mut d.explain_approve, "I have read it: approve, and go on to the next step");
+        elems.push((format!("{p}.approve"), r.rect, d.explain_approve.to_string()));
+        ui.label(egui::RichText::new("Unticked: plan and script are written, kept to read (plan.md, script.md) and count as approved.").small().weak());
+    });
+    ui.end_row();
+    ui.label("Your notes");
+    ui.vertical(|ui| {
+        let r = ui.add(
+            egui::TextEdit::multiline(&mut d.explain_notes)
+                .hint_text("changes to the plan or script, one per line, e.g.\n3: show the error message first\n5: leave out the linters, end on the fix\nshorter sentences everywhere")
+                .desired_rows(3)
+                .desired_width(430.0),
+        );
+        elems.push((format!("{p}.notes"), r.rect, d.explain_notes.clone()));
+        ui.label(egui::RichText::new("“3: …” is about chapter 3; anything else about the whole video. Only what a note asks for changes.").small().weak());
+        if !d.explain_notes.trim().is_empty() {
+            combo_row(ui, &mut d.explain_note_for, &EXPLAIN_NOTE_FOR, &format!("{p}.noteFor"), elems);
+        }
+    });
+    ui.end_row();
+    if d.explain_to == "video" {
+        ui.label("Voiceover");
+        let mut voices: Vec<(String, String)> = saved_voices().into_iter().map(|v| (v.clone(), format!("{v} (your clone)"))).collect();
+        for (k, l) in MAC_VOICES {
+            voices.push((k.to_string(), l.to_string()));
+        }
+        let shown = voices.iter().find(|v| v.0 == d.voice).map(|v| v.1.clone()).unwrap_or_else(|| "Choose a voice…".into());
+        let r = egui::ComboBox::from_id_salt(format!("{p}.voice")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+            for (k, l) in &voices {
+                let o = ui.selectable_value(&mut d.voice, k.clone(), l);
+                elems.push((format!("{p}.voice.{k}"), o.rect, l.clone()));
+            }
+        });
+        elems.push((format!("{p}.voice"), r.response.rect, shown));
+        ui.end_row();
+        if !d.voice.starts_with("mac") && !d.voice.is_empty() {
+            ui.label("Takes per line");
+            let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
+            elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
+            ui.end_row();
+            ui.label("Speaking pace");
+            combo_row(ui, &mut d.speech_pace, &SPEECH_PACES, &format!("{p}.speechPace"), elems);
+            ui.end_row();
+        }
+        ui.label("Look");
+        combo_row(ui, &mut d.explain_look, &EXPLAIN_LOOKS, &format!("{p}.design"), elems);
+        ui.end_row();
+        ui.label("Shape");
+        radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), elems);
+        ui.end_row();
+        ui.label("Captions");
+        combo_row(ui, &mut d.explain_captions, &EXPLAIN_CAPTIONS, &format!("{p}.captions"), elems);
+        ui.end_row();
+        ui.label("Clips");
+        combo_row(ui, &mut d.explain_clips, &EXPLAIN_CLIPS, &format!("{p}.clips"), elems);
+        ui.end_row();
+    }
+    ui.label("");
+    let r = ui.checkbox(&mut d.fresh, "Research and plan again (drops the plan and script of this video)");
+    elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
+    ui.end_row();
+}
+
 /// The optional sound design rows. Returns true when the music folder should be chosen.
 fn sound_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> bool {
     let mut choose = false;
@@ -4034,6 +4372,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         || (d.kind == Kind::Voiceover && !scored)
                         || (d.kind == Kind::Clips && d.clip_type != "sections" && !scored)
                         || (d.kind == Kind::Topic && d.make_video && !scored)
+                        || (d.kind == Kind::Explain && d.explain_to == "video")
                     {
                         ui.label(match d.kind {
                             Kind::Music => "Music",
@@ -4209,6 +4548,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         Kind::Hooks => hooks_rows(ui, &mut d, &p, &mut elems),
                         Kind::Repair => {}
                         Kind::PlanMake => plan_rows(ui, &mut d, &p, &mut elems),
+                        Kind::Explain => explain_rows(ui, &mut d, &p, &mut elems),
                         Kind::Script => {
                             ui.label("Topic");
                             let r = ui.add(egui::TextEdit::singleline(&mut d.topic).hint_text("what the video is about").desired_width(380.0));
@@ -4764,11 +5104,13 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         }
                     }
                     if !matches!(d.kind, Kind::Voice | Kind::Hooks | Kind::Repair | Kind::PlanMake) {
-                        let folder_out = matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package) || planning;
+                        let folder_out =
+                            matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package | Kind::Explain) || planning;
                         ui.label(if folder_out { "Output folder" } else { "Save as" });
                         let hint = match d.kind {
                             Kind::Script => "automatic (Movies/EI/Scripts)",
                             Kind::Topic => "automatic (Movies/EI/Topics/<topic>)",
+                            Kind::Explain => "automatic (Movies/EI/Explainers/<what it explains>)",
                             Kind::Tv => "automatic (“EI on TV” next to the clips)",
                             Kind::Download => "a playlist gets a folder named after it in here",
                             Kind::Package => "a folder “<topic> - package” in here",
@@ -4780,7 +5122,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         }
                         ui.end_row();
                     }
-                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic | Kind::Hooks | Kind::Package | Kind::Repair) && !planning {
+                    if !matches!(d.kind, Kind::Script | Kind::Voice | Kind::Topic | Kind::Hooks | Kind::Package | Kind::Repair | Kind::Explain) && !planning {
                         ui.label("");
                         let label = match d.kind {
                             Kind::Split | Kind::Clips | Kind::Tv | Kind::Download => "Import the files into the project",
@@ -4821,6 +5163,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Topic => "Research and Write",
                     Kind::Hooks => "Sync Hooks",
                     Kind::Repair => "Copy and Repair",
+                    Kind::Explain if !d.explain_notes.trim().is_empty() => "Change It",
+                    Kind::Explain if d.explain_approve => "Approve and Go On",
+                    Kind::Explain if d.explain_to == "plan" => "Research and Plan",
+                    Kind::Explain if d.explain_to == "script" => "Write the Script",
+                    Kind::Explain => "Make Video",
                     Kind::PlanMake if d.plan_check => "Check Video",
                     Kind::PlanMake if !d.plan_fix.trim().is_empty() || !d.plan_caption_fix.trim().is_empty() => "Correct and Make Again",
                     Kind::PlanMake => "Make Video",
@@ -4957,7 +5304,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 }
             }
             Pick::Out => {
-                if matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Download | Kind::Package) {
+                if matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Download | Kind::Package | Kind::Explain) {
                     if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
                         if d.kind == Kind::Download {
                             let _ = save_setting("download_dir", &dir); // the default next time
@@ -5000,7 +5347,14 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     d.topic.clear(); // ready for the next topic
                     d.hook_line.clear();
                 }
-                d.out.clear(); // (a fresh automatic output name for the next one)
+                if d.kind == Kind::Explain {
+                    // what it explains stays (the next step is of the same video); notes and the approval were for this run
+                    d.explain_notes.clear();
+                    d.explain_approve = false;
+                    d.explain_listed = false;
+                } else {
+                    d.out.clear(); // (a fresh automatic output name for the next one)
+                }
             }
             Err(e) => d.error = e,
         }
@@ -5072,7 +5426,7 @@ fn recorder_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
         match engine_step(args) {
             Ok((step, engine)) => {
                 d.rec.loaded = langs.clone();
-                d.rec.loading = Some(start_job("Voice clone: sentences".into(), None, vec![step], false, Some(engine)));
+                d.rec.loading = Some(start_quiet_job("Voice clone: sentences".into(), step, engine));
             }
             Err(e) => d.error = e,
         }
@@ -5081,7 +5435,7 @@ fn recorder_ui(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Strin
         && d.rec.mics_job.is_none()
         && let Ok((step, engine)) = engine_step(vec!["voice-mics".into()])
     {
-        d.rec.mics_job = Some(start_job("Voice clone: microphones".into(), None, vec![step], false, Some(engine)));
+        d.rec.mics_job = Some(start_quiet_job("Voice clone: microphones".into(), step, engine));
     }
     if d.rec.prompts.is_empty() {
         ui.label(if langs.is_empty() { "Choose a language." } else { "Loading the sentences…" });
@@ -5644,6 +5998,9 @@ fn description(kind: Kind) -> &'static str {
         Kind::Download => {
             "Downloads a YouTube playlist (or one video) in the highest quality there is: the best video and the best audio, merged. Choose “Audio only” for just the sound, or “Subtitles only” for what is said, as clean English/Hindi text (the creator's own subtitles or YouTube's captions of the real speech, never a translation), optionally learned as a talking style for your scripts. A playlist gets its own folder named after it; running it again downloads only what is new (a stopped download continues), and unavailable videos are skipped and listed. For your own use: respect the creators' licences."
         }
+        Kind::Explain => {
+            "For videos that teach or argue something: coding and technical topics (flows, code typed line by line, a bug found and fixed, the terminal), and just as well research, history, social or political topics. Say what you want to make. Claude researches it on the web and plans the video in chapters: what each is for, what is said, what is on screen, and every claim with its source. Each quoted sentence is looked up in its source page; what is not found word for word is marked. With “wait for my approval” you read the plan (plan.md) and then the script (script.md) before anything is spoken: approve, or write notes (“3: show the error first” is about chapter 3) and only that changes. The script is checked line by line against the research. The pictures are drawn from the script: source pages are shown as they stand with the sentence marked by a highlighter. Every chapter is written to work on its own, and is also saved as a clip (tall for Shorts if you choose). Looks: clean, dark, viral."
+        }
         Kind::PlanMake => {
             "Makes the video of a plan from Plan Videos. Choose the plans file and a plan, or say in your own words what video you want: it is then planned from what happens in the recordings (their analysis, kept next to them) and added to the plans. Claude reads each stretch of the plan in detail and chooses the exact cuts: no line is cut in the middle, and menus, loading, deaths and wandering are left out. Shorts and Reels are made vertical with the hook and captions; long videos are joined as they are, with chapters. The cuts are saved in the plans file and can be changed there. Every finished Short is checked against its own sound. Found something wrong in a video? Choose its plan and say what is wrong, or correct caption words (wrong => right): only that is changed, the video is made again, and the correction stays in the plan. “Only check” looks at a finished video again and writes what it finds, with every caption to read, to check.txt next to it. The recordings are never changed."
         }
@@ -5718,6 +6075,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .rev()
+        .filter(|j| !j.quiet || j.status == Status::Failed)
         .map(|j| Row {
             id: j.id,
             title: j.title.clone(),
@@ -7010,6 +7368,80 @@ mod tests {
         assert!(Draft::from_params(Kind::Voice, &json!({"name": "v", "source": "record"})).engine_args().is_err());
         assert_eq!(slug("  My Voice / Hindi "), "My-Voice-Hindi");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explainer_arguments() {
+        let mut d = Draft::from_params(Kind::Explain, &json!({"topic": " how a hash map works ", "voice": "mac:Rishi", "language": "en"}));
+        assert_eq!(
+            d.engine_args().unwrap(),
+            [
+                "explain",
+                "how a hash map works",
+                "--minutes",
+                "6",
+                "--language",
+                "en",
+                "--kind",
+                "auto",
+                "--to",
+                "video",
+                "--review",
+                "--voice",
+                "mac:Rishi",
+                "--takes",
+                "2",
+                "--look",
+                "clean",
+                "--aspect",
+                "horizontal",
+                "--captions",
+                "auto",
+                "--clips",
+                "same"
+            ]
+        );
+        // notes go one by one, to the step chosen; the plan alone needs no voice
+        let p = json!({"topic": "x", "to": "plan", "review": false, "seconds": 150, "explainKind": "political", "explainNotes": "3: show the law itself\n\n- shorter",
+            "noteFor": "plan", "approve": true, "fresh": true, "outDir": "/tmp/e", "hints": "both sides", "design": "viral", "clipsAs": "vertical"});
+        let mut d = Draft::from_params(Kind::Explain, &p);
+        assert_eq!(
+            d.engine_args().unwrap(),
+            [
+                "explain",
+                "x",
+                "--minutes",
+                "2.5",
+                "--language",
+                "hinglish",
+                "--kind",
+                "political",
+                "--to",
+                "plan",
+                "--hints",
+                "both sides",
+                "--out-dir",
+                "/tmp/e",
+                "--approve",
+                "--note",
+                "3: show the law itself",
+                "--note",
+                "shorter",
+                "--note-for",
+                "plan",
+                "--fresh"
+            ]
+        );
+        let back = Draft::from_params(Kind::Explain, &d.to_params());
+        assert_eq!((back.explain_look, back.explain_clips, back.explain_kind, back.explain_note_for), ("viral", "vertical", "political", "plan"));
+        let mut v =
+            Draft::from_params(Kind::Explain, &json!({"topic": "x", "voice": "abhay", "design": "dark", "explainCaptions": "words", "aspect": "vertical"}));
+        let a = v.engine_args().unwrap().join(" ");
+        assert!(a.ends_with("--voice abhay --takes 2 --speech-pace relaxed --look dark --aspect vertical --captions words --clips same"), "{a}");
+        assert!(Draft::from_params(Kind::Explain, &json!({"topic": " "})).engine_args().is_err());
+        assert!(Draft::from_params(Kind::Explain, &json!({"topic": "x"})).engine_args().is_err()); // (a video needs a voice)
+        assert!(Draft::from_params(Kind::Explain, &json!({"topic": "x", "to": "script", "seconds": 5})).engine_args().is_err());
+        assert_eq!(Kind::from_command("ai.explain"), Some(Kind::Explain));
     }
 
     #[test]
