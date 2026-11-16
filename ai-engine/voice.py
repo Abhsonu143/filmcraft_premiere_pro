@@ -180,7 +180,7 @@ def _words_worker(items: list[tuple[str, str]], models: dict[str, str]) -> list[
 
     out = []
     for p, lang in items:
-        r = mlx_whisper.transcribe(p, path_or_hf_repo=models.get(lang, models["en"]), language=lang, condition_on_previous_text=False, word_timestamps=True)
+        r = mlx_whisper.transcribe(p, path_or_hf_repo=models.get(lang) or models.get("en") or next(iter(models.values())), language=lang, condition_on_previous_text=False, word_timestamps=True)
         out.append([[str(w.get("word", "")), float(w.get("start", 0)), float(w.get("end", 0))] for sg in r.get("segments", []) for w in sg.get("words", [])])
     return out
 
@@ -558,7 +558,7 @@ def embed(paths: list[str]) -> list[np.ndarray | None]:
 def _asr_worker(items: list[tuple[str, str]], models: dict[str, str]) -> list[str]:
     import mlx_whisper
 
-    return [mlx_whisper.transcribe(p, path_or_hf_repo=models.get(lang, models["en"]), language=lang, condition_on_previous_text=False)["text"]
+    return [mlx_whisper.transcribe(p, path_or_hf_repo=models.get(lang) or models.get("en") or next(iter(models.values())), language=lang, condition_on_previous_text=False)["text"]
             for p, lang in items]
 
 
