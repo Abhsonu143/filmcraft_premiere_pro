@@ -287,3 +287,12 @@ gestures are possible this way. During the 72 s full run the owner said to stop 
 Nothing of the trial is in the repo. The 3D character code (`character.py`, `vrm.py`, the Topic dialog block)
 is committed and left as it is, off by default. Do not continue either without the owner asking.
 
+
+## Explainer Video (2026-11-16)
+- `ei_engine.py explain "<what to explain>" --to plan|script|video [--review] [--approve] [--note "3: …"]`; app: AI ▸ Explainer Video (`ai.explain`).
+- Files: `explainer.py` (research, plan, quote lookup, script, line-by-line check, review and notes), `explain_draw.py` (scenes drawn with PIL in three looks,
+  wide and tall), `explain_video.py` (voice once, frames piped to ffmpeg, clips per chapter). Folder: `~/Movies/EI/Explainers/<name>` with plan.md, script.md.
+- Measured (5.5 min, macOS voice, dark look, 6 tall clips): about 1 min after the script, peak footprint 170 MB. Line times match the sound to 0.01 s.
+- Not done yet: `footage` scenes (photos/video) are drawn as cards; code and terminal output are not run to prove them; on-screen Hindi (Devanagari) is not
+  shaped by PIL here (no raqm), so scenes stay in Latin letters and Devanagari captions are skipped; no sound effects.
+- Same commit: the interface has a Devanagari fallback font (`cjk.rs`), and Voice Clone's helper jobs are quiet (`start_quiet_job`).
