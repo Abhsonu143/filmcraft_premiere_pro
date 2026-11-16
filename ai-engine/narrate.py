@@ -456,12 +456,16 @@ def choose_with_share(slots: list[dict], cands: list[list[dict]], clips: list[di
     return best
 
 
-def tall_frame_filter(W: int, H: int, TW: int, TH: int, opacity: float) -> str:
+def tall_frame_filter(W: int, H: int, TW: int, TH: int, opacity: float, blur: float = 0.0) -> str:
     """A wide picture as a tall video: the picture itself across the middle, and the same picture
-    filling the frame behind it at `opacity` (0 … 1, over black). Ends in the label [framed]."""
+    filling the frame behind it at `opacity` (0 … 1, over black), softened by `blur` (0: sharp … 1:
+    only colour and light are left). Ends in the label [framed]."""
     o = min(1.0, max(0.0, float(opacity)))
+    b = min(1.0, max(0.0, float(blur)))
     fh = int(round(TW * H / W / 2)) * 2
-    return (f"[0:v]split=2[fa][fb];[fa]scale={TW}:{TH}:force_original_aspect_ratio=increase,crop={TW}:{TH},format=rgb24,"
+    # (blurred at a quarter of the size: the same softness for a fraction of the work)
+    soft = f"scale={TW // 8 * 2}:{TH // 8 * 2},gblur=sigma={b * 14:.2f},scale={TW}:{TH}:flags=bilinear," if b > 0.01 else ""
+    return (f"[0:v]split=2[fa][fb];[fa]scale={TW}:{TH}:force_original_aspect_ratio=increase,crop={TW}:{TH},{soft}format=rgb24,"
             f"colorchannelmixer=rr={o:.3f}:gg={o:.3f}:bb={o:.3f}[fbg];[fb]scale={TW}:{fh}[ffg];[fbg][ffg]overlay=0:{(TH - fh) // 2},format=yuv420p[framed]")
 
 
@@ -567,11 +571,11 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
          whisper_model: str = ac.DEFAULT_WHISPER, workers: int = 2, plan_only: bool = False, hints: dict[str, list[int]] | None = None,
          stills: set[str] | None = None, cards: set[str] | None = None, sound: dict | None = None, resolution: str = "1080p",
          hook: str = "auto", niche: str = "", screen_text: str | None = None, max_cards: int | None = None, own: set[str] | None = None,
-         own_share: float | None = None, tall_frame: float | None = None) -> dict:
+         own_share: float | None = None, tall_frame: float | None = None, frame_blur: float = 0.5) -> dict:
     """`sound`: optional emotional sound design (score.options): music per mood, hits, risers, pauses.
     `max_cards`: the most text screens. `own` + `own_share`: the creator's own clips and how much of
     the length (0 … 1) they should cover. `tall_frame`: a wide edit delivered tall, the same picture
-    behind it at this opacity (0 … 1); captions are then laid out for the tall frame."""
+    behind it at this opacity (0 … 1) and softened by `frame_blur` (0 … 1); captions are then laid out for the tall frame."""
     import render
 
     sound_opts = sound
@@ -715,7 +719,8 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
         framed = tall_frame is not None and W > H
         CW, CH = ac.sized(1080, 1920, resolution) if framed else (W, H)  # (captions are laid out for the frame that is delivered)
         if framed:
-            log(f"tall frame: the wide picture across the middle of {CW}x{CH}, the same picture behind it at {min(1.0, max(0.0, tall_frame)) * 100:.0f}%")
+            log(f"tall frame: the wide picture across the middle of {CW}x{CH}, the same picture behind it at {min(1.0, max(0.0, tall_frame)) * 100:.0f}%"
+                + (f", blurred {min(1.0, max(0.0, frame_blur)) * 100:.0f}%" if frame_blur > 0.01 else ", sharp"))
         if (captions and words) or hook_text:
             import captions as cap
 
@@ -728,12 +733,12 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
             af.write_text(ass, encoding="utf-8")
             e = str(af).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
             if framed:
-                cmd += ["-filter_complex", tall_frame_filter(W, H, CW, CH, tall_frame) + f";[framed]subtitles=filename='{e}'[vout]"]
+                cmd += ["-filter_complex", tall_frame_filter(W, H, CW, CH, tall_frame, frame_blur) + f";[framed]subtitles=filename='{e}'[vout]"]
             else:
                 cmd += ["-vf", f"subtitles=filename='{e}'"]
             cmd += ["-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(CW, CH)]
         elif framed:
-            cmd += ["-filter_complex", tall_frame_filter(W, H, CW, CH, tall_frame).replace("[framed]", "[vout]"), "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(CW, CH)]
+            cmd += ["-filter_complex", tall_frame_filter(W, H, CW, CH, tall_frame, frame_blur).replace("[framed]", "[vout]"), "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(CW, CH)]
         else:
             cmd += ["-c:v", "copy"]
         partial = outp.with_name(outp.stem + ".part.mp4")

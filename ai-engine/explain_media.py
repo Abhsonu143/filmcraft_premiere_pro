@@ -185,8 +185,45 @@ for it, the agency or maker, the mission or model number).
 Answer with only this JSON: {{"choices": [{{"id": "m1", "take": "B" or null, "why": "what it shows, or what is missing", "try": "other search words, when null"}}]}} with one entry per thing wanted."""
 
 
-def keep(need: dict, cand: dict, media: Path) -> dict | None:
-    """The chosen file in the video's folder: a photo as it is, a video as a short silent clip that plays everywhere."""
+def best_part(need: dict, raw: Path, dur: float, work: Path, look) -> tuple[float, float] | None:
+    """Where the part of a video worth keeping starts and how long it is. Claude looks at ten
+    frames spread through it and names the run that shows what is wanted, without title slates,
+    logos or end credits. None when it cannot be looked at (the caller then takes a part after the opening)."""
+    n = 10
+    times = [dur * (i + 0.5) / n for i in range(n)]
+    tiles = []
+    for i, t in enumerate(times):
+        dst = work / f"{need['id']}-t{i}.jpg"
+        subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{t:.2f}", "-i", str(raw), "-frames:v", "1", "-vf", f"scale={TILE}:-2", str(dst)],
+                       capture_output=True, timeout=60)
+        if dst.is_file():
+            tiles.append((f"{i + 1}", dst, t))
+    if len(tiles) < 3:
+        return None
+    name = f"{need['id']}-parts.jpg"
+    sheet([(label, path) for label, path, _ in tiles], work / name)
+    prompt = f"""Open {name} with the Read tool. It shows {len(tiles)} numbered frames in order from one video ({dur:.0f} seconds long, the frames evenly spread).
+A part of at most {CLIP_SECONDS:.0f} seconds will be shown in an explainer video, silent, to show: {need['what']}
+Name the first and the last frame of the best continuous run for that. Leave out title slates, text cards, logos, black frames and end
+credits: the run must begin on the real picture. When no frame shows it, answer null for both.
+Answer with only this JSON: {{"first": 3, "last": 5}}"""
+    try:
+        ans = look(prompt, work)
+        if not isinstance(ans, dict) or ans.get("first") is None:
+            return (-1.0, 0.0) if isinstance(ans, dict) and "first" in ans else None  # (looked at, and nothing in it shows it)
+        by = {label: t for label, _, t in tiles}
+        a, b = by[str(int(ans["first"]))], by[str(int(ans.get("last") or ans["first"]))]
+    except (AutocutError, KeyError, TypeError, ValueError):
+        return None
+    half = dur / n / 2
+    # (a frame stands for its own stretch; right after a slate, start a little into that stretch to be clear of it)
+    start = max(0.0, a - half * (0.5 if int(ans["first"]) > 1 else 1.0))
+    return start, max(2.0, min(CLIP_SECONDS, max(a, b) + half - start, dur - start))
+
+
+def keep(need: dict, cand: dict, media: Path, look=None) -> dict | None:
+    """The chosen file in the video's folder: a photo as it is, a video as a short silent clip that
+    plays everywhere, cut to the part that shows the thing (looked at, so it never opens on a title slate)."""
     src = Path(cand["path"]) if cand.get("own") else None
     if cand.get("nasa") and not cand.get("url"):
         cand["url"] = nasa_file(cand["nasa"], cand["kind"] == "video")
@@ -209,8 +246,15 @@ def keep(need: dict, cand: dict, media: Path) -> dict | None:
     dst = media / f"{need['id']}.mp4"
     try:
         dur = ac.probe(str(raw)).duration
-        start = 0.0 if dur <= CLIP_SECONDS + 2 else min(dur * 0.15, dur - CLIP_SECONDS)
-        ac.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}", "-i", str(raw), "-t", f"{CLIP_SECONDS}", "-an",
+        start, length = (0.0 if dur <= CLIP_SECONDS + 2 else min(dur * 0.15, dur - CLIP_SECONDS)), CLIP_SECONDS
+        part = best_part(need, raw, dur, media / "candidates", look) if look and dur > 3 else None
+        if part and part[0] < 0:
+            cand["nothing"] = "the video was looked at frame by frame and no part of it shows this"
+            return None
+        if part:
+            start, length = part
+            log(f"  {need['id']}: the video's part from {start:.0f} s for {length:.0f} s is kept (chosen by looking at its frames)")
+        ac.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}", "-i", str(raw), "-t", f"{length:.2f}", "-an",
                 "-vf", "scale='min(1920,iw)':-2,fps=30,format=yuv420p", *ac.video_encoder_args("h264", "8M"), "-movflags", "+faststart", str(dst)])
         seconds = ac.probe(str(dst)).duration
     except Exception:  # noqa: BLE001 (a file ffmpeg cannot read is not used)
@@ -287,13 +331,13 @@ def find(plan: dict, folder: Path, own: list[str] | None = None, model: str | No
         for i, m in enumerate(asked):
             ch = chosen.get(m["id"], {})
             cand = next((c for c in m["cands"] if c["letter"] == str(ch.get("take") or "").strip().upper()[:1]), None)
-            got = keep(m, cand, media) if cand else None
+            got = keep(m, cand, media, look) if cand else None
             if got:
                 m.update(got, credit=credit_of(cand), page=cand.get("page", ""), own=bool(cand.get("own")), shows=str(ch.get("why", ""))[:200])
                 m["for"] = m["search"] + "|" + m["wanted"]
                 log(f"  {m['id']} {m['what'][:50]}: {got['kind']} · {m['credit'][:90]}")
             else:
-                m["missing"] = str(ch.get("why") or ("the chosen file could not be fetched" if cand else "none of the candidates shows it"))[:200]
+                m["missing"] = str((cand or {}).get("nothing") or ("the chosen file could not be fetched" if cand else ch.get("why") or "none of the candidates shows it"))[:200]
                 again = " ".join(str(ch.get("try") or "").split())[:80]
                 if rnd == 1 and again and again.lower() != m["search"].lower():
                     m["try"], m["was_missing"] = again, m["missing"]

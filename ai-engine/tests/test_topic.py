@@ -199,4 +199,15 @@ def test_a_wide_video_becomes_tall_with_itself_dimmed_behind(tmp_path):
     assert im.size == (360, 640)
     middle, above = im.getpixel((180, 320)), im.getpixel((180, 60))
     assert middle > 235 and 80 < above < 125  # (the picture itself, and the same picture at 40% behind)
+    # blurred behind: the stripes of the picture are sharp without blur and soft with it
+    stripes = Image.new("L", (640, 360))
+    stripes.putdata([255 if (x // 16) % 2 else 0 for _ in range(360) for x in range(640)])
+    stripes.convert("RGB").save(tmp_path / "s.png")
+    rough = {}
+    for blur in (0.0, 0.8):
+        g = nr.tall_frame_filter(640, 360, 360, 640, 1.0, blur).replace("[framed]", "[vout]")
+        subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(tmp_path / "s.png"), "-filter_complex", g, "-map", "[vout]", "-frames:v", "1", str(tmp_path / "b.png")], check=True)
+        px = Image.open(tmp_path / "b.png").convert("L").crop((0, 20, 360, 21)).tobytes()
+        rough[blur] = sum(abs(px[k] - px[k + 1]) for k in range(len(px) - 1)) / len(px)
+    assert rough[0.8] < rough[0.0] * 0.5
     _ = out

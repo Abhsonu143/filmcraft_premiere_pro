@@ -565,7 +565,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
          caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False, sound: dict | None = None,
          resolution: str = "1080p", hook_line: str | None = None, find_hook: bool = False, hints: str = "", feedback: str = "",
          character: dict | None = None, speech_pace: str = "relaxed", text_screens: int = 4, own_share: float | None = None,
-         tall_frame: float | None = None) -> dict:
+         tall_frame: float | None = None, frame_blur: float = 0.5) -> dict:
     """`text_screens`: the most text screens (0: none). `own_share`: how much of the length your own
     footage should cover (0 … 1; None: wherever it fits best). `tall_frame`: with the wide shape, the
     video is delivered tall, the wide picture across the middle and the same picture behind it at
@@ -709,7 +709,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
                     ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound, resolution=resolution, niche=niche,
                     # your own hook opens the video: no cold open before it, and it is the on-screen hook too
                     hook="text" if hook_line and hook_line.strip() else "auto", screen_text=hook_line, max_cards=text_screens,
-                    own=set(mine), own_share=own_share if mine else None, tall_frame=tall_frame if framed else None)
+                    own=set(mine), own_share=own_share if mine else None, tall_frame=tall_frame if framed else None, frame_blur=frame_blur)
         state.mark("edit", "done")
         outputs.insert(0, str(video_out))
         if character:  # 6. the animated presenter, over the finished edit (which is kept without it too)
@@ -778,6 +778,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--own-share", type=float, help="how much of the length your own footage should cover, in percent (left out: wherever it fits best)")
     p.add_argument("--tall-frame", action="store_true", help="with --aspect horizontal: deliver a tall video, the wide picture across the middle and the same picture dimmed behind it")
     p.add_argument("--frame-opacity", type=float, default=35, help="how strongly the picture behind shows in the tall frame, in percent (default 35)")
+    p.add_argument("--frame-blur", type=float, default=50, help="how much the picture behind is blurred in the tall frame, in percent (0: sharp; default 50)")
     import character
     import score
 
@@ -789,15 +790,15 @@ def run_args(a) -> dict:
     footage = own_footage(a.footage) if a.footage else None
     if a.own_share is not None and not 0 <= a.own_share <= 100:
         raise AutocutError("the share of your own footage is 0 to 100 percent")
-    if not 0 <= a.frame_opacity <= 100:
-        raise AutocutError("the opacity of the picture behind is 0 to 100 percent")
+    if not 0 <= a.frame_opacity <= 100 or not 0 <= a.frame_blur <= 100:
+        raise AutocutError("the opacity and the blur of the picture behind are 0 to 100 percent")
     return make(a.topic, a.out_dir, seconds=a.seconds, language=a.language, aspect=a.aspect, voice=a.voice, script_only=a.script_only, style=a.style,
                 writer=a.writer, model=a.model, tone=a.tone, niche=a.niche, sources=a.sources, footage=footage, music=a.music,
                 captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, speech_pace=a.speech_pace, fresh=a.fresh,
                 sound=__import__("score").options(a), resolution=a.resolution, hook_line=a.hook_line, find_hook=a.find_hook,
                 hints=a.hints or "", feedback=a.feedback or "", character=__import__("character").options(a), text_screens=max(0, a.text_screens),
                 own_share=a.own_share / 100 if a.own_share is not None and footage else None,
-                tall_frame=a.frame_opacity / 100 if a.tall_frame and a.aspect == "horizontal" else None)
+                tall_frame=a.frame_opacity / 100 if a.tall_frame and a.aspect == "horizontal" else None, frame_blur=a.frame_blur / 100)
 
 
 def main(argv: list[str] | None = None) -> int:

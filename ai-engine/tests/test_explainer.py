@@ -364,3 +364,37 @@ def test_real_pictures_are_planned_looked_at_and_used_only_when_they_fit(tmp_pat
     assert backed.getpixel((1200, 400))[0] > plain.getpixel((1200, 400))[0] + 15  # (the red photo shows through, dimmed)
     a, b = xd.draw_scene(pen, full, title="T", t=0.0)[0], xd.draw_scene(pen, full, title="T", t=6.0)[0]
     assert a.getpixel((640, 300))[0] > 150 and xd.is_live(full) and not xd.is_live(card)
+
+
+def test_a_found_video_is_cut_to_the_part_that_shows_it(tmp_path):
+    import shutil
+    import subprocess
+
+    import explain_media as xm
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("needs ffmpeg")
+    raw = tmp_path / "v.mp4"  # 10 s of a black "title slate", then 30 s of picture
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=320x180:d=10:r=30", "-f", "lavfi", "-i", "testsrc2=s=320x180:d=30:r=30",
+                    "-filter_complex", "[0:v][1:v]concat=n=2:v=1[v]", "-map", "[v]", "-pix_fmt", "yuv420p", str(raw)], check=True)
+    need = {"id": "m1", "what": "the test picture"}
+    (tmp_path / "candidates").mkdir()
+    asked = {}
+
+    def look(prompt, where):
+        asked["prompt"] = prompt
+        assert (where / "m1-parts.jpg").is_file()
+        return {"first": 4, "last": 6}  # (frames 1-3 are the slate: 2, 6 and 10 s)
+
+    start, length = xm.best_part(need, raw, 40.0, tmp_path / "candidates", look)
+    assert 10.0 < start < 14.0 and 8.0 < length <= xm.CLIP_SECONDS and "title slates" in asked["prompt"]
+    got = xm.keep(need, {"own": True, "path": str(raw), "kind": "video"}, tmp_path, look)
+    assert got["kind"] == "video" and 8.0 < got["seconds"] <= xm.CLIP_SECONDS + 0.2
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", got["file"], "-frames:v", "1", str(tmp_path / "first.png")], check=True)
+    from PIL import Image
+
+    assert max(Image.open(tmp_path / "first.png").convert("L").tobytes()) > 120  # (it opens on the picture, not on the slate)
+    # nothing in it shows the thing: not used at all; and when it cannot be looked at, a part after the opening is kept
+    cand = {"own": True, "path": str(raw), "kind": "video"}
+    assert xm.keep(need, cand, tmp_path, lambda p, w: {"first": None, "last": None}) is None and "no part" in cand["nothing"]
+    assert xm.keep(need, {"own": True, "path": str(raw), "kind": "video"}, tmp_path, lambda p, w: {})["seconds"] > 10

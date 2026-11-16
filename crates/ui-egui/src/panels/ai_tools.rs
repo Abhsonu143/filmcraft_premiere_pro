@@ -291,6 +291,7 @@ struct Draft {
     own_share: f64,
     tall_frame: bool,
     frame_opacity: f64,
+    frame_blur: f64,
     fresh: bool,
     /// Video from Topic: what the creator is looking for (research and script follow it).
     hints: String,
@@ -552,6 +553,7 @@ impl Draft {
             own_share: 50.0,
             tall_frame: false,
             frame_opacity: 35.0,
+            frame_blur: 50.0,
             fresh: false,
             hints: String::new(),
             plan_pick: String::new(),
@@ -740,6 +742,9 @@ impl Draft {
         d.tall_frame = flag("tallFrame", d.tall_frame);
         if let Some(v) = p.get("frameOpacity").and_then(Value::as_f64) {
             d.frame_opacity = v.clamp(0.0, 100.0).round();
+        }
+        if let Some(v) = p.get("frameBlur").and_then(Value::as_f64) {
+            d.frame_blur = v.clamp(0.0, 100.0).round();
         }
         d.fresh = flag("fresh", d.fresh);
         if let Some(v) = s("hints") {
@@ -947,6 +952,7 @@ impl Draft {
         }
         m.insert("tallFrame".into(), json!(self.tall_frame));
         m.insert("frameOpacity".into(), json!(self.frame_opacity));
+        m.insert("frameBlur".into(), json!(self.frame_blur));
         m.insert("fresh".into(), json!(self.fresh));
         m.insert("hints".into(), json!(self.hints));
         m.insert("pick".into(), json!(self.plan_pick));
@@ -1423,6 +1429,7 @@ impl Draft {
                     if self.tall_frame && self.aspect == "horizontal" {
                         a.push("--tall-frame".into());
                         push(&mut a, "--frame-opacity", &format!("{}", self.frame_opacity.clamp(0.0, 100.0).round()));
+                        push(&mut a, "--frame-blur", &format!("{}", self.frame_blur.clamp(0.0, 100.0).round()));
                     }
                     if !self.music.trim().is_empty() && !self.sound {
                         push(&mut a, "--music", self.music.trim());
@@ -3203,6 +3210,7 @@ fn params_from_args(kind: &str, args: &[String]) -> Option<Value> {
             "--no-captions" => ("captions", json!(false), 1),
             "--tall-frame" => ("tallFrame", json!(true), 1),
             "--frame-opacity" => ("frameOpacity", num(&val), 2),
+            "--frame-blur" => ("frameBlur", num(&val), 2),
             "--text-screens" => ("textScreens", num(&val), 2),
             "--own-share" => ("ownShare", num(&val), 2),
             "--script-only" => ("video", json!(false), 1),
@@ -4981,6 +4989,9 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                                                 ui.label("Picture behind shows at");
                                                 let r = ui.add(egui::Slider::new(&mut d.frame_opacity, 0.0..=100.0).suffix(" %").max_decimals(0));
                                                 elems.push((format!("{p}.frameOpacity"), r.rect, d.frame_opacity.to_string()));
+                                                ui.label("blurred");
+                                                let r = ui.add(egui::Slider::new(&mut d.frame_blur, 0.0..=100.0).suffix(" %").max_decimals(0));
+                                                elems.push((format!("{p}.frameBlur"), r.rect, d.frame_blur.to_string()));
                                             });
                                         }
                                     }
@@ -7247,7 +7258,8 @@ mod tests {
         assert!(!plain.contains("--text-screens") && !plain.contains("--tall-frame") && !plain.contains("--own-share"));
         assert!(with(json!({"textScreens": 1})).contains("--text-screens 1"));
         assert!(with(json!({"textScreens": 99})).contains("--text-screens 8"));
-        assert!(with(json!({"tallFrame": true, "frameOpacity": 20})).contains("--tall-frame --frame-opacity 20"));
+        assert!(with(json!({"tallFrame": true, "frameOpacity": 20})).contains("--tall-frame --frame-opacity 20 --frame-blur 50"));
+        assert!(with(json!({"tallFrame": true, "frameBlur": 0})).contains("--frame-blur 0"));
         // only the wide shape is delivered tall; a share needs footage of your own
         assert!(!with(json!({"tallFrame": true, "aspect": "vertical"})).contains("--tall-frame"));
         assert!(!with(json!({"ownShare": 40})).contains("--own-share"));
