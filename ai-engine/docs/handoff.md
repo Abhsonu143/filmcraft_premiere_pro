@@ -324,7 +324,7 @@ already analysed. Nothing is analysed again.
   `say` (one line of the owner's voice + 1-2 shots) or `play` (a line of the game, whole, at full level).
   What the idea claims but the recordings do not show is listed as doubts ("For you to decide or check").
 - `essay.md` to read, `essay.json` to change by hand; `--notes` changes only what the notes ask.
-  The folder is `essays/<idea>` next to the plans file; the same idea goes on with the same plan.
+  The folder is `~/Movies/EI/Essays/<idea>`; the same idea goes on with the same plan.
 - Video: voice spoken once (`voice.speak`), each line shown over its shots exactly as long as it is said,
   game sound under the voice (`--game-sound`, dB), no second of a recording shown twice. Wide, or `--tall`.
 

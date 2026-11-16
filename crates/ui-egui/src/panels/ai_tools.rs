@@ -2279,7 +2279,7 @@ fn default_output(d: &Draft) -> String {
         Kind::Hooks => String::new(),    // the library has one place (Application Support/EI/hooks)
         Kind::Repair => String::new(),   // a copy next to the folder ("<folder> - fixed")
         Kind::PlanMake => String::new(), // a folder per video in "videos" next to the plans file
-        Kind::Essay => String::new(),    // a folder per essay in "essays" next to the plans file
+        Kind::Essay => String::new(),    // the engine names the folder after the idea (Movies/EI/Essays/…)
         Kind::Explain => String::new(),  // the engine names the folder after what is explained (Movies/EI/Explainers/…)
         Kind::Package => movies_dir().join("Thumbnails").to_string_lossy().to_string(),
         // the folder chosen last time (a playlist gets a folder of its own inside it)
@@ -4133,7 +4133,9 @@ fn essay_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String
     ui.vertical(|ui| {
         radio_row(ui, &mut d.essay_to, &ESSAY_STEPS, &format!("{p}.to"), elems);
         ui.label(
-            egui::RichText::new("The plan is essay.md in a folder “essays” next to the plans file. The same idea goes on with the same plan.").small().weak(),
+            egui::RichText::new("The plan is essay.md in Movies/EI/Essays, in a folder named after the idea. The same idea goes on with the same plan.")
+                .small()
+                .weak(),
         );
     });
     ui.end_row();

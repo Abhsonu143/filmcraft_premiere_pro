@@ -407,7 +407,7 @@ def make(idea: str, plans: list[str], out_dir: str | None = None, *, minutes: fl
         raise AutocutError("choose the plans file of your recordings (plans.json, made by Plan Videos)")
     lib = Library(plans)
     if folder is None:
-        folder = Path(plans[0]).expanduser().resolve().parent / "essays" / (sw.safe(idea)[:50] or "essay")
+        folder = Path.home() / "Movies" / "EI" / "Essays" / (sw.safe(idea)[:50] or "essay")
         ej = folder / "essay.json"
         if ej.is_file() and not fresh:
             try:
@@ -501,7 +501,7 @@ def make(idea: str, plans: list[str], out_dir: str | None = None, *, minutes: fl
 def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("idea", nargs="?", default="", help="what the essay is about: a question, a comparison, an argument (your own words, or a pasted suggestion)")
     p.add_argument("--plans", nargs="*", default=[], help="the plans file(s) of Plan Videos (plans.json) whose recordings the essay is made from")
-    p.add_argument("--out-dir", help="the essay's folder (default: essays/<idea> next to the first plans file); give it again to go on with it")
+    p.add_argument("--out-dir", help="the essay's folder (default: Movies/EI/Essays/<idea>); give it again to go on with it")
     p.add_argument("--minutes", type=float, default=6.0)
     p.add_argument("--language", default="en", choices=list(LANG))
     p.add_argument("--voice", help="cloned voice name, or mac / mac:<voice>")
