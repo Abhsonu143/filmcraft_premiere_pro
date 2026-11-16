@@ -1575,7 +1575,7 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
 
 def add_args(p) -> None:
     p.add_argument("--plans", required=True, help="the plans.json made by Plan Videos (or its folder)")
-    p.add_argument("--pick", default="", help="which plan: its number (as in plans.md) or a part of its title")
+    p.add_argument("--pick", default="", help="which plan: its number (as in plans.md) or a part of its title; several numbers at once: 3,7-9,12")
     p.add_argument("--request", default="", help="instead of a plan from the list: say what video you want; it is planned from the recordings, then made")
     p.add_argument("--out-dir", help="where the video's folder goes (default: 'videos' next to plans.json)")
     p.add_argument("--writer", default="claude", choices=["claude", "rules"], help="rules: no Claude, the plan's stretches are used whole")
@@ -1588,8 +1588,44 @@ def add_args(p) -> None:
     p.add_argument("--check", action="store_true", help="make nothing: check the plan's finished video (length, shape, captions against its own sound) and write check.txt")
 
 
+def picks(text: str) -> list[str]:
+    """"3, 7-9, 12" -> ["3", "7", "8", "9", "12"]; anything that is not numbers is one pick (a part of a title)."""
+    text = str(text or "").strip()
+    if not re.fullmatch(r"[\d\s,;\-–]+", text) or text.isdigit():
+        return [text] if text else []
+    out: list[str] = []
+    for part in re.split(r"[,;\s]+", text):
+        m = re.fullmatch(r"(\d+)[\-–](\d+)", part)
+        if m and int(m.group(1)) <= int(m.group(2)) and int(m.group(2)) - int(m.group(1)) < 200:
+            out += [str(n) for n in range(int(m.group(1)), int(m.group(2)) + 1)]
+        elif part.isdigit():
+            out.append(part)
+        elif part:
+            raise AutocutError(f"“{part}” is not a plan number or a range like 7-9")
+    return list(dict.fromkeys(out))
+
+
 def run_args(a) -> dict:
-    if a.check:
-        return check_video(a.plans, pick=a.pick, out_dir=a.out_dir)
-    return make(a.plans, pick=a.pick, request=a.request, out_dir=a.out_dir, writer=a.writer, fresh=a.fresh, captions=not a.no_captions, cuts_only=a.cuts_only, hook=not a.no_hook,
-                fix=a.fix, caption_fix=a.caption_fix)
+    chosen = picks(a.pick)
+    one = lambda pick: (check_video(a.plans, pick=pick, out_dir=a.out_dir) if a.check else  # noqa: E731
+                        make(a.plans, pick=pick, request=a.request, out_dir=a.out_dir, writer=a.writer, fresh=a.fresh, captions=not a.no_captions, cuts_only=a.cuts_only,
+                             hook=not a.no_hook, fix=a.fix, caption_fix=a.caption_fix))
+    if len(chosen) <= 1:
+        return one(a.pick)
+    # several plans at once: one after the other; one that fails does not stop the rest
+    if a.fix or a.caption_fix or a.request:
+        raise AutocutError("a correction or a request is for one plan: choose a single plan for it")
+    outputs, made, failed = [], [], []
+    for k, pick in enumerate(chosen, 1):
+        log(f"plan {pick} ({k} of {len(chosen)})")
+        try:
+            r = one(pick)
+            outputs += r.get("outputs", [])
+            made.append(pick)
+        except AutocutError as e:
+            failed.append({"plan": pick, "error": str(e)})
+            log(f"plan {pick} could not be {'checked' if a.check else 'made'}: {e}")
+    if not made:
+        raise AutocutError(f"none of the {len(chosen)} plans could be {'checked' if a.check else 'made'}: {failed[0]['error']}")
+    log(f"{len(made)} of {len(chosen)} plans {'checked' if a.check else 'made'}" + (f"; not done: {', '.join(f['plan'] for f in failed)}" if failed else ""))
+    return {"outputs": outputs, "made": made, "failed": failed}

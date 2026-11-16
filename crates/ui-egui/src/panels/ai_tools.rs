@@ -310,6 +310,9 @@ struct Draft {
     explain_look: &'static str,
     explain_captions: &'static str,
     explain_clips: &'static str,
+    /// Explainer Video: whose own words may be shown on screen (any | open | none), and whether the script's Python is run.
+    explain_sources: &'static str,
+    explain_run_code: bool,
     explain_list: Vec<(String, String, String)>,
     explain_listed: bool,
     // TV light sync
@@ -550,6 +553,8 @@ impl Draft {
             explain_look: "clean",
             explain_captions: "auto",
             explain_clips: "same",
+            explain_sources: "any",
+            explain_run_code: false,
             explain_list: Vec::new(),
             explain_listed: false,
             plan_list: Vec::new(),
@@ -736,6 +741,8 @@ impl Draft {
         d.explain_look = pick("design", &EXPLAIN_LOOKS.map(|a| a.0), d.explain_look);
         d.explain_captions = pick("explainCaptions", &EXPLAIN_CAPTIONS.map(|a| a.0), d.explain_captions);
         d.explain_clips = pick("clipsAs", &EXPLAIN_CLIPS.map(|a| a.0), d.explain_clips);
+        d.explain_sources = pick("showSources", &EXPLAIN_SOURCES.map(|a| a.0), d.explain_sources);
+        d.explain_run_code = flag("runCode", d.explain_run_code);
         if let Some(v) = p.get("recordings").and_then(Value::as_str) {
             d.tv_folder = v.to_string();
         }
@@ -918,6 +925,8 @@ impl Draft {
         m.insert("design".into(), json!(self.explain_look));
         m.insert("explainCaptions".into(), json!(self.explain_captions));
         m.insert("clipsAs".into(), json!(self.explain_clips));
+        m.insert("showSources".into(), json!(self.explain_sources));
+        m.insert("runCode".into(), json!(self.explain_run_code));
         m.insert("feedback".into(), json!(self.feedback));
         m.insert("recordings".into(), json!(self.tv_folder));
         m.insert("relight".into(), json!(self.relight));
@@ -1413,6 +1422,14 @@ impl Draft {
                 if self.fresh {
                     a.push("--fresh".into());
                 }
+                if self.explain_to != "plan" {
+                    if self.explain_sources != "any" {
+                        push(&mut a, "--show-sources", self.explain_sources);
+                    }
+                    if self.explain_run_code {
+                        a.push("--run-code".into());
+                    }
+                }
                 if video {
                     push(&mut a, "--voice", self.voice.trim());
                     push(&mut a, "--takes", &format!("{}", self.takes.round()));
@@ -1435,6 +1452,13 @@ impl Draft {
                 }
                 a = vec!["plan-make".into(), "--plans".into(), self.input.trim().into()];
                 let (fix, words) = (self.plan_fix.trim(), self.plan_caption_fix.trim());
+                let several = plan_picks(pick).len() > 1;
+                if several && (!fix.is_empty() || !words.is_empty()) {
+                    return Err("A correction is for one plan: tick a single plan for it.".into());
+                }
+                if several && !request.is_empty() {
+                    return Err("Either tick plans from the list, or ask for a new video: not both at once.".into());
+                }
                 if self.plan_check {
                     // only a look at the video already made: nothing is planned, corrected or made
                     if pick.is_empty() {
@@ -2053,6 +2077,11 @@ const EXPLAIN_LOOKS: [(&str, &str); 3] = [
 ];
 const EXPLAIN_CAPTIONS: [(&str, &str); 4] =
     [("auto", "As the look has them"), ("sentence", "A line at the bottom"), ("words", "Big, word by word"), ("none", "No captions")];
+const EXPLAIN_SOURCES: [(&str, &str); 3] = [
+    ("any", "From any public page: one sentence, marked, with credit"),
+    ("open", "Only official and openly licensed sources (governments, courts, standards, Wikipedia, papers)"),
+    ("none", "Never: sources are named, their pages are not shown"),
+];
 const EXPLAIN_CLIPS: [(&str, &str); 3] = [
     ("same", "Each chapter cut out of the video, in its shape"),
     ("vertical", "Each chapter drawn again tall (9:16) for Shorts and Reels"),
@@ -3399,7 +3428,10 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
         }
         Kind::PlanMake => {
             let corrected = !d.plan_fix.trim().is_empty() || !d.plan_caption_fix.trim().is_empty();
-            let what = if d.plan_check {
+            let n = plan_picks(&d.plan_pick).len();
+            let what = if n > 1 {
+                format!("{}{n} plans ({})", if d.plan_check { "check of " } else { "" }, d.plan_pick.trim().replace(',', ", "))
+            } else if d.plan_check {
                 format!("check of plan {}", d.plan_pick.trim())
             } else if corrected {
                 format!("plan {} corrected", d.plan_pick.trim())
@@ -3775,30 +3807,73 @@ fn plan_titles(path: &str) -> Vec<String> {
 }
 
 /// Make Video from Plan: the plan to make (from the file's list), or what is asked for instead.
-fn plan_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
-    ui.label("Plan");
-    ui.horizontal(|ui| {
-        let reload = ui.small_button("↻").on_hover_text("Read the plans file again");
-        elems.push((format!("{p}.reload"), reload.rect, "reload".into()));
-        if reload.clicked() || d.plan_list_for != d.input {
-            d.plan_list = plan_titles(&d.input);
-            d.plan_list_for = d.input.clone();
+/// The plans chosen in Make Video from Plan ("3, 7,9" → ["3", "7", "9"]).
+fn plan_picks(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in text.split([',', ';']).map(str::trim).filter(|s| !s.is_empty()) {
+        if !out.iter().any(|o| o == part) {
+            out.push(part.to_string());
         }
+    }
+    out
+}
+
+fn plan_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
+    ui.label("Plans");
+    ui.vertical(|ui| {
         let number = |line: &str| line.split('.').next().unwrap_or("").to_string();
-        let shown = d.plan_list.iter().find(|l| number(l) == d.plan_pick.trim()).cloned().unwrap_or_else(|| {
-            if d.plan_list.is_empty() { "choose the plans file first".to_string() } else { format!("choose one of {} plans", d.plan_list.len()) }
+        let mut chosen = plan_picks(&d.plan_pick);
+        ui.horizontal(|ui| {
+            let reload = ui.small_button("↻").on_hover_text("Read the plans file again");
+            elems.push((format!("{p}.reload"), reload.rect, "reload".into()));
+            if reload.clicked() || d.plan_list_for != d.input {
+                d.plan_list = plan_titles(&d.input);
+                d.plan_list_for = d.input.clone();
+            }
+            let shown = match (d.plan_list.is_empty(), chosen.len()) {
+                (true, 0) => "choose the plans file first".to_string(),
+                (_, 0) => format!("tick one or more of {} plans", d.plan_list.len()),
+                (_, 1) => format!("plan {}", chosen.join("")),
+                (_, n) => format!("{n} plans: {}", chosen.join(", ")),
+            };
+            let r = ui.label(&shown);
+            elems.push((format!("{p}.pick"), r.rect, shown));
+            if !d.plan_list.is_empty() {
+                let all = ui.small_button("All");
+                elems.push((format!("{p}.pick.all"), all.rect, "All".into()));
+                if all.clicked() {
+                    chosen = d.plan_list.iter().map(|l| number(l)).collect();
+                }
+                let none = ui.small_button("None");
+                elems.push((format!("{p}.pick.none"), none.rect, "None".into()));
+                if none.clicked() {
+                    chosen.clear();
+                }
+            }
         });
-        let r = egui::ComboBox::from_id_salt(format!("{p}.pick")).selected_text(shown.clone()).width(430.0).show_ui(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(format!("{p}.pick.list")).max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+            ui.set_width(430.0);
             for line in d.plan_list.clone() {
                 let n = number(&line);
-                let o = ui.selectable_label(d.plan_pick.trim() == n, &line);
-                if o.clicked() {
-                    d.plan_pick = n.clone();
+                let mut on = chosen.contains(&n);
+                let o = ui.checkbox(&mut on, &line);
+                if o.changed() {
+                    if on {
+                        chosen.push(n.clone());
+                    } else {
+                        chosen.retain(|c| *c != n);
+                    }
                 }
                 elems.push((format!("{p}.pick.{n}"), o.rect, line));
             }
         });
-        elems.push((format!("{p}.pick"), r.response.rect, shown));
+        // (in the order of the file, so the videos are made in that order)
+        let order: Vec<String> = d.plan_list.iter().map(|l| number(l)).collect();
+        chosen.sort_by_key(|c| order.iter().position(|o| o == c).unwrap_or(usize::MAX));
+        d.plan_pick = chosen.join(",");
+        if chosen.len() > 1 {
+            ui.label(egui::RichText::new("Several plans: made one after the other in one job. A correction below is for a single plan.").small().weak());
+        }
     });
     ui.end_row();
     ui.label("Or ask for a video");
@@ -3872,7 +3947,9 @@ fn saved_explainers() -> Vec<(String, String, String)> {
     found.into_iter().map(|f| f.1).take(60).collect()
 }
 
-fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) {
+/// The Explainer Video rows. Returns true when the music file should be chosen.
+fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> bool {
+    let mut choose_music = false;
     ui.label("What to explain");
     ui.vertical(|ui| {
         let r = ui.add(
@@ -3968,6 +4045,15 @@ fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Stri
         }
     });
     ui.end_row();
+    if d.explain_to != "plan" {
+        ui.label("Source pages");
+        combo_row(ui, &mut d.explain_sources, &EXPLAIN_SOURCES, &format!("{p}.showSources"), elems);
+        ui.end_row();
+        ui.label("Code");
+        let r = ui.checkbox(&mut d.explain_run_code, "Run the script's Python and show the real output (locked down: no network, no files touched)");
+        elems.push((format!("{p}.runCode"), r.rect, d.explain_run_code.to_string()));
+        ui.end_row();
+    }
     if d.explain_to == "video" {
         ui.label("Voiceover");
         let mut voices: Vec<(String, String)> = saved_voices().into_iter().map(|v| (v.clone(), format!("{v} (your clone)"))).collect();
@@ -3992,6 +4078,9 @@ fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Stri
             combo_row(ui, &mut d.speech_pace, &SPEECH_PACES, &format!("{p}.speechPace"), elems);
             ui.end_row();
         }
+        ui.label("Music (optional)");
+        choose_music = path_row(ui, &mut d.music, &format!("{p}.music"), "a song, or any video: its sound is laid quietly under the voice", elems);
+        ui.end_row();
         ui.label("Look");
         combo_row(ui, &mut d.explain_look, &EXPLAIN_LOOKS, &format!("{p}.design"), elems);
         ui.end_row();
@@ -4009,6 +4098,7 @@ fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Stri
     let r = ui.checkbox(&mut d.fresh, "Research and plan again (drops the plan and script of this video)");
     elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
     ui.end_row();
+    choose_music
 }
 
 /// The optional sound design rows. Returns true when the music folder should be chosen.
@@ -4372,7 +4462,6 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         || (d.kind == Kind::Voiceover && !scored)
                         || (d.kind == Kind::Clips && d.clip_type != "sections" && !scored)
                         || (d.kind == Kind::Topic && d.make_video && !scored)
-                        || (d.kind == Kind::Explain && d.explain_to == "video")
                     {
                         ui.label(match d.kind {
                             Kind::Music => "Music",
@@ -4548,7 +4637,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         Kind::Hooks => hooks_rows(ui, &mut d, &p, &mut elems),
                         Kind::Repair => {}
                         Kind::PlanMake => plan_rows(ui, &mut d, &p, &mut elems),
-                        Kind::Explain => explain_rows(ui, &mut d, &p, &mut elems),
+                        Kind::Explain => {
+                            if explain_rows(ui, &mut d, &p, &mut elems) {
+                                pick = Some(Pick::Music);
+                            }
+                        }
                         Kind::Script => {
                             ui.label("Topic");
                             let r = ui.add(egui::TextEdit::singleline(&mut d.topic).hint_text("what the video is about").desired_width(380.0));
@@ -6953,6 +7046,13 @@ mod tests {
         let mut check = Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "2", "check": true, "fresh": true, "fix": "ignored"}));
         assert_eq!(check.engine_args().unwrap(), vec!["plan-make", "--plans", &file, "--pick", "2", "--check"]);
         assert!(Draft::from_params(Kind::PlanMake, &json!({"input": file, "request": "x", "check": true})).engine_args().is_err());
+        // several plans at once: made (or checked) one after the other; a correction or a request is for one
+        let mut many = Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "3, 5,3;8"}));
+        assert_eq!(many.engine_args().unwrap()[3..5], ["--pick", "3, 5,3;8"]);
+        assert_eq!(plan_picks("3, 5,3;8"), ["3", "5", "8"]);
+        assert!(Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "3,5", "check": true})).engine_args().is_ok());
+        assert!(Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "3,5", "fix": "too long"})).engine_args().is_err());
+        assert!(Draft::from_params(Kind::PlanMake, &json!({"input": file, "pick": "3,5", "request": "a short"})).engine_args().is_err());
         let mut fix = Draft::from_params(
             Kind::PlanMake,
             &json!({"input": file, "pick": "2", "fix": " it ends too early ", "captionFix": "Arzu => Atsu", "fresh": true, "request": "x"}),
@@ -7438,6 +7538,8 @@ mod tests {
             Draft::from_params(Kind::Explain, &json!({"topic": "x", "voice": "abhay", "design": "dark", "explainCaptions": "words", "aspect": "vertical"}));
         let a = v.engine_args().unwrap().join(" ");
         assert!(a.ends_with("--voice abhay --takes 2 --speech-pace relaxed --look dark --aspect vertical --captions words --clips same"), "{a}");
+        let mut o = Draft::from_params(Kind::Explain, &json!({"topic": "x", "to": "script", "showSources": "open", "runCode": true}));
+        assert!(o.engine_args().unwrap().join(" ").ends_with("--review --show-sources open --run-code"));
         assert!(Draft::from_params(Kind::Explain, &json!({"topic": " "})).engine_args().is_err());
         assert!(Draft::from_params(Kind::Explain, &json!({"topic": "x"})).engine_args().is_err()); // (a video needs a voice)
         assert!(Draft::from_params(Kind::Explain, &json!({"topic": "x", "to": "script", "seconds": 5})).engine_args().is_err());

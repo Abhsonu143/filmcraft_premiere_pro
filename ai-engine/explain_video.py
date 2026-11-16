@@ -69,7 +69,7 @@ def timeline(script: dict, segments: list[dict], *, mode: str = "sentence", tall
         if not states or states[-1]["key"] != key:
             states.append({"start": t if states else 0.0, "key": key})
         text = str(ln.get("shown") or ln["text"]).replace("`", "")
-        if mode != "none" and not xd.is_deva(text):
+        if mode != "none":
             groups = chunks(text.split(), most, chars)
             total = sum(len(w) + 1 for g in groups for w in g) or 1
             at = a

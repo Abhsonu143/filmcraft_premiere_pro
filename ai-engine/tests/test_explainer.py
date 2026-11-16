@@ -1,6 +1,7 @@
 """explainer: the plan of an explainer video (research, chapters, truth, review)."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -214,3 +215,101 @@ def test_pictures_follow_the_voice_and_every_scene_draws(tmp_path, monkeypatch):
     half = xv._sweep(plain, marked[0], marked[1], 0.5)
     mid = (x0 + x1) // 2
     assert half.crop((x0, y0, mid - 4, y1)).tobytes() == marked[0].crop((x0, y0, mid - 4, y1)).tobytes() and half.crop((mid + 4, y0, x1, y1)).tobytes() == plain.crop((mid + 4, y0, x1, y1)).tobytes()
+
+
+def test_a_sources_own_words_are_shown_only_where_the_creator_allows():
+    data = json.loads(json.dumps(RESEARCH))
+    ex.confirm_quotes(data, read)
+    gov = {"fact": "The act has 44 sections.", "url": "https://www.meity.gov.in/act", "source": "MeitY", "quote": "q", "confirmed": "yes"}
+    news = {**gov, "url": "https://www.example-news.com/a"}
+    assert ex.open_source("https://en.wikipedia.org/wiki/X") and ex.open_source("https://indiacode.nic.in/x") and ex.open_source("https://www.gov.uk/x")
+    assert not ex.open_source("https://docs.example/gen") and not ex.open_source("https://notgov.com/x.gov")
+    assert ex.may_show(gov, "open") and ex.may_show(news, "any") and not ex.may_show(news, "open") and not ex.may_show(gov, "none")
+    assert not ex.may_show({**gov, "confirmed": "not found"}, "any")
+    facts = [gov, news]
+    assert ex.clean_scene({"type": "article", "fact": 1}, facts, "open") == {"type": "article", "fact": 1}
+    assert ex.clean_scene({"type": "quote", "fact": 2}, facts, "open")["type"] == "card" and ex.clean_scene({"type": "article", "fact": 1}, facts, "none")["type"] == "card"
+    plan = {**ex.clean_plan(PLAN, data), "show_sources": "none", "language": "hi"}
+    prompt = ex.script_prompt(plan, data)
+    assert 'Do NOT use "article" or "quote" scenes' in prompt and "NOT to be shown on screen" in prompt and "Devanagari" in prompt
+    assert "confirmed in the page" in ex.script_prompt({**plan, "show_sources": "any"}, data)
+
+
+def test_a_photo_is_found_and_credited_or_the_scene_becomes_a_card(tmp_path, monkeypatch):
+    from PIL import Image
+
+    import explain_draw as xd
+
+    def download(url, dst):
+        Image.new("RGB", (1200, 800), (40, 90, 160)).save(dst)
+        return "good" in url
+
+    monkeypatch.setattr(tv, "download", download)
+    find = lambda q: [{"url": "https://x/bad.png"}, {"url": "https://x/good.jpg?w=1", "title": "Hampi", "author": "A. Rao", "license": "CC BY-SA 4.0", "provider": "Wikimedia Commons",  # noqa: E731
+                                                     "page": "https://commons/hampi"}] if "hampi" in q else []
+    script = {"chapters": [{"title": "t", "scenes": [ex.clean_scene({"type": "footage", "search": "hampi  temple", "caption": "Hampi, 14th century"}, []),
+                                                     ex.clean_scene({"type": "footage", "search": "nothing like it", "caption": "An idea"}, []),
+                                                     ex.clean_scene({"type": "footage"}, [])], "lines": []}]}
+    assert ex.fetch_footage(script, tmp_path, find) == 1
+    one, two, three = script["chapters"][0]["scenes"]
+    assert one["credit"] == "Hampi, A. Rao, CC BY-SA 4.0, Wikimedia Commons" and one["file"].endswith("media/c1-s1.jpg") and one["page"] == "https://commons/hampi"
+    assert two == {"type": "card", "text": "An idea", "sub": ""} and three["type"] == "card"
+    assert "found: Hampi, A. Rao" in ex._scene_text(one, [])
+    assert ex.clean_scene({**one}, [])["file"] == one["file"] and ex.fetch_footage(script, tmp_path, lambda q: 1 / 0) == 0  # (kept: not looked for again)
+    img, _ = xd.draw_scene(xd.Pen(640, 360), one, title="t")
+    assert all(abs(a - b) <= 3 for a, b in zip(img.getpixel((320, 150)), (40, 90, 160)))
+    assert xd.draw_scene(xd.Pen(640, 360), {**one, "file": "/nowhere.jpg"}, title="t")[0].size == (640, 360)  # (a lost file: a card, not a crash)
+
+
+def test_code_is_run_and_the_real_output_shown():
+    import shutil
+
+    import explain_run as xr
+
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("no macOS sandbox here")
+    script = {"chapters": [{"scenes": [
+        {"type": "code", "title": "f.py", "lines": ["def f(a, L=[]):", "    L.append(a)", "    return L", "print(f(1))", "print(f(2))"]},
+        {"type": "terminal", "lines": [{"t": "out", "text": "python3 f.py"}, {"t": "out", "text": "[1]"}, {"t": "out", "text": "[2]"}]},
+        {"type": "terminal", "lines": [{"t": "in", "text": ">>> x = [1, 2]"}, {"t": "in", "text": ">>> for v in x:"}, {"t": "in", "text": "...     print(v * 2)"}, {"t": "in", "text": "..."},
+                                       {"t": "out", "text": "2"}, {"t": "out", "text": "4"}, {"t": "in", "text": ">>> x[5]"}, {"t": "err", "text": "IndexError: list index out of range"}]},
+        {"type": "debug", "title": "g.py", "code": ["import socket", "socket.create_connection(('example.com', 80), 2)"], "run": [{"t": "in", "text": "$ python g.py"}, {"t": "out", "text": "connected"}],
+         "fixed": ["open('/Users/Shared/ei-sandbox-test.txt', 'w')"], "passes": [{"t": "ok", "text": "saved"}]},
+        {"type": "terminal", "lines": [{"t": "in", "text": "$ cargo run"}, {"t": "out", "text": "hello"}]}]}]}
+    found = xr.check_script(script)
+    scenes = script["chapters"][0]["scenes"]
+    assert script["ran"]["runs"] == 4
+    assert [r["text"] for r in scenes[1]["lines"]] == ["python3 f.py", "[1]", "[1, 2]"]  # (the script was wrong: the real output is shown)
+    assert scenes[2]["lines"][-1]["text"] == "IndexError: list index out of range" and not any(f["where"] == "1.s3" for f in found)  # (a session that was right is left alone)
+    # the sandbox: no network, and nothing is written outside the temporary folder
+    assert scenes[3]["run"][-1]["t"] == "err" and "connected" not in str(scenes[3]["run"]) and "PermissionError" in scenes[3]["passes"][-1]["text"]
+    assert not Path("/Users/Shared/ei-sandbox-test.txt").exists()
+    assert [f["where"] for f in found] == ["1.s2", "1.s4", "1.s4", "1.s4"] and found[0]["was"] == "[1] / [2]" and found[0]["now"] == "[1] / [1, 2]" and found[0]["corrected"]
+    assert "FIXED code still fails" in found[-1]["problem"] and not found[-1]["corrected"]
+    assert scenes[4]["lines"][1]["text"] == "hello"  # (not Python: not run, not touched)
+    assert xr.short_error('Traceback (most recent call last):\n  File "/tmp/x/f.py", line 3, in <module>\n    f()\nValueError: no') == [
+        "Traceback (most recent call last):", '  File "f.py", line 3', "ValueError: no"]
+
+
+def test_hindi_is_drawn_with_its_letters_joined():
+    import explain_draw as xd
+
+    if xd.shaped("हिंदी", 40, True, (0, 0, 0)) is None:
+        pytest.skip("no macOS text drawing here")
+    from PIL import Image, ImageFont
+
+    img = Image.new("RGB", (600, 120), (255, 255, 255))
+    d = xd.Draw(img)
+    font = xd.Pen(1920, 1080).font("bold", 48, "हिंदी")
+    d.text((10, 10), "डिफ़ॉल्ट सिर्फ़ एक बार", font=font, fill=(0, 0, 0))
+    plain = Image.new("RGB", (600, 120), (255, 255, 255))
+    from PIL import ImageDraw
+
+    ImageDraw.Draw(plain).text((10, 10), "डिफ़ॉल्ट सिर्फ़ एक बार", font=font, fill=(0, 0, 0))
+    assert img.getbbox() and img.tobytes() != plain.tobytes()  # (drawn, and not the letter-by-letter way)
+    assert 0 < d.textlength("डिफ़ॉल्ट सिर्फ़ एक बार", font=font) < ImageDraw.Draw(plain).textlength("डिफ़ॉल्ट सिर्फ़ एक बार", font=font) * 1.2
+    assert d.textlength("plain", font=font) == ImageDraw.Draw(plain).textlength("plain", font=font)
+    pen = xd.Pen(360, 640, "viral")
+    cap, _ = xd.draw_caption(pen, ["यह", "बग", "है"], 1)
+    assert cap.getbbox() is not None
+    assert isinstance(font, ImageFont.FreeTypeFont)

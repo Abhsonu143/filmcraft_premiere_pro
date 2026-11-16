@@ -320,3 +320,10 @@ def test_caption_corrections():
     assert pm.add_caption_fixes(p, [("Arzu", "Atsu"), ("", "x"), ("same", "same")]) == 1 and pm.add_caption_fixes(p, [("arzu!", "Atsu-san")]) == 1
     assert p["caption_fixes"] == [{"wrong": "arzu!", "right": "Atsu-san"}]  # (the same wrong words: the later correction stands)
 
+
+
+def test_several_plans_are_picked_at_once():
+    assert pm.picks("3, 7-9,12;3") == ["3", "7", "8", "9", "12"] and pm.picks("6") == ["6"] and pm.picks("") == []
+    assert pm.picks("the wolf") == ["the wolf"] and pm.picks("Part 2-3") == ["Part 2-3"]  # (a part of a title stays one pick)
+    with pytest.raises(pm.AutocutError):
+        pm.picks("9-7")

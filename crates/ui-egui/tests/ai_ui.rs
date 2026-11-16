@@ -232,6 +232,8 @@ fn ai_menu_and_dialogs() {
                 "review",
                 "approve",
                 "notes",
+                "showSources",
+                "runCode",
                 "voice",
                 "design",
                 "aspect.vertical",

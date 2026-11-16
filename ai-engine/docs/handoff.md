@@ -293,6 +293,10 @@ is committed and left as it is, off by default. Do not continue either without t
 - Files: `explainer.py` (research, plan, quote lookup, script, line-by-line check, review and notes), `explain_draw.py` (scenes drawn with PIL in three looks,
   wide and tall), `explain_video.py` (voice once, frames piped to ffmpeg, clips per chapter). Folder: `~/Movies/EI/Explainers/<name>` with plan.md, script.md.
 - Measured (5.5 min, macOS voice, dark look, 6 tall clips): about 1 min after the script, peak footprint 170 MB. Line times match the sound to 0.01 s.
-- Not done yet: `footage` scenes (photos/video) are drawn as cards; code and terminal output are not run to prove them; on-screen Hindi (Devanagari) is not
-  shaped by PIL here (no raqm), so scenes stay in Latin letters and Devanagari captions are skipped; no sound effects.
+- Later the same day: `--show-sources any|open|none` (whose own words go on screen), `--run-code` (`explain_run.py`: the script's Python run under
+  `sandbox-exec`, no network, writes only in a temp folder; real output replaces what Claude wrote), `footage` scenes (a credited Commons/Openverse
+  photo, kept in `media/`), Hindi drawn through AppKit (`explain_draw.shaped`; Pillow here has no raqm). Make Video from Plan takes several plans
+  (`--pick 3,7-9`; the panel has tick boxes).
+- Not done yet: video footage (photos only); code other than Python is not run; no sound effects; `voice.speak` logs “emphasis left out (KeyError: 'en')”
+  for a Hindi-only voice when a line has an English emphasis word; other tools' Hindi cards (`topic_video.make_card`) still use the unshaped drawing.
 - Same commit: the interface has a Devanagari fallback font (`cjk.rs`), and Voice Clone's helper jobs are quiet (`start_quiet_job`).

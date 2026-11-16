@@ -49,6 +49,77 @@ def is_deva(text: str) -> bool:
     return bool(re.search(r"[\u0900-\u097F]", str(text)))
 
 
+_SHAPED: dict = {}
+
+
+def shaped(text: str, size: float, bold: bool, fill: tuple):
+    """(picture, width) of a line of Hindi drawn by macOS, which joins the letters as they are written
+    (the drawing library here places Devanagari letter by letter, which breaks every joined letter).
+    None where macOS's text drawing is not there."""
+    key = (text, int(size), bold, tuple(fill[:3]))
+    if key in _SHAPED:
+        return _SHAPED[key]
+    try:
+        import AppKit
+        import Foundation
+        from PIL import Image
+
+        font = AppKit.NSFont.fontWithName_size_("KohinoorDevanagari-Bold" if bold else "KohinoorDevanagari-Medium", size) or AppKit.NSFont.systemFontOfSize_(size)
+        colour = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(fill[0] / 255, fill[1] / 255, fill[2] / 255, 1.0)
+        line = AppKit.NSAttributedString.alloc().initWithString_attributes_(text, {AppKit.NSFontAttributeName: font, AppKit.NSForegroundColorAttributeName: colour})
+        sz = line.size()
+        w, h = max(1, int(sz.width) + 4), max(1, int(sz.height) + 2)
+        rep = AppKit.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+            None, w, h, 8, 4, True, False, AppKit.NSCalibratedRGBColorSpace, w * 4, 32)
+        ctx = AppKit.NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
+        AppKit.NSGraphicsContext.saveGraphicsState()
+        AppKit.NSGraphicsContext.setCurrentContext_(ctx)
+        line.drawAtPoint_(Foundation.NSMakePoint(1, 1))
+        ctx.flushGraphics()
+        AppKit.NSGraphicsContext.restoreGraphicsState()
+        data = rep.bitmapData()
+        got = (Image.frombuffer("RGBA", (w, h), bytes(data.tobytes() if hasattr(data, "tobytes") else data[: w * h * 4]), "raw", "RGBa", 0, 1).copy(), float(sz.width))
+    except Exception:  # noqa: BLE001 (no macOS text drawing: the plain way is used)
+        got = None
+    if len(_SHAPED) > 400:
+        _SHAPED.clear()
+    _SHAPED[key] = got
+    return got
+
+
+class Draw:
+    """The drawing surface of a picture. Hindi text goes through macOS (see `shaped`); everything else is the plain drawing library."""
+
+    def __init__(self, img):
+        from PIL import ImageDraw
+
+        self.img, self.d = img, ImageDraw.Draw(img)
+
+    def __getattr__(self, name):
+        return getattr(self.d, name)
+
+    @staticmethod
+    def _how(font) -> tuple[float, bool]:
+        return float(getattr(font, "size", 24)), "Kohinoor" in str(getattr(font, "path", "")) and getattr(font, "index", 0) == 3
+
+    def textlength(self, text, font=None, **kw):
+        got = shaped(str(text), *self._how(font), (0, 0, 0)) if is_deva(text) else None
+        return got[1] if got else self.d.textlength(text, font=font, **kw)
+
+    def text(self, xy, text, font=None, fill=None, stroke_width=0, stroke_fill=None, **kw):
+        fill = tuple(fill[:3]) if isinstance(fill, (tuple, list)) else (255, 255, 255)
+        got = shaped(str(text), *self._how(font), fill) if is_deva(text) else None
+        if not got:
+            return self.d.text(xy, text, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill, **kw)
+        x, y = int(xy[0]) - 1, int(xy[1])
+        put = (lambda im, at: self.img.alpha_composite(im, at)) if self.img.mode == "RGBA" else (lambda im, at: self.img.paste(im, at, im))
+        if stroke_width:
+            edge = shaped(str(text), *self._how(font), tuple((stroke_fill or (0, 0, 0))[:3]))[0]
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-0.7, -0.7), (0.7, -0.7), (-0.7, 0.7), (0.7, 0.7)):
+                put(edge, (max(0, x + int(dx * stroke_width)), max(0, y + int(dy * stroke_width))))
+        put(got[0], (max(0, x), max(0, y)))
+
+
 class Pen:
     """One frame size and look: fonts, measures, the areas of the frame."""
 
@@ -405,9 +476,9 @@ def s_article(pen, d, sc, step, focus, fact):
         f = pen.font("serif", pen.px(size))
         lh = pen.px(size) * 1.5
         runs = [(_clip(ctx.get("before", ""), around, True), False, grey), (exact, True, ink), (_clip(ctx.get("after", ""), around, False), False, grey)]
-        from PIL import Image, ImageDraw
+        from PIL import Image
 
-        probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+        probe = Draw(Image.new("RGB", (8, 8)))
         end, _ = paragraph(pen, probe, 0, 0, maxw, runs, f, lh)
         if end <= room or (size, around) == (22, 0):
             _, marks = paragraph(pen, d, x, y, maxw, runs, f, lh, mark=(255, 232, 96) if (step or 2) >= 2 else None)
@@ -550,16 +621,45 @@ def s_timeline(pen, d, sc, step, focus, fact):
     return []
 
 
-SCENES = {"card": s_card, "flow": s_flow, "code": s_code, "terminal": s_terminal, "debug": s_debug, "article": s_article, "quote": s_quote, "example": s_example,
+def s_footage(pen, d, sc, step, focus, fact):
+    """A photo filling the picture area, what it is on a dark band, its credit underneath."""
+    from PIL import Image, ImageOps
+
+    box = [pen.m, pen.top, pen.W - pen.m, pen.bottom - pen.px(44)]
+    w, h = int(box[2] - box[0]), int(box[3] - box[1])
+    try:
+        photo = ImageOps.fit(ImageOps.exif_transpose(Image.open(sc.get("file", ""))).convert("RGB"), (w, h), Image.LANCZOS, centering=(0.5, 0.4))
+    except (OSError, ValueError):
+        return s_card(pen, d, {"text": sc.get("caption") or sc.get("search", ""), "sub": ""}, step, focus, fact)
+    mask = Image.new("L", (w, h), 0)
+    Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=pen.px(22), fill=255)
+    d.img.paste(photo, (int(box[0]), int(box[1])), mask)
+    cap = str(sc.get("caption", ""))
+    if cap:
+        f, lines, lh = fit_text(pen, d, cap, "bold", w - pen.px(60), pen.px(130), pen.px(42), pen.px(26), 1.2)
+        bh = lh * len(lines[:2]) + pen.px(28)
+        band = Image.new("RGBA", (w, bh), (0, 0, 0, 150))
+        d.img.paste(band, (int(box[0]), int(box[3]) - bh), Image.composite(band.getchannel("A"), Image.new("L", (w, bh), 0), mask.crop((0, h - bh, w, h))))
+        for i, ln in enumerate(lines[:2]):
+            d.text((box[0] + pen.px(30), box[3] - bh + pen.px(12) + i * lh), ln, font=f, fill=(255, 255, 255))
+    credit_ = "Photo: " + str(sc.get("credit", ""))
+    cf = pen.font("sans", pen.px(22), credit_)
+    while len(credit_) > 12 and d.textlength(credit_, font=cf) > pen.W - 2 * pen.m:
+        credit_ = credit_[:-2].rstrip() + "…"
+    d.text((pen.m, pen.bottom - pen.px(30)), credit_, font=cf, fill=pen.k["soft"])
+    return []
+
+
+SCENES = {"footage": s_footage, "card": s_card, "flow": s_flow, "code": s_code, "terminal": s_terminal, "debug": s_debug, "article": s_article, "quote": s_quote, "example": s_example,
           "compare": s_compare, "chart": s_chart, "timeline": s_timeline}
 
 
 def draw_scene(pen: Pen, scene: dict, step: int = 0, focus=(), *, title: str = "", fact: dict | None = None):
     """(the frame, the boxes of what was just marked). `step`: how far the scene has built up (0: all of it)."""
-    from PIL import Image, ImageDraw
+    from PIL import Image
 
     img = Image.new("RGB", (pen.W, pen.H), pen.k["bg"])
-    d = ImageDraw.Draw(img)
+    d = Draw(img)
     header(pen, d, title)
     fn = SCENES.get(scene.get("type"), s_card)
     marks = fn(pen, d, scene, int(step or 0), focus or (), fact) or []
@@ -571,12 +671,12 @@ def draw_scene(pen: Pen, scene: dict, step: int = 0, focus=(), *, title: str = "
 def draw_caption(pen: Pen, words: list[str], active: int):
     """(picture with see-through background, where its top-left goes) of a caption: a line in a
     dark box (`sentence`), or big words with the one being said in the accent colour (`words`)."""
-    from PIL import Image, ImageDraw
+    from PIL import Image
 
     text = " ".join(words)
     if not text or pen.captions == "none":
         return None, (0, 0)
-    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    probe = Draw(Image.new("RGB", (8, 8)))
     big = pen.captions == "words"
     size = pen.px(74 if big else 40)
     f = pen.font("heavy" if big else "bold", size, text)
@@ -595,7 +695,7 @@ def draw_caption(pen: Pen, words: list[str], active: int):
     pad = pen.px(22)
     w, h = int(max(r[1] for r in rows) + 2 * pad), lh * len(rows) + 2 * pad
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+    d = Draw(img)
     if not big:
         d.rounded_rectangle([0, 0, w - 1, h - 1], radius=pen.px(16), fill=(0, 0, 0, 170))
     for r, (row, rw) in enumerate(rows):

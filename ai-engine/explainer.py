@@ -291,12 +291,35 @@ SCENE_FORMS = """  {"type": "card", "text": "one short line, at most 12 words", 
   {"type": "example", "title": "...", "lines": ["a worked case, one stage per line"]}   (at most 6; step N = the first N)
   {"type": "compare", "title": "...", "left": {"title": "...", "lines": ["..."], "code": false}, "right": {...}, "good_bad": true}   (step 1 the left side, 2 both; "code": true for code lines)
   {"type": "chart", "title": "...", "unit": "%", "bars": [{"label": "...", "value": 12.5}], "fact": 7}   (numbers ONLY from that fact; step N = the first N bars)
-  {"type": "timeline", "title": "...", "points": [{"when": "1991", "what": "..."}]}   (at most 6; step N = the first N)"""
+  {"type": "timeline", "title": "...", "points": [{"when": "1991", "what": "..."}]}   (at most 6; step N = the first N)
+  {"type": "footage", "search": "2-4 plain words naming the real thing (a place, a machine, a person in public life)", "caption": "what it is, one short line"}
+     (a free-licensed photo found for those words, credited on screen; only for something a photo really shows, never for an idea)"""
+SHOW_SOURCES = {"any": "any public page, briefly and with credit", "open": "only official and openly licensed sources", "none": "never"}
+# sources whose words may be shown under "open": governments, courts, standards bodies, open encyclopedias, papers and documentation
+OPEN_HOSTS = ("wikipedia.org", "wikimedia.org", "wikisource.org", "wikidata.org", "arxiv.org", "un.org", "who.int", "worldbank.org", "europa.eu", "ietf.org", "rfc-editor.org",
+              "w3.org", "docs.python.org", "peps.python.org", "developer.mozilla.org", "kernel.org", "gnu.org", "nasa.gov", "isro.gov.in", "indiacode.nic.in")
 
 
-def _facts_block(data: dict) -> str:
-    return "\n".join(f"F{k}. {f['fact']} [{f.get('source') or ''} {f.get('date') or ''}]"
-                     + (f"\n    exact sentence ({'confirmed in the page' if f.get('confirmed') == 'yes' else 'NOT confirmed: do not show or quote it'}): “{f['quote']}”" if f.get("quote") else "")
+def open_source(url: str) -> bool:
+    """Whether a page is an official or openly licensed source (by its address: a rule of thumb, not a legal opinion)."""
+    from urllib.parse import urlparse
+
+    host = urlparse(str(url)).netloc.lower().removeprefix("www.")
+    return bool(re.search(r"(^|\.)(gov|mil|int)(\.[a-z]{2})?$|\.nic\.in$|\.gouv\.fr$|\.bund\.de$", host)) or any(host == h or host.endswith("." + h) for h in OPEN_HOSTS)
+
+
+def may_show(fact: dict | None, show: str) -> bool:
+    """A source's own words go on screen only when the sentence was found in its page and the creator allows that kind of source."""
+    return bool(fact) and fact.get("confirmed") == "yes" and (show == "any" or (show == "open" and open_source(fact.get("url", ""))))
+
+
+def _facts_block(data: dict, show: str = "any") -> str:
+    def mark(f: dict) -> str:
+        if f.get("confirmed") != "yes":
+            return "NOT confirmed: do not show or quote it"
+        return "confirmed in the page" if may_show(f, show) else "confirmed, but this source's words are NOT to be shown on screen: say it in your own words"
+
+    return "\n".join(f"F{k}. {f['fact']} [{f.get('source') or ''} {f.get('date') or ''}]" + (f"\n    exact sentence ({mark(f)}): “{f['quote']}”" if f.get("quote") else "")
                      for k, f in enumerate(data.get("facts", []), 1))
 
 
@@ -306,15 +329,18 @@ def script_prompt(plan: dict, data: dict) -> str:
     examples = "\n".join(f"- {e.get('what')}: {str(e.get('detail', ''))[:900]}" for e in data.get("examples", []) if isinstance(e, dict))
     chapters = json.dumps([{k: c.get(k) for k in ("title", "goal", "hook", "says", "shows", "claims", "ends_on", "how_said", "seconds")} | {"words": round(c["seconds"] * WORDS_PER_SECOND)}
                            for c in plan["chapters"]], ensure_ascii=False, indent=1)
-    other = ("\nThe voice speaks " + ("Hindi (Devanagari)" if plan.get("language") == "hi" else "Hinglish (Hindi in Latin letters, the way people text)")
-             + "; everything ON SCREEN (scenes and \"shown\") is in English or Latin letters.\n") if plan.get("language") in ("hi", "hinglish") else ""
+    other = {"hi": "\nThe voice speaks Hindi, written in Devanagari, the everyday Hindi of a creator (common English words such as code, function, video stay as people say them). "
+                   "Titles, cards, flow boxes and captions on screen are in Hindi too; code, commands, names of things and a source's own sentence stay as they are.\n",
+             "hinglish": "\nThe voice speaks Hinglish (Hindi in Latin letters, the way people text), and so does the text on screen; code and a source's own sentence stay as they are.\n"
+             }.get(plan.get("language"), "")
+    show = plan.get("show_sources", "any")
     return f"""Write the script of this explainer video from its approved plan: every spoken line, and what is on screen while it is said.
 One voice narrates. The pictures are drawn by a program from the "scenes" you give, exactly as written, so they must be complete and correct.
 Title: {plan['title']}  ·  For: {plan.get('audience', '')}  ·  Promise: {plan.get('promise', '')}{other}
 ## The plan (the creator approved it; keep its chapters, order, opening and closing lines, and what it shows)
 {chapters}
 ## The research (the only facts there are)
-{_facts_block(data)}
+{_facts_block(data, show)}
 ## Examples found
 {examples or "(none)"}
 
@@ -337,7 +363,7 @@ scene has built up). Steps only go forward inside a scene. Something new should 
 Never talk about something that is not on screen. Scene forms:
 {SCENE_FORMS}
 - Code, commands, outputs and error texts must be real and runnable, taken from the research's examples; output exactly as the tool prints it.
-- "article" and "quote" only for a fact whose sentence is confirmed in the page. Use them where a claim needs proof: the viewer sees the source say it.
+- {'"article" and "quote" only for a fact whose sentence is marked confirmed in the page. Use them where a claim needs proof: the viewer sees the source say it.' if show != "none" else 'Do NOT use "article" or "quote" scenes: no source page is shown in this video. Name the source in the spoken line and on a card instead.'}
 - Text on screen is short. The voice explains; the screen shows.
 
 Answer with only this JSON:
@@ -362,7 +388,7 @@ would have done it differently. Everything said must still rest on the research;
 {now}
 
 ## The research (the only facts there are)
-{_facts_block(data)}
+{_facts_block(data, plan.get("show_sources", "any"))}
 
 ## Scene forms
 {SCENE_FORMS}
@@ -420,9 +446,10 @@ def _ints(v, n: int = 12) -> list[int]:
     return [x for x in out if x > 0][:n]
 
 
-def clean_scene(sc: dict, facts: list[dict]) -> dict:
+def clean_scene(sc: dict, facts: list[dict], show: str = "any") -> dict:
     """A scene the drawing step can rely on. A source passage whose sentence is not confirmed in
-    its page is never shown as one: it becomes a plain card."""
+    its page, or whose kind of source the creator does not want shown, is never shown as one: it
+    becomes a plain card."""
     kind = str(sc.get("type", "")).strip().lower()
     title = str(sc.get("title", "")).strip()[:90]
     try:
@@ -431,9 +458,12 @@ def clean_scene(sc: dict, facts: list[dict]) -> dict:
         k = 0
     fact = facts[k - 1] if 1 <= k <= len(facts) else None
     if kind in ("article", "quote"):
-        if fact and fact.get("confirmed") == "yes":
+        if may_show(fact, show):
             return {"type": kind, "fact": k}
         return {"type": "card", "text": str((fact or {}).get("fact") or sc.get("text") or sc.get("what") or "")[:160], "sub": str((fact or {}).get("source", ""))[:80], **({"fact": k} if fact else {})}
+    if kind == "footage" and str(sc.get("search", "")).strip():
+        kept = {a: str(sc[a]) for a in ("file", "credit", "page") if sc.get(a) and Path(str(sc.get("file", ""))).is_file()}
+        return {"type": kind, "search": " ".join(str(sc["search"]).split())[:80], "caption": str(sc.get("caption", "")).strip()[:120], **kept}
     if kind == "flow":
         return {"type": kind, "title": title, "boxes": _strs(sc.get("boxes"), 8, 90)}
     if kind == "code":
@@ -460,10 +490,10 @@ def clean_scene(sc: dict, facts: list[dict]) -> dict:
     return {"type": "card", "text": str(sc.get("text") or sc.get("what") or title or "")[:160], "sub": str(sc.get("sub", ""))[:160], **({"fact": k} if fact else {})}
 
 
-def clean_chapter(raw: dict, plan_ch: dict, facts: list[dict]) -> dict:
+def clean_chapter(raw: dict, plan_ch: dict, facts: list[dict], show: str = "any") -> dict:
     import emotions as em
 
-    scenes = [clean_scene(sc, facts) for sc in raw.get("scenes") or [] if isinstance(sc, dict)][:12] or [{"type": "card", "text": plan_ch["title"], "sub": ""}]
+    scenes = [clean_scene(sc, facts, show) for sc in raw.get("scenes") or [] if isinstance(sc, dict)][:12] or [{"type": "card", "text": plan_ch["title"], "sub": ""}]
     lines, at = [], (1, 0)
     for ln in raw.get("lines") or []:
         if not isinstance(ln, dict) or not str(ln.get("text", "")).strip():
@@ -518,6 +548,8 @@ def _scene_text(sc: dict, facts: list[dict]) -> str:
     f = facts[sc["fact"] - 1] if sc.get("fact") and sc["fact"] <= len(facts) else {}
     if t in ("article", "quote"):
         return f"{'the source page with this sentence marked' if t == 'article' else 'the exact words'}: “{f.get('quote', '')}” ({f.get('source', '')})"
+    if t == "footage":
+        return f"a photo of “{sc['search']}”: {sc.get('caption', '')}" + (f"  \n  found: {sc['credit']}  \n  {sc.get('page', '')}" if sc.get("credit") else "  (not looked for yet)")
     if t == "flow":
         return " → ".join(sc["boxes"])
     if t == "code":
@@ -571,7 +603,7 @@ def write_script(plan: dict, data: dict, model: str | None, ask=None) -> dict:
     if len(chs) != len(plan["chapters"]):
         raise AutocutError(f"the script came back with {len(chs)} chapters for a plan of {len(plan['chapters'])}: try again")
     script = {"title": plan["title"], "promise": plan.get("promise", ""), "language": plan.get("language", "en"), "plan": plan_sig(plan), "status": "draft", "notes": [],
-              "chapters": [clean_chapter(c, p, data["facts"]) for c, p in zip(chs, plan["chapters"])], "made": time.strftime("%Y-%m-%d %H:%M")}
+              "chapters": [clean_chapter(c, p, data["facts"], plan.get("show_sources", "any")) for c, p in zip(chs, plan["chapters"])], "made": time.strftime("%Y-%m-%d %H:%M")}
     check_script(script, data, ask)
     return script
 
@@ -601,7 +633,7 @@ def revise_script(script: dict, notes: list[dict], plan: dict, data: dict, model
         except (TypeError, ValueError, AttributeError):
             continue
         if 1 <= k <= len(script["chapters"]):
-            script["chapters"][k - 1] = clean_chapter(c, plan["chapters"][k - 1], data["facts"])
+            script["chapters"][k - 1] = clean_chapter(c, plan["chapters"][k - 1], data["facts"], plan.get("show_sources", "any"))
     when = time.strftime("%Y-%m-%d %H:%M")
     ch = answer.get("changed") if isinstance(answer, dict) else None
     script["notes"] = (script.get("notes") or []) + [{**n, "when": when} for n in notes]
@@ -613,13 +645,56 @@ def revise_script(script: dict, notes: list[dict], plan: dict, data: dict, model
     return script
 
 
+def fetch_footage(script: dict, folder: Path, find=None) -> int:
+    """A free-licensed photo for every footage scene (Wikimedia Commons, then Openverse), kept in the
+    video's folder with its credit. A scene nothing is found for becomes a card. Returns how many were found."""
+    import topic_video as tv
+
+    find = find or (lambda q: tv.commons_search(q, 5) or tv.openverse_search(q, 5))
+    media, got = folder / "media", 0
+    for c, ch in enumerate(script["chapters"], 1):
+        for k, sc in enumerate(ch["scenes"], 1):
+            if sc["type"] != "footage" or (sc.get("file") and Path(sc["file"]).is_file()):
+                continue
+            hit = None
+            for item in find(sc["search"]) or []:
+                media.mkdir(parents=True, exist_ok=True)
+                dst = media / f"c{c}-s{k}{Path(str(item.get('url', '')).split('?')[0]).suffix.lower() if Path(str(item.get('url', '')).split('?')[0]).suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp') else '.jpg'}"
+                if item.get("url") and tv.download(item["url"], dst):
+                    hit = (dst, item)
+                    break
+            if hit:
+                dst, item = hit
+                sc.update(file=str(dst), page=str(item.get("page", "")),
+                          credit=", ".join(x for x in (str(item.get("title", ""))[:60], str(item.get("author", ""))[:40], str(item.get("license", "")), str(item.get("provider", ""))) if x))
+                got += 1
+                log(f"photo for “{sc['search']}”: {sc['credit']}")
+            else:
+                log(f"no free photo found for “{sc['search']}”: a card is shown instead")
+                ch["scenes"][k - 1] = {"type": "card", "text": sc.get("caption") or sc["search"], "sub": ""}
+    return got
+
+
+def run_the_code(script: dict) -> None:
+    """The script's Python is run (in the sandbox) and the real output put on screen; what was found joins the script's checks."""
+    import explain_run as xr
+
+    found = xr.check_script(script)
+    script["checks"] = [c for c in script.get("checks", []) if not str(c.get("problem", "")).startswith(("run with Python", "the FIXED code"))] + found
+    ran = script.get("ran", {})
+    log(f"code: {ran.get('runs', 0)} run(s) with {ran.get('with', 'Python')}, {sum(1 for f in found if f['corrected'])} output(s) corrected to the real one"
+        + (f", {sum(1 for f in found if not f['corrected'])} for you to look at" if any(not f["corrected"] for f in found) else ""))
+    for f in found[:6]:
+        log(f"  {f['where']}: {f['problem'][:150]}")
+
+
 STEPS = ("plan", "script", "video")
 
 
 def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language: str = "en", kind: str = "auto", hints: str = "", review: bool = False,
          approve: bool = False, notes: list[str] | None = None, fresh: bool = False, model: str | None = None, to: str = "plan", note_for: str = "auto",
          voice: str = "mac", look: str = "clean", aspect: str = "horizontal", captions: str = "auto", music: str | None = None, clips: str = "same",
-         takes: int = 2, speech_pace: str = "reference") -> dict:
+         takes: int = 2, speech_pace: str = "reference", show_sources: str = "any", run_code: bool = False) -> dict:
     """An explainer video for `want`, in its folder, as far as `to` (plan, script, video). `review`:
     the plan, then the script, wait for approval (`approve`); otherwise each counts as approved once
     written. `notes`: changes the creator asks for, applied to the step named by `note_for` (auto:
@@ -632,6 +707,8 @@ def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language:
         raise AutocutError("say what the video should explain")
     if kind not in KINDS:
         raise AutocutError(f"kind must be one of {', '.join(KINDS)}")
+    if show_sources not in SHOW_SOURCES:
+        raise AutocutError(f"sources are shown: {', '.join(SHOW_SOURCES)}")
     if to not in STEPS or note_for not in ("auto", "plan", "script"):
         raise AutocutError("go as far as plan, script or video; notes are for the plan or the script")
     minutes = min(60.0, max(1.0, float(minutes)))
@@ -739,11 +816,20 @@ def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language:
         return res
     # 2. script
     with ac.stage("script"):
+        plan["show_sources"] = show_sources
+        if script is not None and script.get("show_sources", "any") != show_sources and not for_script:
+            log(f"source pages are now shown: {SHOW_SOURCES[show_sources]}; the script is written again for that")
+            script = None
         new = script is None
         if new:
             script = write_script(plan, data, model)
         if for_script:
             script = revise_script(script, for_script, plan, data, model)
+        script["show_sources"] = show_sources
+        if new or for_script or any(sc["type"] == "footage" and not sc.get("file") for ch in script["chapters"] for sc in ch["scenes"]):
+            fetch_footage(script, folder)
+        if run_code and (new or for_script or not script.get("ran")):
+            run_the_code(script)
         if (approve and plan_was_approved and not new and not for_script) or (not review and script.get("status") != "approved"):
             script["status"] = "approved"
             script["approved"] = time.strftime("%Y-%m-%d %H:%M")
@@ -792,6 +878,9 @@ def add_args(p) -> None:
     p.add_argument("--clips", default="same", choices=["none", "same", "vertical"], help="each chapter as a clip of its own: cut out of the video, or drawn again tall for Shorts")
     p.add_argument("--takes", type=int, default=2)
     p.add_argument("--speech-pace", default="reference")
+    p.add_argument("--show-sources", default="any", choices=list(SHOW_SOURCES),
+                   help="a source's own sentence on screen, marked: from any public page (briefly, with credit), only from official and openly licensed sources, or never")
+    p.add_argument("--run-code", action="store_true", help="run the script's Python (sandboxed: no network, no files outside a temporary folder) and show the real output")
     p.add_argument("--fresh", action="store_true", help="research and plan again")
     p.add_argument("--model")
 
@@ -799,4 +888,4 @@ def add_args(p) -> None:
 def run_args(a) -> dict:
     return make(a.want, a.out_dir, minutes=a.minutes, language=a.language, kind=a.kind, hints=a.hints or "", review=a.review, approve=a.approve, notes=a.note,
                 fresh=a.fresh, model=a.model, to=a.to, note_for=a.note_for, voice=a.voice, look=a.look, aspect=a.aspect, captions=a.captions, music=a.music,
-                clips=a.clips, takes=a.takes, speech_pace=a.speech_pace)
+                clips=a.clips, takes=a.takes, speech_pace=a.speech_pace, show_sources=a.show_sources, run_code=a.run_code)
