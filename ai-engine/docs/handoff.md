@@ -303,6 +303,11 @@ is committed and left as it is, off by default. Do not continue either without t
   files live in `<folder>/media`, what is missing is listed in `plan.md` ("Pictures I could not find: can you help?"). The script uses them as
   `footage` scenes (a photo is slowly pushed in, a video plays, silent, 14 s at most) or `behind` a drawn scene (dimmed). `--no-media` turns it off.
   Known: a video is judged by one frame, so its kept part can begin on a title card.
+- Video from Topic (same day): `--text-screens N` (the most text screens; `narrate.choose(max_cards=)`), your own pictures as footage
+  (`topic_video.own_footage/own_clips`: each a push-in clip in `media/own`), `--own-share PCT` (`narrate.choose_with_share`: a bias on your own
+  clips stepped until the share by time is reached), `--tall-frame --frame-opacity PCT` with the wide shape (`narrate.tall_frame_filter`: the
+  edit stays 16:9, the final pass lays it across a 9:16 frame over itself dimmed, captions laid out for the tall frame), and text screens in
+  six designs coloured by their source (`topic_cards.py`; Hindi shaped through `explain_draw.Draw`).
 - Not done yet: code other than Python is not run; no sound effects; `voice.speak` logs “emphasis left out (KeyError: 'en')”
   for a Hindi-only voice when a line has an English emphasis word; other tools' Hindi cards (`topic_video.make_card`) still use the unshaped drawing.
 - Same commit: the interface has a Devanagari fallback font (`cjk.rs`), and Voice Clone's helper jobs are quiet (`start_quiet_job`).

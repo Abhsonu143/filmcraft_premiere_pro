@@ -304,45 +304,62 @@ def font_for(text: str, bold: bool = True) -> str | None:
     return next((c for c in cands if Path(c).is_file()), None)
 
 
-def make_card(headline: str, source: str, dst: Path, W: int, H: int) -> bool:
-    """A headline/fact card: big text on a dark gradient, the source underneath."""
-    from PIL import Image, ImageDraw, ImageFont
+def make_card(headline: str, source: str, dst: Path, W: int, H: int, *, url: str = "", design: str | None = None, seed: str = "") -> bool:
+    """A text screen: a fact with its source, in one of several designs (topic_cards)."""
+    import topic_cards as tc
 
-    img = Image.new("RGB", (W, H))
-    d = ImageDraw.Draw(img)
-    for y in range(H):  # dark blue -> near black
-        k = y / H
-        d.line([(0, y), (W, y)], fill=(int(18 + 10 * (1 - k)), int(24 + 14 * (1 - k)), int(48 + 30 * (1 - k))))
-    fp = font_for(headline)
-    size = int(min(W, H) * (0.075 if len(headline) < 70 else 0.058))
-    deva = bool(re.search(r"[\u0900-\u097F]", headline))
-    # faces inside the .ttc files: Avenir Next 0 = Bold, 5 = Medium; Kohinoor Devanagari 3 = Bold, 1 = Medium
-    bold, medium = (3, 1) if deva else (0, 5)
-    try:
-        font = ImageFont.truetype(fp, size, index=bold if fp and fp.endswith(".ttc") else 0) if fp else ImageFont.load_default()
-        small = ImageFont.truetype(fp, int(size * 0.45), index=medium if fp and fp.endswith(".ttc") else 0) if fp else ImageFont.load_default()
-    except OSError:
-        font = small = ImageFont.load_default()
-    words, lines, cur = headline.split(), [], ""
-    maxw = W * 0.82
-    for w in words:
-        trial = (cur + " " + w).strip()
-        if d.textlength(trial, font=font) <= maxw:
-            cur = trial
-        else:
-            lines.append(cur)
-            cur = w
-    lines.append(cur)
-    lh = int(size * 1.25)
-    y = (H - lh * len(lines)) // 2 - lh // 2
-    d.rectangle([W * 0.09 - 14, y - 10, W * 0.09 - 6, y + lh * len(lines)], fill=(255, 196, 61))
-    for ln in lines:
-        d.text((W * 0.09, y), ln, font=font, fill=(255, 255, 255))
-        y += lh
-    if source:
-        d.text((W * 0.09, y + lh // 2), f"Source: {source}", font=small, fill=(180, 190, 210))
-    img.save(dst)
+    tc.make_card(headline, source, dst, W, H, url=url, design=design, seed=seed)
     return True
+
+
+IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".tif", ".tiff", ".bmp")
+
+
+def own_footage(items: list[str]) -> list[str]:
+    """Your own clips and pictures: files as given, and the videos and pictures inside folders."""
+    import voiceover_cut as vc
+
+    out: list[str] = []
+    for it in items:
+        p = Path(it).expanduser()
+        if p.is_dir():
+            out += sorted(str(f.resolve()) for f in p.iterdir() if f.suffix.lower() in tuple(vc.VIDEO_EXT) + IMAGE_EXT and not f.name.startswith("."))
+        elif p.is_file():
+            out.append(str(p.resolve()))
+        else:
+            raise AutocutError(f"not found: {it}")
+    seen: set[str] = set()
+    return [c for c in out if not (c in seen or seen.add(c))]
+
+
+def own_clips(files: list[str], folder: Path, W: int, H: int) -> tuple[list[str], set[str]]:
+    """Your own footage as clips the edit can use: videos as they are, each picture as a slow
+    push-in shot (kept in the folder; the picture itself is not touched). (clips, which are pictures)"""
+    clips, stills = [], set()
+    for k, f in enumerate(files):
+        p = Path(f)
+        if p.suffix.lower() not in IMAGE_EXT:
+            clips.append(str(p.resolve()))
+            continue
+        folder.mkdir(parents=True, exist_ok=True)
+        uid = hashlib.sha1(f"{p.resolve()}|{p.stat().st_mtime_ns}".encode()).hexdigest()[:10]
+        clip = folder / f"own{uid}_{W}x{H}.mp4"
+        src = p
+        if p.suffix.lower() in (".heic", ".webp", ".tif", ".tiff", ".bmp"):  # (a copy ffmpeg reads everywhere; turned the right way up)
+            from PIL import Image, ImageOps
+
+            src = folder / f"own{uid}.jpg"
+            try:
+                ImageOps.exif_transpose(Image.open(p)).convert("RGB").save(src, quality=93)
+            except Exception:  # noqa: BLE001 (a picture that cannot be read is left out)
+                log(f"your picture {p.name} could not be read: left out")
+                continue
+        if clip.is_file() or image_to_clip(src, clip, W, H, 7.0, push_in=k % 2 == 0):
+            clips.append(str(clip.resolve()))
+            stills.add(str(clip.resolve()))
+        else:
+            log(f"your picture {p.name} could not be used: left out")
+    return clips, stills
 
 
 def youtube_sections(url: str, dst_dir: Path, tag: str, n: int = 3, seconds: float = 8.0) -> list[dict]:
@@ -371,7 +388,8 @@ def youtube_sections(url: str, dst_dir: Path, tag: str, n: int = 3, seconds: flo
     return out
 
 
-def collect_media(script: dict, data: dict, folder: Path, sources: list[str], W: int, H: int, per_line: int = 2) -> tuple[list[dict], dict[str, list[int]]]:
+def collect_media(script: dict, data: dict, folder: Path, sources: list[str], W: int, H: int, per_line: int = 2,
+                  text_screens: int = 4) -> tuple[list[dict], dict[str, list[int]]]:
     """Downloads/creates media for the script. Returns (items, hints: clip path -> line indices)."""
     import narrate as nr
 
@@ -451,14 +469,19 @@ def collect_media(script: dict, data: dict, folder: Path, sources: list[str], W:
             got = youtube_sections(v["url"], folder, f"v{k}")
             items += got
             log(f"YouTube: {len(got)} section(s) from {v.get('title', v['url'])[:60]}")
-    if "cards" in sources:
+    if "cards" in sources and text_screens > 0:
+        import topic_cards as tc
+
         facts = data.get("facts", [])
-        for k, f in enumerate(facts[:4]):
+        designs: list[str] = []
+        for k, f in enumerate(facts[:max(0, min(int(text_screens), 8))]):
             png = raw / f"card{k}.png"
             clip = folder / f"card{k}.mp4"
-            if make_card(f["fact"], f.get("source") or urllib.parse.urlparse(f.get("url", "")).netloc, png, W, H) and image_to_clip(png, clip, W, H, 5.0, k % 2 == 0):
+            designs.append(tc.design_for(f["fact"], k, str(data.get("topic", "")), designs))  # (each screen its own design, coloured by its source)
+            if (make_card(f["fact"], f.get("source") or urllib.parse.urlparse(f.get("url", "")).netloc, png, W, H, url=f.get("url", ""), design=designs[-1])
+                    and image_to_clip(png, clip, W, H, 5.0, k % 2 == 0)):
                 items.append({"kind": "card", "file": str(clip), "title": f["fact"], "page": f.get("url", ""), "license": "made by EI",
-                              "author": "", "provider": f.get("source", "")})
+                              "author": "", "provider": f.get("source", ""), "design": designs[-1]})
                 # a fact card belongs to the line that says the fact (shared words)
                 fw = set(re.findall(r"\w{4,}", f["fact"].lower()))
                 best = max(range(len(segs)), key=lambda i: len(fw & set(re.findall(r"\w{4,}", segs[i]["text"].lower())))) if segs else None
@@ -541,7 +564,12 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
          sources: list[str] | None = None, footage: list[str] | None = None, music: str | None = None, captions: bool = True,
          caption_style: str | None = None, takes: int = 2, pace: str = "medium", fresh: bool = False, sound: dict | None = None,
          resolution: str = "1080p", hook_line: str | None = None, find_hook: bool = False, hints: str = "", feedback: str = "",
-         character: dict | None = None, speech_pace: str = "relaxed") -> dict:
+         character: dict | None = None, speech_pace: str = "relaxed", text_screens: int = 4, own_share: float | None = None,
+         tall_frame: float | None = None) -> dict:
+    """`text_screens`: the most text screens (0: none). `own_share`: how much of the length your own
+    footage should cover (0 … 1; None: wherever it fits best). `tall_frame`: with the wide shape, the
+    video is delivered tall, the wide picture across the middle and the same picture behind it at
+    this opacity (0 … 1)."""
     import script_writer as sw
 
     hints = (hints or "").strip()
@@ -626,7 +654,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         import voice as vo
 
         # 3 + 4. voice and media at the same time (media needs only the script, not the voice)
-        media_sig = state.sig(script_path.read_bytes(), sources, W, H)
+        media_sig = state.sig(script_path.read_bytes(), sources, W, H, *([text_screens] if text_screens != 4 else []), "cards-2")
         media_json = folder / "media" / "media.json"
         got: dict = {}
 
@@ -639,7 +667,7 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
                             log(f"reusing {len(saved['items'])} media item(s)")
                             got["media"] = (saved["items"], saved["hints"])
                             return
-                    its, hs = collect_media(script, data, folder / "media", sources, W, H)
+                    its, hs = collect_media(script, data, folder / "media", sources, W, H, text_screens=text_screens)
                     media_json.write_text(json.dumps({"items": its, "hints": hs}, ensure_ascii=False, indent=1), encoding="utf-8")
                     state.mark("media", media_sig)
                     got["media"] = (its, hs)
@@ -662,21 +690,26 @@ def make(topic: str, out_dir: str | None = None, *, seconds: float = 60, languag
         if "error" in got:
             raise got["error"]
         items, hints = got["media"]
-        clips = [i["file"] for i in items] + list(footage or [])
+        mine, mine_stills = own_clips(list(footage or []), folder / "media" / "own", W, H)
+        if footage:
+            log(f"your own footage: {len(mine) - len(mine_stills)} video(s), {len(mine_stills)} picture(s)")
+        clips = [i["file"] for i in items] + mine
         if not clips:
             raise AutocutError("no media was found or allowed for this topic: allow more sources or add your own footage")
         # 5. edit
         import narrate as nr
 
         video_out = folder / f"{name}.mp4"
-        stills = {str(Path(i["file"]).resolve()) for i in items if i["kind"] == "image"}
+        stills = {str(Path(i["file"]).resolve()) for i in items if i["kind"] == "image"} | mine_stills
+        framed = tall_frame is not None and aspect == "horizontal"
         cards = {str(Path(i["file"]).resolve()) for i in items if i["kind"] == "card"}
         with ac.stage("edit"):
             nr.make(sp["outputs"][0], clips, str(video_out), narration=sp["narration"], aspect=aspect, pace=pace, captions=captions,
-                    caption_style=caption_style or ("pop" if aspect == "vertical" else "clean"), music=music, describe="none", hints=hints, stills=stills, cards=cards,
+                    caption_style=caption_style or ("pop" if aspect == "vertical" or framed else "clean"), music=music, describe="none", hints=hints, stills=stills, cards=cards,
                     ambience_db=-60 if all(i["kind"] != "video" for i in items) else -30, sound=sound, resolution=resolution, niche=niche,
                     # your own hook opens the video: no cold open before it, and it is the on-screen hook too
-                    hook="text" if hook_line and hook_line.strip() else "auto", screen_text=hook_line)
+                    hook="text" if hook_line and hook_line.strip() else "auto", screen_text=hook_line, max_cards=text_screens,
+                    own=set(mine), own_share=own_share if mine else None, tall_frame=tall_frame if framed else None)
         state.mark("edit", "done")
         outputs.insert(0, str(video_out))
         if character:  # 6. the animated presenter, over the finished edit (which is kept without it too)
@@ -741,6 +774,10 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--find-hook", action="store_true", help="look online for hooks that work for this exact topic first")
     p.add_argument("--feedback", default="", help="what did not come out right last time (kept in the folder; every retry follows all of it)")
     p.add_argument("--hints", default="", help="what you are looking for: angles, facts to find, what to leave out, how it should come out (one per line)")
+    p.add_argument("--text-screens", type=int, default=4, help="the most text screens (a fact with its source) in the video; 0: none")
+    p.add_argument("--own-share", type=float, help="how much of the length your own footage should cover, in percent (left out: wherever it fits best)")
+    p.add_argument("--tall-frame", action="store_true", help="with --aspect horizontal: deliver a tall video, the wide picture across the middle and the same picture dimmed behind it")
+    p.add_argument("--frame-opacity", type=float, default=35, help="how strongly the picture behind shows in the tall frame, in percent (default 35)")
     import character
     import score
 
@@ -749,16 +786,18 @@ def add_args(p: argparse.ArgumentParser) -> None:
 
 
 def run_args(a) -> dict:
-    footage = None
-    if a.footage:
-        import voiceover_cut as vc
-
-        footage = vc.collect_clips(a.footage)
+    footage = own_footage(a.footage) if a.footage else None
+    if a.own_share is not None and not 0 <= a.own_share <= 100:
+        raise AutocutError("the share of your own footage is 0 to 100 percent")
+    if not 0 <= a.frame_opacity <= 100:
+        raise AutocutError("the opacity of the picture behind is 0 to 100 percent")
     return make(a.topic, a.out_dir, seconds=a.seconds, language=a.language, aspect=a.aspect, voice=a.voice, script_only=a.script_only, style=a.style,
                 writer=a.writer, model=a.model, tone=a.tone, niche=a.niche, sources=a.sources, footage=footage, music=a.music,
                 captions=not a.no_captions, caption_style=a.caption_style, takes=a.takes, pace=a.pace, speech_pace=a.speech_pace, fresh=a.fresh,
                 sound=__import__("score").options(a), resolution=a.resolution, hook_line=a.hook_line, find_hook=a.find_hook,
-                hints=a.hints or "", feedback=a.feedback or "", character=__import__("character").options(a))
+                hints=a.hints or "", feedback=a.feedback or "", character=__import__("character").options(a), text_screens=max(0, a.text_screens),
+                own_share=a.own_share / 100 if a.own_share is not None and footage else None,
+                tall_frame=a.frame_opacity / 100 if a.tall_frame and a.aspect == "horizontal" else None)
 
 
 def main(argv: list[str] | None = None) -> int:

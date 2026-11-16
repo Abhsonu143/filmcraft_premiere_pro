@@ -290,7 +290,7 @@ def shots_for_lines(lines: list[dict], total: float, pace: str, lead: float = 0.
 
 
 def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], first: bool, k: int = 30, hinted: set[int] | None = None,
-               hook: bool = False) -> list[dict]:
+               hook: bool = False, own: set[int] | None = None) -> list[dict]:
     """Best windows (clip, in) of the slot's length, with their unary score."""
     dur = slot["end"] - slot["start"]
     emo = line.get("emotion", "neutral")
@@ -344,6 +344,14 @@ def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], fir
         short.append(x)
         if len(short) >= k:
             break
+    if own:  # the creator's own footage always stays in the running (its share of the video is set later)
+        have = {(x["clip"], x["in"]) for x in short}
+        mine = [x for x in out if x["clip"] in own and (x["clip"], x["in"]) not in have]
+        per_own: dict[int, int] = {}
+        for x in mine:
+            if per_own.get(x["clip"], 0) < 2 and len(per_own) < 8:
+                per_own[x["clip"]] = per_own.get(x["clip"], 0) + 1
+                short.append(x)
     return short
 
 
@@ -359,9 +367,12 @@ def same_scene(clips: list[dict], a: dict, b: dict) -> float:
     return float(np.clip((float(va @ vb) / (na * nb) - 0.85) / 0.12, 0.0, 1.0))
 
 
-def choose(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_order: bool, beam: int = 12) -> list[dict]:
+def choose(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_order: bool, beam: int = 12, max_cards: int | None = None,
+           own: set[int] | None = None, own_bias: float = 0.0) -> list[dict]:
     """The whole edit at once (beam search over slots). A still (photo, title card: `clip["still"]`)
-    is one moment: shown once, never in two slots."""
+    is one moment: shown once, never in two slots. `max_cards`: the most text screens (never more
+    than about a quarter of the shots). `own_bias`: how much the creator's own footage is preferred."""
+    card_cap = max(1, len(slots) // 4) if max_cards is None else max(0, min(int(max_cards), max(1, len(slots) // 4)))
     State = tuple  # (score, picks list, used {clip: [(a,b)]})
     beams: list[tuple[float, list[dict], dict]] = [(0.0, [], {})]
     for si, (slot, cs) in enumerate(zip(slots, cands)):
@@ -378,9 +389,9 @@ def choose(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_
                 if clips[c["clip"]].get("card"):
                     if prev is not None and clips[prev["clip"]].get("card"):
                         continue  # never two text cards in a row
-                    if sum(1 for q in picks if clips[q["clip"]].get("card")) >= max(1, len(slots) // 4):
-                        continue  # cards: at most about a quarter of the shots
-                s = c["score"]
+                    if sum(1 for q in picks if clips[q["clip"]].get("card")) >= card_cap:
+                        continue  # cards: at most about a quarter of the shots, or the creator's own limit
+                s = c["score"] + (own_bias if own and c["clip"] in own else 0.0)
                 if prev is not None:
                     if prev["clip"] == c["clip"]:
                         s -= 0.6 if slot["part"] == 0 else 0.2  # same clip again (softer inside one long line)
@@ -396,8 +407,9 @@ def choose(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_
                 nu = dict(used)
                 nu[c["clip"]] = spans + [(c["in"], c["in"] + dur)]
                 nxt.append((score + s, picks + [c], nu))
-        if not nxt:  # ran out of fresh footage: allow reuse rather than fail
-            nxt = [(score + cs[0]["score"] - 1.0, picks + [cs[0]], used) for score, picks, used in beams[:1] if cs]
+        if not nxt:  # ran out of fresh footage: allow reuse rather than fail (a text screen only when nothing else is left)
+            again = next((c for c in cs if not clips[c["clip"]].get("card")), cs[0] if cs else None)
+            nxt = [(score + again["score"] - 1.0, picks + [again], used) for score, picks, used in beams[:1] if again]
             if not nxt:
                 raise AutocutError("not enough footage for the narration")
         nxt.sort(key=lambda x: -x[0])
@@ -408,6 +420,49 @@ def choose(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_
 # ---------------------------------------------------------------------------------------------
 # Render
 # ---------------------------------------------------------------------------------------------
+
+
+def own_share_of(slots: list[dict], picks: list[dict], own: set[int]) -> float:
+    total = sum(s["end"] - s["start"] for s in slots)
+    return sum(s["end"] - s["start"] for s, p in zip(slots, picks) if p["clip"] in own) / total if total > 0 else 0.0
+
+
+def choose_with_share(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_order: bool, own: set[int], share: float,
+                      max_cards: int | None = None) -> tuple[list[dict], float]:
+    """The edit whose share of the creator's own footage (by time) comes closest to `share` (0 … 1).
+    (the picks, the share reached). Each photo is still one moment, so few photos cannot fill much."""
+    def run(bias: float):
+        try:
+            picks = choose(slots, cands, clips, story_order, max_cards=max_cards, own=own, own_bias=bias)
+        except AutocutError:
+            return None
+        return picks, own_share_of(slots, picks, own)
+
+    best = run(0.0)
+    if best is None:
+        raise AutocutError("not enough footage for the narration")
+    more = best[1] < share
+    for bias in (0.6, 1.2, 2.5, 5.0, 12.0):  # (more of it, or less of it, step by step until the share is crossed)
+        if abs(best[1] - share) < 0.04:
+            break
+        got = run(bias if more else -bias)
+        if got is None:
+            continue
+        crossed = (got[1] >= share) if more else (got[1] <= share)
+        if abs(got[1] - share) < abs(best[1] - share):
+            best = got
+        if crossed:
+            break
+    return best
+
+
+def tall_frame_filter(W: int, H: int, TW: int, TH: int, opacity: float) -> str:
+    """A wide picture as a tall video: the picture itself across the middle, and the same picture
+    filling the frame behind it at `opacity` (0 … 1, over black). Ends in the label [framed]."""
+    o = min(1.0, max(0.0, float(opacity)))
+    fh = int(round(TW * H / W / 2)) * 2
+    return (f"[0:v]split=2[fa][fb];[fa]scale={TW}:{TH}:force_original_aspect_ratio=increase,crop={TW}:{TH},format=rgb24,"
+            f"colorchannelmixer=rr={o:.3f}:gg={o:.3f}:bb={o:.3f}[fbg];[fb]scale={TW}:{fh}[ffg];[fbg][ffg]overlay=0:{(TH - fh) // 2},format=yuv420p[framed]")
 
 
 def build_shots(slots: list[dict], picks: list[dict], lines: list[dict], clips: list[dict], fps: float, W: int, H: int) -> list[dict]:
@@ -511,8 +566,12 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
          ambience_db: float = -24.0, describe: str = "local", model: str | None = None, story_order: bool = True, look: str = "natural",
          whisper_model: str = ac.DEFAULT_WHISPER, workers: int = 2, plan_only: bool = False, hints: dict[str, list[int]] | None = None,
          stills: set[str] | None = None, cards: set[str] | None = None, sound: dict | None = None, resolution: str = "1080p",
-         hook: str = "auto", niche: str = "", screen_text: str | None = None) -> dict:
-    """`sound`: optional emotional sound design (score.options): music per mood, hits, risers, pauses."""
+         hook: str = "auto", niche: str = "", screen_text: str | None = None, max_cards: int | None = None, own: set[str] | None = None,
+         own_share: float | None = None, tall_frame: float | None = None) -> dict:
+    """`sound`: optional emotional sound design (score.options): music per mood, hits, risers, pauses.
+    `max_cards`: the most text screens. `own` + `own_share`: the creator's own clips and how much of
+    the length (0 … 1) they should cover. `tall_frame`: a wide edit delivered tall, the same picture
+    behind it at this opacity (0 … 1); captions are then laid out for the tall frame."""
     import render
 
     sound_opts = sound
@@ -587,9 +646,20 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
     for ci, c in enumerate(clips):
         for li in (hints or {}).get(c["path"], []):
             by_line.setdefault(int(li), set()).add(ci)
-    cands = [candidates(s, lines[s["line"]], q[s["line"]], clips, first=(i == 0), hinted=by_line.get(s["line"]), hook=bool(s.get("hook")) and hook != "off")
+    own_ix = {ci for ci, c in enumerate(clips) if c["path"] in (own or set())}
+    if max_cards is not None and max_cards <= 0 and any(not c["card"] for c in clips):
+        for c in clips:  # no text screens at all: they are not even candidates
+            if c["card"]:
+                c["duration"] = 0.0
+    cands = [candidates(s, lines[s["line"]], q[s["line"]], clips, first=(i == 0), hinted=by_line.get(s["line"]), hook=bool(s.get("hook")) and hook != "off",
+                        own=own_ix if own_share is not None else None)
              for i, s in enumerate(slots)]
-    picks = choose(slots, cands, clips, story_order)
+    if own_ix and own_share is not None:
+        picks, reached = choose_with_share(slots, cands, clips, story_order, own_ix, min(1.0, max(0.0, own_share)), max_cards)
+        log(f"your own footage covers {reached * 100:.0f}% of the length (asked: {own_share * 100:.0f}%)"
+            + ("; there is not enough of it for more: a photo is shown once" if reached < own_share - 0.1 else ""))
+    else:
+        picks = choose(slots, cands, clips, story_order, max_cards=max_cards)
     shots = build_shots(slots, picks, lines, clips, fps, W, H)
     by_path = {c["path"]: c for c in clips}
     craft = nc.treat(shots, slots, lines, by_path, fps)
@@ -642,22 +712,32 @@ def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = N
             build_sound(voice, shots, clips, fps, vtotal, sound, str(Path(music).resolve()) if music else None, ambience_db, music_db)
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(sound)]
         words = caption_words(lines)
+        framed = tall_frame is not None and W > H
+        CW, CH = ac.sized(1080, 1920, resolution) if framed else (W, H)  # (captions are laid out for the frame that is delivered)
+        if framed:
+            log(f"tall frame: the wide picture across the middle of {CW}x{CH}, the same picture behind it at {min(1.0, max(0.0, tall_frame)) * 100:.0f}%")
         if (captions and words) or hook_text:
             import captions as cap
 
-            ass = cap.build_ass(words if captions else [], None, W, H, total, caption_style, "off")
+            ass = cap.build_ass(words if captions else [], None, CW, CH, total, caption_style, "off")
             if hook_text:
-                ass = nc.hook_ass(ass, hook_text, W, H)
+                ass = nc.hook_ass(ass, hook_text, CW, CH)
             if any(re.search(r"[ऀ-ॿ]", w["word"]) for w in words) or re.search(r"[ऀ-ॿ]", hook_text or ""):
                 ass = ass.replace("Avenir Next Heavy", "Kohinoor Devanagari").replace("Avenir Next Demi Bold", "Kohinoor Devanagari")
             af = Path(tmp) / "c.ass"
             af.write_text(ass, encoding="utf-8")
             e = str(af).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-            cmd += ["-vf", f"subtitles=filename='{e}'", "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(W, H)]
+            if framed:
+                cmd += ["-filter_complex", tall_frame_filter(W, H, CW, CH, tall_frame) + f";[framed]subtitles=filename='{e}'[vout]"]
+            else:
+                cmd += ["-vf", f"subtitles=filename='{e}'"]
+            cmd += ["-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(CW, CH)]
+        elif framed:
+            cmd += ["-filter_complex", tall_frame_filter(W, H, CW, CH, tall_frame).replace("[framed]", "[vout]"), "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(CW, CH)]
         else:
             cmd += ["-c:v", "copy"]
         partial = outp.with_name(outp.stem + ".part.mp4")
-        cmd += ["-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(partial)]
+        cmd += ["-map", "[vout]" if framed else "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(partial)]
         ac.run(cmd)
         partial.replace(outp)
     import shutil

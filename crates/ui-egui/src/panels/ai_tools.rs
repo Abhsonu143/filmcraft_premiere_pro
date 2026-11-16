@@ -284,6 +284,13 @@ struct Draft {
     src_free: bool,
     src_cards: bool,
     src_youtube: bool,
+    /// Video from Topic: the most text screens; how much of the length the creator's own footage covers
+    /// (percent, when `own_share_on`); a wide video delivered tall with itself dimmed behind (`frame_opacity` percent).
+    text_screens: f64,
+    own_share_on: bool,
+    own_share: f64,
+    tall_frame: bool,
+    frame_opacity: f64,
     fresh: bool,
     /// Video from Topic: what the creator is looking for (research and script follow it).
     hints: String,
@@ -540,6 +547,11 @@ impl Draft {
             src_free: true,
             src_cards: true,
             src_youtube: false,
+            text_screens: 4.0,
+            own_share_on: false,
+            own_share: 50.0,
+            tall_frame: false,
+            frame_opacity: 35.0,
             fresh: false,
             hints: String::new(),
             plan_pick: String::new(),
@@ -718,6 +730,17 @@ impl Draft {
         d.src_free = flag("free", d.src_free);
         d.src_cards = flag("cards", d.src_cards);
         d.src_youtube = flag("youtube", d.src_youtube);
+        if let Some(v) = p.get("textScreens").and_then(Value::as_f64) {
+            d.text_screens = v.clamp(0.0, 8.0).round();
+        }
+        if let Some(v) = p.get("ownShare").and_then(Value::as_f64) {
+            d.own_share_on = true;
+            d.own_share = v.clamp(0.0, 100.0).round();
+        }
+        d.tall_frame = flag("tallFrame", d.tall_frame);
+        if let Some(v) = p.get("frameOpacity").and_then(Value::as_f64) {
+            d.frame_opacity = v.clamp(0.0, 100.0).round();
+        }
         d.fresh = flag("fresh", d.fresh);
         if let Some(v) = s("hints") {
             d.hints = v;
@@ -918,6 +941,12 @@ impl Draft {
         m.insert("free".into(), json!(self.src_free));
         m.insert("cards".into(), json!(self.src_cards));
         m.insert("youtube".into(), json!(self.src_youtube));
+        m.insert("textScreens".into(), json!(self.text_screens));
+        if self.own_share_on {
+            m.insert("ownShare".into(), json!(self.own_share));
+        }
+        m.insert("tallFrame".into(), json!(self.tall_frame));
+        m.insert("frameOpacity".into(), json!(self.frame_opacity));
         m.insert("fresh".into(), json!(self.fresh));
         m.insert("hints".into(), json!(self.hints));
         m.insert("pick".into(), json!(self.plan_pick));
@@ -1384,6 +1413,16 @@ impl Draft {
                     if !self.clips.is_empty() {
                         a.push("--footage".into());
                         a.extend(self.clips.iter().cloned());
+                        if self.own_share_on {
+                            push(&mut a, "--own-share", &format!("{}", self.own_share.clamp(0.0, 100.0).round()));
+                        }
+                    }
+                    if self.src_cards && self.text_screens.round() != 4.0 {
+                        push(&mut a, "--text-screens", &format!("{}", self.text_screens.clamp(0.0, 8.0).round()));
+                    }
+                    if self.tall_frame && self.aspect == "horizontal" {
+                        a.push("--tall-frame".into());
+                        push(&mut a, "--frame-opacity", &format!("{}", self.frame_opacity.clamp(0.0, 100.0).round()));
                     }
                     if !self.music.trim().is_empty() && !self.sound {
                         push(&mut a, "--music", self.music.trim());
@@ -2096,6 +2135,7 @@ const EXPLAIN_LOOKS: [(&str, &str); 3] = [
 ];
 const EXPLAIN_CAPTIONS: [(&str, &str); 4] =
     [("auto", "As the look has them"), ("sentence", "A line at the bottom"), ("words", "Big, word by word"), ("none", "No captions")];
+const TOPIC_IMAGE_EXT: [&str; 8] = ["jpg", "jpeg", "png", "webp", "heic", "tif", "tiff", "bmp"];
 const EXPLAIN_SOURCES: [(&str, &str); 3] = [
     ("any", "From any public page: one sentence, marked, with credit"),
     ("open", "Only official and openly licensed sources (governments, courts, standards, Wikipedia, papers)"),
@@ -3161,6 +3201,10 @@ fn params_from_args(kind: &str, args: &[String]) -> Option<Value> {
             "--fresh" => ("fresh", json!(true), 1),
             "--find-hook" => ("findHook", json!(true), 1),
             "--no-captions" => ("captions", json!(false), 1),
+            "--tall-frame" => ("tallFrame", json!(true), 1),
+            "--frame-opacity" => ("frameOpacity", num(&val), 2),
+            "--text-screens" => ("textScreens", num(&val), 2),
+            "--own-share" => ("ownShare", num(&val), 2),
             "--script-only" => ("video", json!(false), 1),
             "--sound-design" => ("soundDesign", json!(true), 1),
             "--no-effects" => ("soundEffects", json!(false), 1),
@@ -4455,7 +4499,8 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     {
                         ui.label(match d.kind {
                             Kind::Audio => "Videos",
-                            Kind::Script | Kind::Topic => "Your footage (optional)",
+                            Kind::Script => "Your footage (optional)",
+                            Kind::Topic => "Your videos and pictures (optional)",
                             Kind::Voice => "Your recordings",
                             Kind::Voiceover => "Footage",
                             Kind::Tv => "Your clips",
@@ -4926,17 +4971,51 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                                     ui.end_row();
                                 }
                                 ui.label("Shape");
-                                radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
+                                ui.vertical(|ui| {
+                                    radio_row(ui, &mut d.aspect, &ASPECTS[1..], &format!("{p}.aspect"), &mut elems);
+                                    if d.aspect == "horizontal" {
+                                        let r = ui.checkbox(&mut d.tall_frame, "Deliver it tall (9:16): the wide picture across the middle, the same picture dimmed behind it");
+                                        elems.push((format!("{p}.tallFrame"), r.rect, d.tall_frame.to_string()));
+                                        if d.tall_frame {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Picture behind shows at");
+                                                let r = ui.add(egui::Slider::new(&mut d.frame_opacity, 0.0..=100.0).suffix(" %").max_decimals(0));
+                                                elems.push((format!("{p}.frameOpacity"), r.rect, d.frame_opacity.to_string()));
+                                            });
+                                        }
+                                    }
+                                });
                                 ui.end_row();
                                 ui.label("Pace");
                                 radio_row(ui, &mut d.pace, &PACES, &format!("{p}.pace"), &mut elems);
                                 ui.end_row();
+                                if !d.clips.is_empty() {
+                                    ui.label("Your footage covers");
+                                    ui.horizontal(|ui| {
+                                        let r = ui.checkbox(&mut d.own_share_on, "about");
+                                        elems.push((format!("{p}.ownShareOn"), r.rect, d.own_share_on.to_string()));
+                                        let r = ui.add_enabled(d.own_share_on, egui::Slider::new(&mut d.own_share, 0.0..=100.0).suffix(" % of the length").max_decimals(0));
+                                        elems.push((format!("{p}.ownShare"), r.rect, d.own_share.to_string()));
+                                        if !d.own_share_on {
+                                            ui.label(egui::RichText::new("(off: wherever it fits best)").weak());
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
                                 ui.label("Pictures from");
                                 ui.vertical(|ui| {
                                     let r = ui.checkbox(&mut d.src_free, "Free-licensed photos and videos (Wikimedia Commons, Openverse; credited)");
                                     elems.push((format!("{p}.free"), r.rect, d.src_free.to_string()));
                                     let r = ui.checkbox(&mut d.src_cards, "Headline and fact cards from the research");
                                     elems.push((format!("{p}.cards"), r.rect, d.src_cards.to_string()));
+                                    if d.src_cards {
+                                        ui.horizontal(|ui| {
+                                            ui.label("      at most");
+                                            let r = ui.add(egui::DragValue::new(&mut d.text_screens).range(0.0..=8.0).speed(0.05).max_decimals(0));
+                                            elems.push((format!("{p}.textScreens"), r.rect, d.text_screens.to_string()));
+                                            ui.label("text screens in the video (each drawn differently)");
+                                        });
+                                    }
                                     let r = ui.checkbox(&mut d.src_youtube, "Short clips from YouTube videos the research finds");
                                     elems.push((format!("{p}.youtube"), r.rect, d.src_youtube.to_string()));
                                     if d.src_youtube {
@@ -5406,6 +5485,8 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     AUDIO_EXT.iter().chain(VIDEO_EXT.iter()).copied().collect()
                 } else if d.kind == Kind::Talk && d.talk_mode == "plan" {
                     video.iter().copied().chain(["json", "srt"]).collect() // (the recordings, or their saved analysis and .srt)
+                } else if d.kind == Kind::Topic {
+                    video.iter().copied().chain(TOPIC_IMAGE_EXT).collect() // (your own pictures too: each becomes a slow push-in shot)
                 } else {
                     video.clone()
                 };
@@ -7150,6 +7231,37 @@ mod tests {
             assert_eq!(b.engine_args().unwrap(), first, "{kind:?} keeps every setting through the queue");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn topic_text_screens_own_share_and_tall_frame() {
+        let base = json!({"topic": "GTA 6", "voice": "mac:Rishi", "aspect": "horizontal"});
+        let with = |extra: Value| {
+            let mut p = base.clone();
+            for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+                p[k] = v;
+            }
+            Draft::from_params(Kind::Topic, &p).engine_args().unwrap().join(" ")
+        };
+        let plain = with(json!({}));
+        assert!(!plain.contains("--text-screens") && !plain.contains("--tall-frame") && !plain.contains("--own-share"));
+        assert!(with(json!({"textScreens": 1})).contains("--text-screens 1"));
+        assert!(with(json!({"textScreens": 99})).contains("--text-screens 8"));
+        assert!(with(json!({"tallFrame": true, "frameOpacity": 20})).contains("--tall-frame --frame-opacity 20"));
+        // only the wide shape is delivered tall; a share needs footage of your own
+        assert!(!with(json!({"tallFrame": true, "aspect": "vertical"})).contains("--tall-frame"));
+        assert!(!with(json!({"ownShare": 40})).contains("--own-share"));
+        let clip = std::env::temp_dir().join("ei-own-share-test.jpg");
+        std::fs::write(&clip, b"x").unwrap();
+        let own = with(json!({"ownShare": 40, "clips": [clip.to_string_lossy()]}));
+        assert!(own.contains("--own-share 40"), "{own}");
+        let mut d = Draft::from_params(
+            Kind::Topic,
+            &json!({"topic": "GTA 6", "voice": "mac:Rishi", "aspect": "horizontal", "tallFrame": true, "ownShare": 40, "textScreens": 2}),
+        );
+        let mut back = Draft::from_params(Kind::Topic, &d.to_params());
+        assert_eq!(back.engine_args().unwrap(), d.engine_args().unwrap());
+        let _ = std::fs::remove_file(&clip);
     }
 
     #[test]

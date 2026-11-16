@@ -205,6 +205,7 @@ fn ai_menu_and_dialogs() {
                 "voice",
                 "free",
                 "cards",
+                "textScreens",
                 "youtube",
                 "captions",
                 "out",
