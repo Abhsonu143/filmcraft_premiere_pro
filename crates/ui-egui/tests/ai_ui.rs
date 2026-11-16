@@ -232,6 +232,8 @@ fn ai_menu_and_dialogs() {
                 "review",
                 "approve",
                 "notes",
+                "findMedia",
+                "ownMedia",
                 "showSources",
                 "runCode",
                 "voice",

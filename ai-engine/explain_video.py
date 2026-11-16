@@ -115,11 +115,21 @@ def render(out: Path, script: dict, facts: list[dict], states: list[dict], cues:
         k = sc.get("fact")
         return facts[k - 1] if isinstance(k, int) and 1 <= k <= len(facts) else None
 
+    def scene_of(k: int) -> tuple:
+        c, s, step, focus = states[k]["key"]
+        ch = script["chapters"][c]
+        return ch, ch["scenes"][min(len(ch["scenes"]), max(1, s)) - 1], step, focus
+
+    def scene_start(k: int) -> float:
+        while k > 0 and states[k - 1]["key"][:2] == states[k]["key"][:2]:
+            k -= 1
+        return states[k]["start"]
+
+    live = [xd.is_live(scene_of(k)[1]) for k in range(len(states))]
+
     def get(k: int) -> tuple:
         if k not in drawn:
-            c, s, step, focus = states[k]["key"]
-            ch = script["chapters"][c]
-            sc = ch["scenes"][min(len(ch["scenes"]), max(1, s)) - 1]
+            ch, sc, step, focus = scene_of(k)
             img, marks = xd.draw_scene(pen, sc, step, focus, title=ch["title"], fact=fact_of(sc))
             pre = xd.draw_scene(pen, sc, 1, focus, title=ch["title"], fact=fact_of(sc))[0] if marks else None
             for old in [o for o in drawn if o < k - 1]:
@@ -141,7 +151,11 @@ def render(out: Path, script: dict, facts: list[dict], states: list[dict], cues:
         for i in range(n):
             t = t0 + i / FPS
             k = max(0, bisect.bisect_right(st_starts, t) - 1)
-            img, pre, marks = get(k)
+            if live[k]:  # (a video plays, a photo is pushed in: drawn anew for this moment)
+                ch, sc, step, focus = scene_of(k)
+                img, pre, marks = xd.draw_scene(pen, sc, step, focus, title=ch["title"], fact=fact_of(sc), t=max(0.0, t - scene_start(k)))[0], None, []
+            else:
+                img, pre, marks = get(k)
             age = t - states[k]["start"]
             new_scene = k > 0 and states[k - 1]["key"][:2] != states[k]["key"][:2]
             moving = True
@@ -150,7 +164,7 @@ def render(out: Path, script: dict, facts: list[dict], states: list[dict], cues:
             elif marks and age < (fade if new_scene else 0) + SWEEP:
                 base = _sweep(pre, img, marks, max(0.0, age - (fade if new_scene else 0)) / SWEEP)
             else:
-                base, moving = img, False
+                base, moving = img, live[k]
             if punch and new_scene and age < 0.28:
                 z = 1 + punch * (1 - age / 0.28) ** 2
                 big = base.resize((int(W * z), int(H * z)), Image.BILINEAR)
@@ -200,13 +214,19 @@ def description(script: dict, facts: list[dict], chapters: list[dict]) -> str:
     out = [script.get("title", ""), "", script.get("promise", ""), "", "Chapters"]
     out += [f"{clock(c['start'])} {script['chapters'][c['chapter']]['title']}" for c in chapters]
     used = sorted({ln.get("fact") for ch in script["chapters"] for ln in ch["lines"] if ln.get("fact")} | {sc.get("fact") for ch in script["chapters"] for sc in ch["scenes"] if sc.get("fact")})
+    shown = {}
+    for ch in script["chapters"]:
+        for sc in ch["scenes"]:
+            for item in (sc if sc.get("type") == "footage" else None, sc.get("behind")):
+                if isinstance(item, dict) and item.get("credit") and item.get("file"):
+                    shown[item["file"]] = f"- {item['credit']}" + (f": {item['page']}" if item.get("page") else "")
     seen, src = set(), []
     for k in used:
         f = facts[k - 1] if isinstance(k, int) and 1 <= k <= len(facts) else None
         if f and f.get("url") and f["url"] not in seen:
             seen.add(f["url"])
             src.append(f"- {f.get('source', '')}: {f['url']}")
-    return "\n".join(out + (["", "Sources"] + src if src else [])) + "\n"
+    return "\n".join(out + (["", "Sources"] + src if src else []) + (["", "Pictures and video"] + list(shown.values()) if shown else [])) + "\n"
 
 
 def make_video(folder: Path, script: dict, facts: list[dict], *, voice: str = "mac", look: str = "clean", aspect: str = "horizontal", captions: str | None = None,

@@ -109,6 +109,14 @@ Angle: {data.get("angle", "")}
 {shows}
   Technical topics lean on flow, code, debug, terminal, example; research and social topics on article, quote, chart, timeline, compare.
   "article" and "quote" may only use a quote given in the research, word for word.
+- REAL PICTURES AND VIDEO ("media"): a video of only drawn text feels like slides. Wherever the chapter is about something that exists and can
+  be seen (a place, a machine, a building, an event, an animal, a product, a person in public life, a document, a landscape), name it in
+  "media": free-licensed photos and videos are then searched for each, looked at, and used full screen or dimmed behind the text.
+  "what": exactly what should be seen; "search": 2-4 plain English words a photo archive would file it under (the proper name, not a
+  description); "kind": "video" where movement helps (a launch, a machine working, a crowd, weather), else "photo"; "why": what it does there.
+  For a topic about the real world aim for something real on screen every 15-20 seconds (2-4 per chapter). Use judgment about when NOT to:
+  none for code, logic, maths, an abstract idea or a number (a drawn scene explains those better), none that only decorates (no generic
+  "person at laptop", "abstract technology"), none that could mislead (a different event passed off as this one). A coding chapter usually has none.
 - how_said: how the voice should sound there (curious, dry, urgent, warm…) and how fast.
 - catch: in one line, why someone would stop scrolling for this chapter, and what they would repeat to a friend afterwards.
 - open_questions: what you could not settle from the research and the creator should decide or check.
@@ -117,6 +125,7 @@ Answer with only this JSON:
 {{"title": "...", "promise": "what the viewer can do or understand afterwards, one sentence", "audience": "who it is for and what they already know",
  "chapters": [{{"title": "...", "goal": "what this chapter is for", "hook": "its first spoken line", "says": ["the points made, in order (3-6 short lines)"],
    "shows": [{{"type": "flow|code|debug|terminal|article|quote|example|compare|chart|timeline|footage|card", "what": "exactly what is on screen"}}],
+   "media": [{{"what": "...", "search": "...", "kind": "photo|video", "why": "..."}}],
    "claims": [{{"claim": "...", "fact": 3}}], "ends_on": "its last line", "how_said": "...", "catch": "...", "clip_title": "the title it would have posted alone", "seconds": 45}}],
  "open_questions": ["..."]}}"""
 
@@ -139,12 +148,18 @@ Every chapter must still work cut out on its own, and every claim must still res
 ## The research (the only facts there are)
 {facts}
 
+Each chapter's "media" lists the real things to be seen ({{"what", "search": 2-4 plain English words an archive files it under, "kind": "photo|video",
+"why"}}): free-licensed photos and video are searched for each and looked at. A note may ask for more, fewer or other ones; one the creator
+says to do without is removed.
+
 Answer with only the whole plan again as JSON, in the same form, with one more field: "changed": one short sentence per change you made."""
 
 
 def clean_plan(raw: dict, data: dict) -> dict:
     """The plan as the next steps can rely on it: known picture types, claims tied to real facts
     (with their source and quote), sane lengths. Raises when there is no usable chapter."""
+    import explain_media as xm
+
     facts = data.get("facts", [])
     chapters = []
     for c in (raw.get("chapters") if isinstance(raw, dict) else None) or []:
@@ -174,7 +189,8 @@ def clean_plan(raw: dict, data: dict) -> dict:
                          "says": [str(x).strip()[:300] for x in c.get("says") or [] if str(x).strip()][:8], "shows": shows[:6], "claims": claims[:8],
                          "ends_on": str(c.get("ends_on", "")).strip()[:300], "how_said": str(c.get("how_said", "")).strip()[:200],
                          "catch": str(c.get("catch", "")).strip()[:300], "clip_title": str(c.get("clip_title", "")).strip()[:120],
-                         "seconds": round(min(180.0, max(15.0, secs)))})
+                         "seconds": round(min(180.0, max(15.0, secs))),
+                         "media": [{k: m[k] for k in ("what", "search", "kind", "why")} for m in xm.clean_needs(c.get("media"), 0, 0)]})
     if not chapters:
         raise AutocutError("the plan came back without chapters")
     return {"title": str(raw.get("title", "")).strip()[:150] or "Explainer", "promise": str(raw.get("promise", "")).strip()[:300],
@@ -262,7 +278,17 @@ def plan_md(plan: dict) -> str:
             out += ["", "Claims and where they come from:"]
             out += [f"- {cl['claim']}  \n  {cl['source'] or '(no source)'} · {MARK.get(cl['confirmed'], cl['confirmed'])}"
                     + (f"  \n  “{cl['quote']}”  \n  {cl['url']}" if cl["quote"] else (f"  \n  {cl['url']}" if cl["url"] else "")) for cl in c["claims"]]
+        seen = [m for m in plan.get("media", []) if m["chapter"] == n]
+        if seen:
+            out += ["", "Real pictures and video:"]
+            out += [f"- **{m['id']}** {m['kind']}: {m['what']}  \n  " + (f"found: {m['credit']}" + (f" ({m['seconds']:.0f} s)" if m.get("seconds") else "") + (f"  \n  {m['page']}" if m.get("page") else "")
+                                                                         if m.get("file") else f"**NOT FOUND** ({m.get('missing', 'not looked for yet')}); searched: “{m['search']}”") for m in seen]
         out += ["", f"*Ends on:* “{c['ends_on']}”", f"*How it is said:* {c['how_said']}", f"*Why it catches:* {c['catch']}", f"*Posted alone as:* {c['clip_title']}", ""]
+    lost = [m for m in plan.get("media", []) if not m.get("file") and m.get("missing")]
+    if lost:
+        out += ["## Pictures I could not find: can you help?", "", "Without them these moments are drawn instead. To give your own: add the photo or video files "
+                "(in the app: “Your pictures and videos”), or put them in the folder `media/mine` here, and run it again. They are looked at and used where they fit.", ""]
+        out += [f"- {m['id']} (chapter {m['chapter']}): {m['what']}" for m in lost] + [""]
     if plan.get("open_questions"):
         out += ["## For you to decide or check", ""] + [f"- {q}" for q in plan["open_questions"]] + [""]
     if plan.get("notes"):
@@ -292,8 +318,10 @@ SCENE_FORMS = """  {"type": "card", "text": "one short line, at most 12 words", 
   {"type": "compare", "title": "...", "left": {"title": "...", "lines": ["..."], "code": false}, "right": {...}, "good_bad": true}   (step 1 the left side, 2 both; "code": true for code lines)
   {"type": "chart", "title": "...", "unit": "%", "bars": [{"label": "...", "value": 12.5}], "fact": 7}   (numbers ONLY from that fact; step N = the first N bars)
   {"type": "timeline", "title": "...", "points": [{"when": "1991", "what": "..."}]}   (at most 6; step N = the first N)
-  {"type": "footage", "search": "2-4 plain words naming the real thing (a place, a machine, a person in public life)", "caption": "what it is, one short line"}
-     (a free-licensed photo found for those words, credited on screen; only for something a photo really shows, never for an idea)"""
+  {"type": "footage", "media": "m3", "caption": "what it is, one short line"}
+     (the real photo or video m3 full screen, credited; ONLY a media id listed under "Real pictures and video found")
+  Any card, quote, flow, example, compare, chart or timeline scene may also carry "behind": "m3": that picture or video fills the frame,
+  dimmed, behind the scene. Never behind code, terminal, debug or article."""
 SHOW_SOURCES = {"any": "any public page, briefly and with credit", "open": "only official and openly licensed sources", "none": "never"}
 # sources whose words may be shown under "open": governments, courts, standards bodies, open encyclopedias, papers and documentation
 OPEN_HOSTS = ("wikipedia.org", "wikimedia.org", "wikisource.org", "wikidata.org", "arxiv.org", "un.org", "who.int", "worldbank.org", "europa.eu", "ietf.org", "rfc-editor.org",
@@ -334,6 +362,8 @@ def script_prompt(plan: dict, data: dict) -> str:
              "hinglish": "\nThe voice speaks Hinglish (Hindi in Latin letters, the way people text), and so does the text on screen; code and a source's own sentence stay as they are.\n"
              }.get(plan.get("language"), "")
     show = plan.get("show_sources", "any")
+    seen = "\n".join(f"{m['id']} (chapter {m['chapter']}, {m['kind']}" + (f", {m['seconds']:.0f} s" if m.get("seconds") else "") + f"): {m['what']}" + (f" — shows: {m['shows']}" if m.get("shows") else "")
+                     for m in plan.get("media", []) if m.get("file"))
     return f"""Write the script of this explainer video from its approved plan: every spoken line, and what is on screen while it is said.
 One voice narrates. The pictures are drawn by a program from the "scenes" you give, exactly as written, so they must be complete and correct.
 Title: {plan['title']}  ·  For: {plan.get('audience', '')}  ·  Promise: {plan.get('promise', '')}{other}
@@ -343,6 +373,8 @@ Title: {plan['title']}  ·  For: {plan.get('audience', '')}  ·  Promise: {plan.
 {_facts_block(data, show)}
 ## Examples found
 {examples or "(none)"}
+## Real pictures and video found (each was looked at and shows what it says; nothing else exists)
+{seen or "(none: everything is drawn)"}
 
 ## What is said
 - TRUE: only what the research supports. A line that states something checkable carries "fact": the fact number. Numbers, names, dates and
@@ -365,6 +397,15 @@ Never talk about something that is not on screen. Scene forms:
 - Code, commands, outputs and error texts must be real and runnable, taken from the research's examples; output exactly as the tool prints it.
 - {'"article" and "quote" only for a fact whose sentence is marked confirmed in the page. Use them where a claim needs proof: the viewer sees the source say it.' if show != "none" else 'Do NOT use "article" or "quote" scenes: no source page is shown in this video. Name the source in the spoken line and on a card instead.'}
 - Text on screen is short. The voice explains; the screen shows.
+- Real pictures and video are what make this a video and not slides. USE EVERY ONE FOUND, and most of them more than once:
+  * as a "footage" scene at the moment the voice first talks about exactly that thing (hold it 3-8 seconds); a chapter that has one
+    opens on it, under its hook;
+  * and "behind" the card, quote, flow, timeline, compare, example or chart scenes that are about that same thing (a flow of the
+    landing steps over the photo of the lander; a card about the launch over the launch). A drawn scene whose subject has a found
+    picture carries it behind; the same picture may be behind several scenes.
+  Judgment: never a picture while the voice is on something else, never behind code, terminal, debug or a source page, and where a
+  chapter has nothing real that fits (logic, maths, an abstract idea), drawn scenes alone are right. A picture from another chapter may
+  be used when the voice comes back to that thing.
 
 Answer with only this JSON:
 {{"chapters": [{{"scenes": [...], "lines": [{{"text": "...", "shown": "", "scene": 1, "step": 1, "focus": [], "fact": 0, "emotion": "...", "intensity": 0.6,
@@ -446,7 +487,19 @@ def _ints(v, n: int = 12) -> list[int]:
     return [x for x in out if x > 0][:n]
 
 
-def clean_scene(sc: dict, facts: list[dict], show: str = "any") -> dict:
+BEHIND_OK = ("card", "quote", "flow", "example", "compare", "chart", "timeline")
+
+
+def clean_scene(sc: dict, facts: list[dict], show: str = "any", media: dict | None = None) -> dict:
+    out = _clean_scene(sc, facts, show, media or {})
+    b = sc.get("behind")
+    m = (media or {}).get(str(b.get("id", "") if isinstance(b, dict) else b or "").strip().lower())
+    if m and out["type"] in BEHIND_OK:
+        out["behind"] = {k: m[k] for k in ("id", "file", "kind", "credit", "seconds") if k in m}
+    return out
+
+
+def _clean_scene(sc: dict, facts: list[dict], show: str, media: dict) -> dict:
     """A scene the drawing step can rely on. A source passage whose sentence is not confirmed in
     its page, or whose kind of source the creator does not want shown, is never shown as one: it
     becomes a plain card."""
@@ -461,6 +514,9 @@ def clean_scene(sc: dict, facts: list[dict], show: str = "any") -> dict:
         if may_show(fact, show):
             return {"type": kind, "fact": k}
         return {"type": "card", "text": str((fact or {}).get("fact") or sc.get("text") or sc.get("what") or "")[:160], "sub": str((fact or {}).get("source", ""))[:80], **({"fact": k} if fact else {})}
+    if kind == "footage" and str(sc.get("media", "")).strip().lower() in media:
+        m = media[str(sc["media"]).strip().lower()]
+        return {"type": kind, "media": m["id"], "caption": str(sc.get("caption", "")).strip()[:120], **{a: m[a] for a in ("file", "kind", "credit", "page", "seconds") if a in m}}
     if kind == "footage" and str(sc.get("search", "")).strip():
         kept = {a: str(sc[a]) for a in ("file", "credit", "page") if sc.get(a) and Path(str(sc.get("file", ""))).is_file()}
         return {"type": kind, "search": " ".join(str(sc["search"]).split())[:80], "caption": str(sc.get("caption", "")).strip()[:120], **kept}
@@ -487,13 +543,13 @@ def clean_scene(sc: dict, facts: list[dict], show: str = "any") -> dict:
         pts = [{"when": str(p.get("when", ""))[:24], "what": str(p.get("what", ""))[:140]} for p in sc.get("points") or [] if isinstance(p, dict)][:7]
         if pts:
             return {"type": kind, "title": title, "points": pts}
-    return {"type": "card", "text": str(sc.get("text") or sc.get("what") or title or "")[:160], "sub": str(sc.get("sub", ""))[:160], **({"fact": k} if fact else {})}
+    return {"type": "card", "text": str(sc.get("text") or sc.get("what") or sc.get("caption") or title or "")[:160], "sub": str(sc.get("sub", ""))[:160], **({"fact": k} if fact else {})}
 
 
-def clean_chapter(raw: dict, plan_ch: dict, facts: list[dict], show: str = "any") -> dict:
+def clean_chapter(raw: dict, plan_ch: dict, facts: list[dict], show: str = "any", media: dict | None = None) -> dict:
     import emotions as em
 
-    scenes = [clean_scene(sc, facts, show) for sc in raw.get("scenes") or [] if isinstance(sc, dict)][:12] or [{"type": "card", "text": plan_ch["title"], "sub": ""}]
+    scenes = [clean_scene(sc, facts, show, media) for sc in raw.get("scenes") or [] if isinstance(sc, dict)][:12] or [{"type": "card", "text": plan_ch["title"], "sub": ""}]
     lines, at = [], (1, 0)
     for ln in raw.get("lines") or []:
         if not isinstance(ln, dict) or not str(ln.get("text", "")).strip():
@@ -519,7 +575,21 @@ def clean_chapter(raw: dict, plan_ch: dict, facts: list[dict], show: str = "any"
 def plan_sig(plan: dict) -> str:
     import hashlib
 
-    return hashlib.sha1(json.dumps(plan["chapters"], ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+    found = [(m["id"], m.get("file", "")) for m in plan.get("media", [])]
+    return hashlib.sha1(json.dumps([plan["chapters"], found] if found else plan["chapters"], ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def media_needs(plan: dict) -> list[dict]:
+    """The plan's things to be seen, numbered through the video (m1, m2…); what was already found
+    for the same words is kept."""
+    old = {(m["chapter"], m["search"], m.get("wanted", m["kind"])): m for m in plan.get("media", [])}
+    out = []
+    for c, ch in enumerate(plan["chapters"], 1):
+        for m in ch.get("media", []):
+            had = old.get((c, m["search"], m["kind"]), {})
+            out.append({**m, "wanted": m["kind"], **{k: v for k, v in had.items() if k in ("file", "kind", "credit", "page", "seconds", "missing", "for", "own", "shows")},
+                        "id": f"m{len(out) + 1}", "chapter": c})
+    return out
 
 
 def apply_checks(script: dict, problems: list) -> list[dict]:
@@ -548,6 +618,8 @@ def _scene_text(sc: dict, facts: list[dict]) -> str:
     f = facts[sc["fact"] - 1] if sc.get("fact") and sc["fact"] <= len(facts) else {}
     if t in ("article", "quote"):
         return f"{'the source page with this sentence marked' if t == 'article' else 'the exact words'}: “{f.get('quote', '')}” ({f.get('source', '')})"
+    if t == "footage" and sc.get("media"):
+        return f"{sc['media']} full screen ({sc.get('kind', 'photo')}: {sc.get('credit', '')}): {sc.get('caption', '')}"
     if t == "footage":
         return f"a photo of “{sc['search']}”: {sc.get('caption', '')}" + (f"  \n  found: {sc['credit']}  \n  {sc.get('page', '')}" if sc.get("credit") else "  (not looked for yet)")
     if t == "flow":
@@ -578,7 +650,7 @@ def script_md(script: dict, facts: list[dict]) -> str:
         out += [f"- {c['where']}: {c['problem']}" + (f"  \n  was: “{c['was']}”  \n  now: “{c['now']}”" if c.get("corrected") else "  \n  **not corrected: for you to decide**") for c in script["checks"]] + [""]
     for n, ch in enumerate(script["chapters"], 1):
         out += [f"## {n}. {ch['title']}", "", "On screen:"]
-        out += [f"- **{k}. {sc['type']}**: {_scene_text(sc, facts)}" for k, sc in enumerate(ch["scenes"], 1)]
+        out += [f"- **{k}. {sc['type']}**: {_scene_text(sc, facts)}" + (f"  \n  behind it, dimmed: {sc['behind']['id']}" if sc.get("behind") else "") for k, sc in enumerate(ch["scenes"], 1)]
         out += ["", "Said (the picture on screen in brackets):"]
         out += [f"- [{ln['scene']}" + (f".{ln['step']}" if ln["step"] else "") + f"] {ln['text']}" + (f"  *(F{ln['fact']}: {facts[ln['fact'] - 1].get('source', '')})*" if ln.get("fact") else "")
                 for ln in ch["lines"]]
@@ -592,6 +664,10 @@ def script_md(script: dict, facts: list[dict]) -> str:
     return "\n".join(out) + "\n"
 
 
+def found_media(plan: dict) -> dict:
+    return {m["id"]: m for m in plan.get("media", []) if m.get("file") and Path(m["file"]).is_file()}
+
+
 def write_script(plan: dict, data: dict, model: str | None, ask=None) -> dict:
     """The script of an approved plan, checked once against the research."""
     import script_writer as sw
@@ -603,7 +679,7 @@ def write_script(plan: dict, data: dict, model: str | None, ask=None) -> dict:
     if len(chs) != len(plan["chapters"]):
         raise AutocutError(f"the script came back with {len(chs)} chapters for a plan of {len(plan['chapters'])}: try again")
     script = {"title": plan["title"], "promise": plan.get("promise", ""), "language": plan.get("language", "en"), "plan": plan_sig(plan), "status": "draft", "notes": [],
-              "chapters": [clean_chapter(c, p, data["facts"], plan.get("show_sources", "any")) for c, p in zip(chs, plan["chapters"])], "made": time.strftime("%Y-%m-%d %H:%M")}
+              "chapters": [clean_chapter(c, p, data["facts"], plan.get("show_sources", "any"), found_media(plan)) for c, p in zip(chs, plan["chapters"])], "made": time.strftime("%Y-%m-%d %H:%M")}
     check_script(script, data, ask)
     return script
 
@@ -633,7 +709,7 @@ def revise_script(script: dict, notes: list[dict], plan: dict, data: dict, model
         except (TypeError, ValueError, AttributeError):
             continue
         if 1 <= k <= len(script["chapters"]):
-            script["chapters"][k - 1] = clean_chapter(c, plan["chapters"][k - 1], data["facts"], plan.get("show_sources", "any"))
+            script["chapters"][k - 1] = clean_chapter(c, plan["chapters"][k - 1], data["facts"], plan.get("show_sources", "any"), found_media(plan))
     when = time.strftime("%Y-%m-%d %H:%M")
     ch = answer.get("changed") if isinstance(answer, dict) else None
     script["notes"] = (script.get("notes") or []) + [{**n, "when": when} for n in notes]
@@ -694,7 +770,8 @@ STEPS = ("plan", "script", "video")
 def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language: str = "en", kind: str = "auto", hints: str = "", review: bool = False,
          approve: bool = False, notes: list[str] | None = None, fresh: bool = False, model: str | None = None, to: str = "plan", note_for: str = "auto",
          voice: str = "mac", look: str = "clean", aspect: str = "horizontal", captions: str = "auto", music: str | None = None, clips: str = "same",
-         takes: int = 2, speech_pace: str = "reference", show_sources: str = "any", run_code: bool = False) -> dict:
+         takes: int = 2, speech_pace: str = "reference", show_sources: str = "any", run_code: bool = False, media: list[str] | None = None,
+         find_media: bool = True) -> dict:
     """An explainer video for `want`, in its folder, as far as `to` (plan, script, video). `review`:
     the plan, then the script, wait for approval (`approve`); otherwise each counts as approved once
     written. `notes`: changes the creator asks for, applied to the step named by `note_for` (auto:
@@ -743,9 +820,9 @@ def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language:
     if for_script and script is None:
         raise AutocutError("there is no script yet for these notes: they can change the plan (notes for: plan)")
     plan_was_approved = bool(plan and plan.get("status") == "approved")
-    weights = {"research": 0.45, "plan": 0.35, "truth": 0.2}
+    weights = {"research": 0.4, "plan": 0.3, "truth": 0.15, "media": 0.15}
     if to != "plan":
-        weights = {"research": 0.15, "truth": 0.05, "plan": 0.1, "script": 0.2, **({"make": 0.5} if to == "video" else {})}
+        weights = {"research": 0.15, "truth": 0.05, "plan": 0.1, "media": 0.1, "script": 0.2, **({"make": 0.4} if to == "video" else {})}
     ac.progress_plan(weights)
     data = None
     if rj.is_file() and not fresh:
@@ -791,6 +868,17 @@ def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language:
                 log(f"changed: {c}")
         if asked:
             script = None  # (the plan changed: its script is written again)
+    with ac.stage("media"):
+        before = plan_sig(plan)
+        plan["media"] = media_needs(plan) if find_media else []
+        if plan["media"]:
+            import explain_media as xm
+
+            got, wanted = xm.find(plan, folder, media, model)
+            log(f"real pictures and video: {got} of {wanted} found" + (f"; not found: {'; '.join(m['what'][:50] for m in plan['media'] if not m.get('file'))[:300]}" if got < wanted else ""))
+        if script is not None and plan_sig(plan) != before and script.get("plan") == before:
+            script = None  # (other pictures than the script was written for)
+    with ac.stage("plan"):
         if approve or (not review and plan.get("status") != "approved"):
             plan["status"] = "approved"
             plan["approved"] = time.strftime("%Y-%m-%d %H:%M")
@@ -880,6 +968,8 @@ def add_args(p) -> None:
     p.add_argument("--speech-pace", default="reference")
     p.add_argument("--show-sources", default="any", choices=list(SHOW_SOURCES),
                    help="a source's own sentence on screen, marked: from any public page (briefly, with credit), only from official and openly licensed sources, or never")
+    p.add_argument("--media", nargs="*", default=[], help="your own photos and videos (files or folders): looked at and used where they show what the plan wants seen")
+    p.add_argument("--no-media", action="store_true", help="do not look for real photos and video: everything is drawn")
     p.add_argument("--run-code", action="store_true", help="run the script's Python (sandboxed: no network, no files outside a temporary folder) and show the real output")
     p.add_argument("--fresh", action="store_true", help="research and plan again")
     p.add_argument("--model")
@@ -888,4 +978,4 @@ def add_args(p) -> None:
 def run_args(a) -> dict:
     return make(a.want, a.out_dir, minutes=a.minutes, language=a.language, kind=a.kind, hints=a.hints or "", review=a.review, approve=a.approve, notes=a.note,
                 fresh=a.fresh, model=a.model, to=a.to, note_for=a.note_for, voice=a.voice, look=a.look, aspect=a.aspect, captions=a.captions, music=a.music,
-                clips=a.clips, takes=a.takes, speech_pace=a.speech_pace, show_sources=a.show_sources, run_code=a.run_code)
+                clips=a.clips, takes=a.takes, speech_pace=a.speech_pace, show_sources=a.show_sources, run_code=a.run_code, media=a.media, find_media=not a.no_media)

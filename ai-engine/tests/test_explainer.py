@@ -313,3 +313,54 @@ def test_hindi_is_drawn_with_its_letters_joined():
     cap, _ = xd.draw_caption(pen, ["यह", "बग", "है"], 1)
     assert cap.getbbox() is not None
     assert isinstance(font, ImageFont.FreeTypeFont)
+
+
+def test_real_pictures_are_planned_looked_at_and_used_only_when_they_fit(tmp_path):
+    import explain_draw as xd
+    import explain_media as xm
+    from PIL import Image
+
+    plan = ex.clean_plan({"title": "t", "chapters": [
+        {"title": "The lander", "seconds": 30, "media": [{"what": "the lander on the ground", "search": "Vikram lander", "kind": "video", "why": "w"},
+                                                         {"what": "the control room", "search": "ISRO control room", "kind": "photo"}, {"what": "no search"}, "junk"]},
+        {"title": "The maths", "seconds": 30}]}, RESEARCH)
+    assert [m["kind"] for m in plan["chapters"][0]["media"]] == ["video", "photo"] and plan["chapters"][1]["media"] == []
+    plan["media"] = ex.media_needs(plan)
+    assert [(m["id"], m["chapter"]) for m in plan["media"]] == [("m1", 1), ("m2", 1)]
+
+    mine = tmp_path / "mine.png"
+    Image.new("RGB", (1200, 800), (200, 40, 40)).save(mine)
+    seen = {}
+
+    def look(prompt, where):
+        seen["prompt"] = prompt
+        assert (where / "m1.jpg").is_file() and "YOUR OWN FILE" in prompt
+        return {"choices": [{"id": "m1", "take": "A", "why": "the lander"}, {"id": "m2", "take": None, "why": "only rockets, no control room"}]}
+
+    sig = ex.plan_sig(plan)
+    assert xm.find(plan, tmp_path, [str(mine)], search=lambda need: [], look=look) == (1, 2)
+    m1, m2 = plan["media"]
+    assert Path(m1["file"]).is_file() and m1["credit"] == "your own file" and m1["kind"] == "photo" and "file" not in m2 and "control room" in m2["missing"]
+    assert ex.plan_sig(plan) != sig  # (the script is written again for other pictures)
+    md = ex.plan_md({**plan, "promise": "", "audience": "", "status": "draft"} | {"chapters": [dict(c, goal="", hook="", says=[], shows=[], claims=[], ends_on="", how_said="", catch="", clip_title="") for c in plan["chapters"]]})
+    assert "could not find" in md and "found: your own file" in md and "NOT FOUND" in md
+    # found again for the same words: not looked for twice
+    assert xm.find(plan, tmp_path, [], search=lambda need: [], look=lambda *a: {}) == (1, 2)
+    assert plan["media"][0]["file"] == m1["file"]
+
+    # the script may use only what was found: full screen, or dimmed behind a card; never behind code
+    media = ex.found_media(plan)
+    full = ex.clean_scene({"type": "footage", "media": "M1", "caption": "The lander"}, [], "any", media)
+    assert full["file"] == m1["file"] and full["credit"] == "your own file"
+    assert ex.clean_scene({"type": "footage", "media": "m2", "caption": "Control room"}, [], "any", media)["type"] == "card"
+    card = ex.clean_scene({"type": "card", "text": "19 minutes", "behind": "m1"}, [], "any", media)
+    assert card["behind"]["file"] == m1["file"] and ex.clean_scene(card, [], "any", media)["behind"]["id"] == "m1"
+    assert "behind" not in ex.clean_scene({"type": "code", "title": "a.py", "lines": ["x = 1"], "behind": "m1"}, [], "any", media)
+    assert "behind" not in ex.clean_scene({"type": "card", "text": "x", "behind": "m2"}, [], "any", media)
+
+    pen = xd.Pen(1280, 720, "dark")
+    plain = xd.draw_scene(pen, {"type": "card", "text": "19 minutes"}, title="T")[0]
+    backed = xd.draw_scene(pen, card, title="T")[0]
+    assert backed.getpixel((1200, 400))[0] > plain.getpixel((1200, 400))[0] + 15  # (the red photo shows through, dimmed)
+    a, b = xd.draw_scene(pen, full, title="T", t=0.0)[0], xd.draw_scene(pen, full, title="T", t=6.0)[0]
+    assert a.getpixel((640, 300))[0] > 150 and xd.is_live(full) and not xd.is_live(card)

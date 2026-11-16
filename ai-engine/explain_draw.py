@@ -621,18 +621,88 @@ def s_timeline(pen, d, sc, step, focus, fact):
     return []
 
 
-def s_footage(pen, d, sc, step, focus, fact):
-    """A photo filling the picture area, what it is on a dark band, its credit underneath."""
+FRAMES: dict = {}  # a video's frames as small files, made once per run: path -> (folder, how many)
+
+
+def video_frames(path: str) -> tuple[str, int]:
+    """A video's frames as pictures in a temporary folder (30 a second, at most 1280 wide)."""
+    import atexit
+    import shutil
+    import subprocess
+    import tempfile
+
+    if path not in FRAMES:
+        tmp = tempfile.mkdtemp(prefix="ei-frames-")
+        atexit.register(shutil.rmtree, tmp, ignore_errors=True)
+        subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", path, "-vf", "fps=30,scale='min(1280,iw)':-2", "-q:v", "4", f"{tmp}/%05d.jpg"],
+                       capture_output=True, timeout=300)
+        FRAMES[path] = (tmp, len(list(Path(tmp).glob("*.jpg"))))
+    return FRAMES[path]
+
+
+def media_image(pen: Pen, item: dict, t: float):
+    """The picture of a photo or of a video at `t` seconds (a video shorter than its scene holds its last frame). None when the file is gone."""
+    from PIL import Image, ImageOps
+
+    path = str(item.get("file", ""))
+    try:
+        if item.get("kind") == "video":
+            folder, n = video_frames(path)
+            if n == 0:
+                return None
+            return Image.open(f"{folder}/{min(n, max(1, int(t * 30) + 1)):05d}.jpg").convert("RGB")
+        if path not in pen._fonts:
+            im = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+            im.thumbnail((2400, 2400))
+            pen._fonts[path] = im
+        return pen._fonts[path]
+    except (OSError, ValueError):
+        return None
+
+
+def is_live(scene: dict) -> bool:
+    """Whether a scene moves by itself (a video, or a photo slowly pushed in), so it is drawn anew for every frame."""
+    return scene.get("type") == "footage" and bool(scene.get("file")) or (scene.get("behind") or {}).get("kind") == "video"
+
+
+def backdrop(pen: Pen, img, item: dict, t: float) -> None:
+    """A real picture behind a drawn scene: filling the frame, softened and sunk into the look's background so the text stays easy to read."""
+    from PIL import Image, ImageFilter, ImageOps
+
+    photo = media_image(pen, item, t)
+    if photo is None:
+        return
+    key = ("behind", item.get("file"), pen.W, pen.H)
+    if item.get("kind") == "video" or key not in pen._fonts:
+        small = ImageOps.fit(photo, (pen.W // 4, pen.H // 4), Image.BILINEAR).filter(ImageFilter.GaussianBlur(1.2))
+        soft = Image.blend(small.resize((pen.W, pen.H), Image.BILINEAR), Image.new("RGB", (pen.W, pen.H), pen.k["bg"]), 0.62 if sum(pen.k["bg"]) < 380 else 0.74)
+        if item.get("kind") == "video":
+            img.paste(soft)
+            return
+        pen._fonts[key] = soft
+    img.paste(pen._fonts[key])
+
+
+def s_footage(pen, d, sc, step, focus, fact, t: float = 0.0):
+    """A photo (slowly pushed in) or a playing video filling the picture area, what it is on a dark band, its credit underneath."""
     from PIL import Image, ImageOps
 
     box = [pen.m, pen.top, pen.W - pen.m, pen.bottom - pen.px(44)]
     w, h = int(box[2] - box[0]), int(box[3] - box[1])
-    try:
-        photo = ImageOps.fit(ImageOps.exif_transpose(Image.open(sc.get("file", ""))).convert("RGB"), (w, h), Image.LANCZOS, centering=(0.5, 0.4))
-    except (OSError, ValueError):
+    photo = media_image(pen, sc, t)
+    if photo is None:
         return s_card(pen, d, {"text": sc.get("caption") or sc.get("search", ""), "sub": ""}, step, focus, fact)
-    mask = Image.new("L", (w, h), 0)
-    Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=pen.px(22), fill=255)
+    if sc.get("kind") != "video":
+        z = 1.0 + 0.012 * min(t, 12.0)
+        pw, ph = photo.size
+        cw, ch = pw / z, ph / z
+        photo = photo.crop((int((pw - cw) / 2), int((ph - ch) * 0.4), int((pw - cw) / 2 + cw), int((ph - ch) * 0.4 + ch)))
+    photo = ImageOps.fit(photo, (w, h), Image.BILINEAR, centering=(0.5, 0.4))
+    mask = pen._fonts.setdefault(("mask", w, h), None)
+    if mask is None:
+        mask = Image.new("L", (w, h), 0)
+        Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=pen.px(22), fill=255)
+        pen._fonts[("mask", w, h)] = mask
     d.img.paste(photo, (int(box[0]), int(box[1])), mask)
     cap = str(sc.get("caption", ""))
     if cap:
@@ -642,7 +712,7 @@ def s_footage(pen, d, sc, step, focus, fact):
         d.img.paste(band, (int(box[0]), int(box[3]) - bh), Image.composite(band.getchannel("A"), Image.new("L", (w, bh), 0), mask.crop((0, h - bh, w, h))))
         for i, ln in enumerate(lines[:2]):
             d.text((box[0] + pen.px(30), box[3] - bh + pen.px(12) + i * lh), ln, font=f, fill=(255, 255, 255))
-    credit_ = "Photo: " + str(sc.get("credit", ""))
+    credit_ = ("Video: " if sc.get("kind") == "video" else "Photo: ") + str(sc.get("credit", ""))
     cf = pen.font("sans", pen.px(22), credit_)
     while len(credit_) > 12 and d.textlength(credit_, font=cf) > pen.W - 2 * pen.m:
         credit_ = credit_[:-2].rstrip() + "…"
@@ -654,15 +724,25 @@ SCENES = {"footage": s_footage, "card": s_card, "flow": s_flow, "code": s_code, 
           "compare": s_compare, "chart": s_chart, "timeline": s_timeline}
 
 
-def draw_scene(pen: Pen, scene: dict, step: int = 0, focus=(), *, title: str = "", fact: dict | None = None):
-    """(the frame, the boxes of what was just marked). `step`: how far the scene has built up (0: all of it)."""
+def draw_scene(pen: Pen, scene: dict, step: int = 0, focus=(), *, title: str = "", fact: dict | None = None, t: float = 0.0):
+    """(the frame, the boxes of what was just marked). `step`: how far the scene has built up (0: all
+    of it). `t`: seconds the scene has been on screen (a video plays, a photo is slowly pushed in)."""
     from PIL import Image
 
     img = Image.new("RGB", (pen.W, pen.H), pen.k["bg"])
     d = Draw(img)
+    behind = scene.get("behind") if isinstance(scene.get("behind"), dict) else None
+    if behind:
+        backdrop(pen, img, behind, t)
     header(pen, d, title)
     fn = SCENES.get(scene.get("type"), s_card)
-    marks = fn(pen, d, scene, int(step or 0), focus or (), fact) or []
+    marks = (s_footage(pen, d, scene, int(step or 0), focus or (), fact, t) if fn is s_footage else fn(pen, d, scene, int(step or 0), focus or (), fact)) or []
+    if behind and behind.get("credit") and not (scene.get("type") in ("quote", "chart") or fact):
+        note = "Behind: " + str(behind["credit"])
+        cf = pen.font("sans", pen.px(20), note)
+        while len(note) > 12 and d.textlength(note, font=cf) > pen.W - 2 * pen.m:
+            note = note[:-2].rstrip() + "…"
+        d.text((pen.m, pen.bottom - pen.px(30)), note, font=cf, fill=pen.k["soft"])
     if scene.get("type") in ("article", "quote", "chart") or (fact and scene.get("type") == "card"):
         credit(pen, d, fact)
     return img, marks

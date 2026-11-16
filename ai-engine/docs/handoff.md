@@ -297,6 +297,12 @@ is committed and left as it is, off by default. Do not continue either without t
   `sandbox-exec`, no network, writes only in a temp folder; real output replaces what Claude wrote), `footage` scenes (a credited Commons/Openverse
   photo, kept in `media/`), Hindi drawn through AppKit (`explain_draw.shaped`; Pillow here has no raqm). Make Video from Plan takes several plans
   (`--pick 3,7-9`; the panel has tick boxes).
-- Not done yet: video footage (photos only); code other than Python is not run; no sound effects; `voice.speak` logs “emphasis left out (KeyError: 'en')”
+- Real pictures are part of the plan (`explain_media.py`): each chapter's `media` names what should really be seen; candidates come from the
+  creator's own files (`--media`, or `<folder>/media/mine`), Wikimedia Commons, NASA's library and Openverse; Claude looks at a sheet of them
+  per thing (`thumb_studio.ask_claude_seeing`) and takes one only when it truly shows it, with one more round on other search words. Found
+  files live in `<folder>/media`, what is missing is listed in `plan.md` ("Pictures I could not find: can you help?"). The script uses them as
+  `footage` scenes (a photo is slowly pushed in, a video plays, silent, 14 s at most) or `behind` a drawn scene (dimmed). `--no-media` turns it off.
+  Known: a video is judged by one frame, so its kept part can begin on a title card.
+- Not done yet: code other than Python is not run; no sound effects; `voice.speak` logs “emphasis left out (KeyError: 'en')”
   for a Hindi-only voice when a line has an English emphasis word; other tools' Hindi cards (`topic_video.make_card`) still use the unshaped drawing.
 - Same commit: the interface has a Devanagari fallback font (`cjk.rs`), and Voice Clone's helper jobs are quiet (`start_quiet_job`).

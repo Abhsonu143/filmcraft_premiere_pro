@@ -313,6 +313,9 @@ struct Draft {
     /// Explainer Video: whose own words may be shown on screen (any | open | none), and whether the script's Python is run.
     explain_sources: &'static str,
     explain_run_code: bool,
+    /// Explainer Video: whether real photos and video are looked for, and a folder (or file) of the creator's own.
+    explain_find_media: bool,
+    explain_media: String,
     explain_list: Vec<(String, String, String)>,
     explain_listed: bool,
     // TV light sync
@@ -555,6 +558,8 @@ impl Draft {
             explain_clips: "same",
             explain_sources: "any",
             explain_run_code: false,
+            explain_find_media: true,
+            explain_media: String::new(),
             explain_list: Vec::new(),
             explain_listed: false,
             plan_list: Vec::new(),
@@ -743,6 +748,10 @@ impl Draft {
         d.explain_clips = pick("clipsAs", &EXPLAIN_CLIPS.map(|a| a.0), d.explain_clips);
         d.explain_sources = pick("showSources", &EXPLAIN_SOURCES.map(|a| a.0), d.explain_sources);
         d.explain_run_code = flag("runCode", d.explain_run_code);
+        d.explain_find_media = flag("findMedia", d.explain_find_media);
+        if let Some(v) = p.get("ownMedia").and_then(Value::as_str) {
+            d.explain_media = v.to_string();
+        }
         if let Some(v) = p.get("recordings").and_then(Value::as_str) {
             d.tv_folder = v.to_string();
         }
@@ -927,6 +936,8 @@ impl Draft {
         m.insert("clipsAs".into(), json!(self.explain_clips));
         m.insert("showSources".into(), json!(self.explain_sources));
         m.insert("runCode".into(), json!(self.explain_run_code));
+        m.insert("findMedia".into(), json!(self.explain_find_media));
+        m.insert("ownMedia".into(), json!(self.explain_media));
         m.insert("feedback".into(), json!(self.feedback));
         m.insert("recordings".into(), json!(self.tv_folder));
         m.insert("relight".into(), json!(self.relight));
@@ -1421,6 +1432,14 @@ impl Draft {
                 }
                 if self.fresh {
                     a.push("--fresh".into());
+                }
+                if !self.explain_find_media {
+                    a.push("--no-media".into());
+                } else if !self.explain_media.trim().is_empty() {
+                    if !exists(&self.explain_media) {
+                        return Err("The folder of your pictures and videos does not exist.".into());
+                    }
+                    push(&mut a, "--media", self.explain_media.trim());
                 }
                 if self.explain_to != "plan" {
                     if self.explain_sources != "any" {
@@ -3698,6 +3717,7 @@ enum Pick {
     Out,
     StyleSources,
     TvFolder,
+    OwnMedia,
     MusicFolder,
     CharacterAdd,
     CharacterPicture,
@@ -3947,9 +3967,9 @@ fn saved_explainers() -> Vec<(String, String, String)> {
     found.into_iter().map(|f| f.1).take(60).collect()
 }
 
-/// The Explainer Video rows. Returns true when the music file should be chosen.
-fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> bool {
-    let mut choose_music = false;
+/// The Explainer Video rows. Returns what should be chosen from disk (the music, or the folder of own pictures), if asked.
+fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> Option<Pick> {
+    let mut choose = None;
     ui.label("What to explain");
     ui.vertical(|ui| {
         let r = ui.add(
@@ -4045,6 +4065,18 @@ fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Stri
         }
     });
     ui.end_row();
+    ui.label("Real pictures");
+    ui.vertical(|ui| {
+        let r = ui.checkbox(&mut d.explain_find_media, "Find real photos and video for what the plan wants seen (free-licensed, each looked at, credited)");
+        elems.push((format!("{p}.findMedia"), r.rect, d.explain_find_media.to_string()));
+        if d.explain_find_media {
+            if path_row(ui, &mut d.explain_media, &format!("{p}.ownMedia"), "optional: a folder of your own photos and videos, used where they fit", elems) {
+                choose = Some(Pick::OwnMedia);
+            }
+            ui.label(egui::RichText::new("What could not be found is listed in plan.md, so you can add your own and run it again.").small().weak());
+        }
+    });
+    ui.end_row();
     if d.explain_to != "plan" {
         ui.label("Source pages");
         combo_row(ui, &mut d.explain_sources, &EXPLAIN_SOURCES, &format!("{p}.showSources"), elems);
@@ -4079,7 +4111,9 @@ fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Stri
             ui.end_row();
         }
         ui.label("Music (optional)");
-        choose_music = path_row(ui, &mut d.music, &format!("{p}.music"), "a song, or any video: its sound is laid quietly under the voice", elems);
+        if path_row(ui, &mut d.music, &format!("{p}.music"), "a song, or any video: its sound is laid quietly under the voice", elems) {
+            choose = Some(Pick::Music);
+        }
         ui.end_row();
         ui.label("Look");
         combo_row(ui, &mut d.explain_look, &EXPLAIN_LOOKS, &format!("{p}.design"), elems);
@@ -4098,7 +4132,7 @@ fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(Stri
     let r = ui.checkbox(&mut d.fresh, "Research and plan again (drops the plan and script of this video)");
     elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
     ui.end_row();
-    choose_music
+    choose
 }
 
 /// The optional sound design rows. Returns true when the music folder should be chosen.
@@ -4638,8 +4672,8 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         Kind::Repair => {}
                         Kind::PlanMake => plan_rows(ui, &mut d, &p, &mut elems),
                         Kind::Explain => {
-                            if explain_rows(ui, &mut d, &p, &mut elems) {
-                                pick = Some(Pick::Music);
+                            if let Some(asked) = explain_rows(ui, &mut d, &p, &mut elems) {
+                                pick = Some(asked);
                             }
                         }
                         Kind::Script => {
@@ -5342,6 +5376,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
             Pick::CharacterPicture => {
                 if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f("Picture", &["png", "jpg", "jpeg", "webp", "heic", "tif", "tiff"])) {
                     d.ch_picture = f;
+                }
+            }
+            Pick::OwnMedia => {
+                if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
+                    d.explain_media = dir;
                 }
             }
             Pick::TvFolder => {
@@ -7538,6 +7577,11 @@ mod tests {
             Draft::from_params(Kind::Explain, &json!({"topic": "x", "voice": "abhay", "design": "dark", "explainCaptions": "words", "aspect": "vertical"}));
         let a = v.engine_args().unwrap().join(" ");
         assert!(a.ends_with("--voice abhay --takes 2 --speech-pace relaxed --look dark --aspect vertical --captions words --clips same"), "{a}");
+        let mut m = Draft::from_params(Kind::Explain, &json!({"topic": "x", "to": "plan", "findMedia": false, "ownMedia": "/nowhere"}));
+        assert!(m.engine_args().unwrap().contains(&"--no-media".to_string()));
+        assert!(Draft::from_params(Kind::Explain, &json!({"topic": "x", "to": "plan", "ownMedia": "/nowhere"})).engine_args().is_err());
+        let mut m = Draft::from_params(Kind::Explain, &json!({"topic": "x", "to": "plan", "ownMedia": "/tmp"}));
+        assert!(m.engine_args().unwrap().join(" ").contains("--media /tmp"));
         let mut o = Draft::from_params(Kind::Explain, &json!({"topic": "x", "to": "script", "showSources": "open", "runCode": true}));
         assert!(o.engine_args().unwrap().join(" ").ends_with("--review --show-sources open --run-code"));
         assert!(Draft::from_params(Kind::Explain, &json!({"topic": " "})).engine_args().is_err());
