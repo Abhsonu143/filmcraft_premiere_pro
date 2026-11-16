@@ -118,21 +118,38 @@ Answer with only this JSON:
  "publish": {{"title": "...", "description": "2-4 sentences", "tags": ["..."]}}}}"""
 
 
-def revise_prompt(essay: dict, notes: str, details: list[str]) -> str:
-    return f"""The creator read the plan of their narrated video essay and wants changes. Make exactly those changes and nothing else: a
-chapter no note is about stays as it is. The rules of the beats stay the same ("say" with its "show" shots, or "play" a line of the game
-that is in the stretches below, at its time).
+def revise_prompt(essay: dict, notes: str, details: list[str], made: str = "") -> str:
+    video = f"""
+## The video as it was made (the creator's times are times in THIS video; each row is one beat with its time in the video)
+{made}
+""" if made else ""
+    return f"""The creator read the plan of their narrated video essay{' and watched the video made from it' if made else ''} and wants changes.
+Make exactly those changes and nothing else: a chapter or beat no note is about stays as it is, word for word. The rules of the beats
+stay the same ("say" with its "show" shots, or "play" a line of the game that is in the stretches below, at its time).
 
 ## The creator's notes
 {notes.strip()}
 
+A note may name a time in the video and what is wrong there: the picture, the sound, or the captions. Find the beat(s) at that time
+in the table below and fix that:
+- the picture: change that beat's "show" (another moment from the stretches below that fits the line; never seconds already shown);
+- what is said: change that beat's "say" (the voice is then spoken again), or drop or move the beat;
+- the game's line (cut off, the wrong line, starts late): change that "play"'s start and end to the line's times in the stretches below;
+- the sound: a "say" beat may carry "game_db" (how loud the game is under the voice there: -60 silent, -24 usual, -12 clearly heard);
+  a "play" beat may carry "gain_db" (-12 to 12: quieter or louder than usual);
+- the captions: a "say" or a "play" beat may carry "caption": the text to show there instead (a wrong word, a misspelt name), or ""
+  for none. The spoken words do not change with it.
+If a note cannot be done with what the stretches below hold, do the nearest thing that serves what the creator wants and say so
+plainly in "changed".
+
 ## The essay now
 {json.dumps({k: essay.get(k) for k in ("title", "thesis", "chapters", "doubts", "publish")}, ensure_ascii=False, indent=1)}
-
+{video}
 ## The stretches of the recordings it may use (every 5 seconds: time, action, what is on screen; every line said with its time)
 {chr(10).join(details)}
 
-Answer with only the whole essay again as JSON in the same form, with one more field: "changed": one short sentence per change you made."""
+Answer with only the whole essay again as JSON in the same form, with one more field: "changed": one short sentence per change you
+made (and per thing you did differently from what was asked, with the reason), in plain English for the creator."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -176,6 +193,15 @@ def _shot(s, lib) -> dict | None:
     return {"r": n, "start": round(a, 2), "what": " ".join(str(s.get("what", "")).split())[:160]}
 
 
+def _num(v) -> float | None:
+    """A finite number, or None."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and abs(f) != float("inf") and not isinstance(v, bool) else None
+
+
 def clean_essay(raw: dict, lib) -> dict:
     """The essay as the next steps can rely on it: every shot inside a recording, every played
     stretch moved to whole lines of the game and short enough, no empty beats."""
@@ -204,11 +230,21 @@ def clean_essay(raw: dict, lib) -> dict:
                 e = min(e, a + HARD_PLAY, lib.duration(n))
                 if e - a < 1.0:
                     continue
-                beats.append({"play": {"r": n, "start": round(a, 2), "end": round(e, 2), "line": " ".join(d["text"].strip() for d in said) or " ".join(str(p.get("line", "")).split())[:300],
-                                       "who": str(p.get("who", "")).strip()[:60], "heard": bool(said)}})
+                play = {"r": n, "start": round(a, 2), "end": round(e, 2), "line": " ".join(d["text"].strip() for d in said) or " ".join(str(p.get("line", "")).split())[:300],
+                        "who": str(p.get("who", "")).strip()[:60], "heard": bool(said)}
+                if _num(p.get("gain_db")) is not None:
+                    play["gain_db"] = round(min(12.0, max(-12.0, _num(p.get("gain_db")))), 1)
+                if isinstance(p.get("caption"), str):
+                    play["caption"] = " ".join(p["caption"].split())[:300]
+                beats.append({"play": play})
             elif str(b.get("say", "")).strip():
                 shots = [s for s in (_shot(s, lib) for s in (b.get("show") if isinstance(b.get("show"), list) else [b.get("show")]) if isinstance(s, dict)) if s][:2]
-                beats.append({"say": " ".join(str(b["say"]).split())[:400], "emotion": str(b.get("emotion", "Neutral")).strip().title()[:20] or "Neutral", "show": shots})
+                say = {"say": " ".join(str(b["say"]).split())[:400], "emotion": str(b.get("emotion", "Neutral")).strip().title()[:20] or "Neutral", "show": shots}
+                if _num(b.get("game_db")) is not None:
+                    say["game_db"] = round(min(0.0, max(-60.0, _num(b.get("game_db")))), 1)
+                if isinstance(b.get("caption"), str):
+                    say["caption"] = " ".join(b["caption"].split())[:400]
+                beats.append(say)
         if beats:
             chapters.append({"title": str(c.get("title", "")).strip()[:120] or f"Part {len(chapters) + 1}", "beats": beats})
     if not any("say" in b for c in chapters for b in c["beats"]):
@@ -225,7 +261,7 @@ def clean_essay(raw: dict, lib) -> dict:
     pub = raw.get("publish") if isinstance(raw.get("publish"), dict) else {}
     return {"title": str(raw.get("title", "")).strip()[:140], "chapters": chapters,
             "doubts": [" ".join(str(d).split())[:500] for d in raw.get("doubts") or [] if str(d).strip()][:10],
-            "changed": [" ".join(str(d).split())[:200] for d in raw.get("changed") or [] if str(d).strip()][:12],
+            "changed": [" ".join(str(d).split())[:400] for d in raw.get("changed") or [] if str(d).strip()][:12],
             "publish": {"title": str(pub.get("title", "")).strip()[:140], "description": str(pub.get("description", "")).strip()[:1500],
                         "tags": [str(t).strip()[:40] for t in pub.get("tags") or [] if str(t).strip()][:20]}}
 
@@ -280,12 +316,13 @@ def build(essay: dict, segments: list[dict], voice_seconds: float, lib, wav: str
     """The video as pieces. `segments`: the spoken lines' times in the voice file, one per "say" in
     order. A spoken line is shown over its shots for exactly as long as it is said (its pause
     included), with the game's sound at `game_db`; a played stretch is shown whole with its own
-    sound. Returns {"pieces", "voice", "cues", "chapters", "seconds"}."""
+    sound. Returns {"pieces", "voice", "cues", "chapters", "beats", "seconds"}."""
     mine = says(essay)
     if len(segments) != len(mine):
         raise AutocutError(f"the voice has {len(segments)} lines and the essay {len(mine)}: speak it again")
     under = 0.0 if game_db <= -60 else 10 ** (game_db / 20)
-    pieces, voice, cues, chapters, t, k = [], [], [], [], 0.0, 0
+    pieces, voice, cues, chapters, beats, t, k = [], [], [], [], [], 0.0, 0
+    level = lambda db: 0.0 if db <= -60 else 10 ** (db / 20)
     used: dict[int, list[tuple[float, float]]] = {}
 
     def free(n: int, a: float, d: float) -> float:
@@ -303,10 +340,15 @@ def build(essay: dict, segments: list[dict], voice_seconds: float, lib, wav: str
             if "play" in b:
                 p = b["play"]
                 d = p["end"] - p["start"]
-                pieces.append({"src": lib.get(p["r"])["path"], "start": p["start"], "seconds": d, "gain": 1.0, "match": True, "kind": "play", "r": p["r"]})
+                pieces.append({"src": lib.get(p["r"])["path"], "start": p["start"], "seconds": d, "gain": level(p.get("gain_db", 0.0)), "match": True, "kind": "play", "r": p["r"]})
                 used.setdefault(p["r"], []).append((p["start"], p["end"]))
-                for ln in lib.lines(p["r"], p["start"], p["end"], mostly=True):
-                    cues.append({"start": round(t + max(0.0, ln["start"] - p["start"]), 2), "end": round(t + min(d, ln["end"] - p["start"]), 2), "text": ln["text"].strip(), "game": True})
+                if "caption" in p:
+                    if p["caption"]:
+                        cues.append({"start": round(t + 0.2, 2), "end": round(t + d - 0.2, 2), "text": p["caption"], "game": True})
+                else:
+                    for ln in lib.lines(p["r"], p["start"], p["end"], mostly=True):
+                        cues.append({"start": round(t + max(0.0, ln["start"] - p["start"]), 2), "end": round(t + min(d, ln["end"] - p["start"]), 2), "text": ln["text"].strip(), "game": True})
+                beats.append({"chapter": len(chapters), "start": round(t, 2), "end": round(t + d, 2), "kind": "play", "text": p.get("line", ""), "from": f"R{p['r']} {gp.hms(p['start'])}"})
                 t += d
                 continue
             seg = segments[k]
@@ -315,18 +357,31 @@ def build(essay: dict, segments: list[dict], voice_seconds: float, lib, wav: str
             d = max(0.4, e - a)
             voice.append((wav, a, d, t))
             said_for = max(0.3, min(d, float(seg.get("end", e)) - a))
-            cues.append({"start": round(t, 2), "end": round(t + said_for, 2), "text": b["say"], "game": False})
+            if b.get("caption", b["say"]):
+                cues.append({"start": round(t, 2), "end": round(t + said_for, 2), "text": b.get("caption", b["say"]), "game": False})
+            mine_db = level(b["game_db"]) if "game_db" in b else under
             shots = b["show"] or [{"r": lib.items[0]["n"], "start": 0.0, "what": ""}]
             if len(shots) > 1 and d < 3.2:
                 shots = shots[:1]  # (too short a line for two pictures)
             each = d / len(shots)
             for s in shots:
                 st = free(s["r"], lib.lit(s["r"], s["start"], each), each)
-                pieces.append({"src": lib.get(s["r"])["path"], "start": round(st, 2), "seconds": each, "gain": under, "kind": "say", "r": s["r"]})
+                pieces.append({"src": lib.get(s["r"])["path"], "start": round(st, 2), "seconds": each, "gain": mine_db, "kind": "say", "r": s["r"]})
                 used.setdefault(s["r"], []).append((st, st + each))
+            beats.append({"chapter": len(chapters), "start": round(t, 2), "end": round(t + d, 2), "kind": "say", "text": b["say"],
+                          "from": "; ".join(f"R{s['r']} {gp.hms(s['start'])} {s.get('what', '')}".strip() for s in shots)})
             t += d
             k += 1
-    return {"pieces": pieces, "voice": voice, "cues": cues, "chapters": chapters, "seconds": t}
+    return {"pieces": pieces, "voice": voice, "cues": cues, "chapters": chapters, "beats": beats, "seconds": t}
+
+
+def made_text(timeline: dict) -> str:
+    """The made video beat by beat, for a revision: its time in the video, whose line it is, where its picture is from."""
+    rows = []
+    for b in timeline.get("beats") or []:
+        who = "THE GAME" if b.get("kind") == "play" else "voice"
+        rows.append(f"[{clock(b['start'])}–{clock(b['end'])}] chapter {b.get('chapter', '?')} · {who}: {str(b.get('text', ''))[:160]}  (picture: {str(b.get('from', ''))[:160]})")
+    return "\n".join(rows)
 
 
 def cue_words(cues: list[dict]) -> list[dict]:
@@ -437,7 +492,13 @@ def make(idea: str, plans: list[str], out_dir: str | None = None, *, minutes: fl
                          made=time.strftime("%Y-%m-%d %H:%M"))
         elif notes.strip():
             log(f"your notes: {notes.strip()[:200]}")
-            new = clean_essay(sw.extract_json(sw.ask_claude(revise_prompt(essay, notes, details_for(outline, lib)), model, timeout=1200)), lib)
+            made = ""
+            try:
+                made = made_text(json.loads((folder / "timeline.json").read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                pass  # (no video was made yet: the notes are about the plan)
+            new = clean_essay(sw.extract_json(sw.ask_claude(revise_prompt(essay, notes, details_for(outline, lib), made), model, timeout=1200)), lib)
+            (folder / "essay.previous.json").write_text(json.dumps(essay, ensure_ascii=False, indent=1), encoding="utf-8")  # (to go back to)
             for c in new["changed"]:
                 log(f"changed: {c}")
             essay = {**essay, **{k: v for k, v in new.items() if v or k == "changed"}, "noted": (essay.get("noted") or []) + [{"when": time.strftime("%Y-%m-%d %H:%M"), "text": notes.strip()[:1000]}]}
@@ -450,7 +511,8 @@ def make(idea: str, plans: list[str], out_dir: str | None = None, *, minutes: fl
     for d in essay.get("doubts", [])[:6]:
         log(f"  to check: {d[:200]}")
     outputs = [str(folder / "essay.md"), str(ej)]
-    result = {"outputs": outputs, "out_dir": str(folder), "title": essay["title"], "lines": len(says(essay)), "plays": n_play, "video": None}
+    result = {"outputs": outputs, "out_dir": str(folder), "title": essay["title"], "lines": len(says(essay)), "plays": n_play, "video": None,
+              "changed": essay.get("changed", []) if notes.strip() else []}
     if to == "plan":
         log(f"the plan is ready to read: {folder / 'essay.md'}")
         return result
@@ -493,7 +555,7 @@ def make(idea: str, plans: list[str], out_dir: str | None = None, *, minutes: fl
             ass_path.unlink(missing_ok=True)
         out.with_suffix(".srt").write_text(ac.to_srt([{"start": c["start"], "end": c["end"], "text": c["text"]} for c in b["cues"]]), encoding="utf-8")
         (folder / "publish.txt").write_text(publish_text(essay, b["chapters"]), encoding="utf-8")
-        (folder / "timeline.json").write_text(json.dumps({"pieces": b["pieces"], "chapters": b["chapters"], "cues": b["cues"]}, ensure_ascii=False, indent=1), encoding="utf-8")
+        (folder / "timeline.json").write_text(json.dumps({"pieces": b["pieces"], "chapters": b["chapters"], "beats": b["beats"], "cues": b["cues"]}, ensure_ascii=False, indent=1), encoding="utf-8")
     log(f"done in {time.time() - t0:.0f}s: {out}")
     return {**result, "outputs": [str(out), str(out.with_suffix(".srt")), str(folder / "publish.txt")] + outputs, "video": str(out), "seconds": round(b["seconds"], 1)}
 

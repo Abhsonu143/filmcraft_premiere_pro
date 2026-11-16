@@ -107,6 +107,20 @@ def test_lines_get_their_shots_for_as_long_as_they_are_said(tmp_path):
     assert pc.frames_of(b["pieces"], 30) == [90, 168, 90, 60] and b["chapters"] == [{"title": "The choice", "start": 0.0}]
     with pytest.raises(AutocutError):
         es.build(e, segs[:1], 6.0, lib, "voice.wav")
+    # corrections of one beat: the game's level under a line, a played line's level, and captions of their own
+    fixed = json.loads(json.dumps(RAW))
+    fixed["chapters"][0]["beats"][0].update(game_db=-200, caption="Atsu saves no island.")
+    fixed["chapters"][0]["beats"][1]["play"].update(gain_db=6, caption="")
+    fixed["chapters"][0]["beats"][2].update(game_db="loud", caption=7)
+    f = es.clean_essay(fixed, lib)
+    fb = f["chapters"][0]["beats"]
+    assert fb[0]["game_db"] == -60.0 and fb[1]["play"]["gain_db"] == 6.0 and "game_db" not in fb[2] and "caption" not in fb[2]
+    assert es.clean_essay(f, lib)["chapters"] == f["chapters"] and es.said_sig(f) == es.said_sig(e)  # (the voice is not spoken again for these)
+    g = es.build(f, segs, 6.0, lib, "voice.wav", game_db=-20)
+    assert [round(p["gain"], 2) for p in g["pieces"]] == [0.0, 2.0, 0.1, 1.0]
+    assert [c["text"] for c in g["cues"]][:2] == ["Atsu saves no island.", "She answers to no one."]  # (the played line shows no caption now)
+    made = es.made_text(g)
+    assert "[0:00–0:03] chapter 1 · voice: Atsu is not saving an island." in made and "[0:03–0:08] chapter 1 · THE GAME: You chose vengeance." in made and "R1 0:00:20" in made
     words = es.cue_words([c for c in b["cues"] if not c["game"]])
     assert words[0]["word"] == " Atsu" and words[-1]["end"] <= 8.6 + 2.0 + 1e-6
     assert "0:00 The choice" in es.publish_text(e, b["chapters"]) and "Tags: a, b" in es.publish_text(e, b["chapters"])
@@ -166,8 +180,14 @@ def test_a_plan_is_written_and_kept_and_changed_with_notes(tmp_path, monkeypatch
     # again: nothing is asked again; with notes: only the revision
     es.make("", [], str(out), to="plan")
     assert len(asked) == 2
-    es.make("", [], str(out), to="plan", notes="open on the duel")
+    r2 = es.make("", [], str(out), to="plan", notes="open on the duel")
     assert len(asked) == 3 and json.loads((out / "essay.json").read_text())["title"] == "Revenge or Honor (2)"
+    assert r2["changed"] == ["opens on the duel"] and "as it was made" not in asked[2]
+    assert json.loads((out / "essay.previous.json").read_text())["title"] == "Revenge or Honor"  # (what it was, to go back to)
+    # after a video was made, notes can name times in it: the revision is given the video beat by beat
+    (out / "timeline.json").write_text(json.dumps({"beats": [{"chapter": 1, "start": 0.0, "end": 3.0, "kind": "say", "text": "Atsu is not saving an island.", "from": "R1 0:00:20"}]}))
+    es.make("", [], str(out), to="plan", notes="0:00 to 0:03, the sound: the game is too loud under my voice")
+    assert "as it was made" in asked[3] and "[0:00–0:03] chapter 1 · voice: Atsu is not saving an island." in asked[3] and "game_db" in asked[3]
     with pytest.raises(AutocutError):
         es.make("", [], str(out), to="video")  # (no voice chosen)
     with pytest.raises(AutocutError):

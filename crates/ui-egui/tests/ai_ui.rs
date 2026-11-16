@@ -218,7 +218,10 @@ fn ai_menu_and_dialogs() {
         ("hooks", &["niches", "countries", "claude", "run"]),
         ("repair", &["input", "input.choose", "run"]),
         ("planMake", &["input", "input.choose", "reload", "pick", "request", "hook", "fresh", "fix", "captionFix", "check", "run"]),
-        ("essay", &["input", "input.choose", "topic", "minutes", "language.hi", "to.plan", "to.video", "notes", "fresh", "run"]),
+        (
+            "essay",
+            &["input", "input.choose", "morePlans", "morePlans.add", "topic", "minutes", "language.hi", "to.plan", "to.video", "notes", "fresh", "out", "run"],
+        ),
         (
             "explain",
             &[

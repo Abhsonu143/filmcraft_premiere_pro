@@ -29,7 +29,7 @@
 //!   check?}`: the video of a plan from Plan Videos, or of a new plan written for what is asked; the result (`.otio` + `.srt`) opens in
 //!   the timeline. `fix`: what is wrong with the video made before (corrected in the plan, then made again); `captionFix`: caption words
 //!   corrected in this and every later make; `check`: nothing is made, the finished video is checked (`check.txt` next to it).
-//! - `ai.essay {input (plans.json of Plan Videos), topic (the idea: a question, a comparison, an argument), seconds?=360, language?,
+//! - `ai.essay {input (plans.json of Plan Videos), morePlans? (more plans files, to use several games together), out? (the essay's folder), topic (the idea: a question, a comparison, an argument), seconds?=360, language?,
 //!   essayTo?=plan|video, essayNotes?, voice?, takes?, speechPace?, tallFrame?, frameOpacity?, frameBlur?, essayCaptions?=voice|all|none,
 //!   gameSound?=-24 (dB under the voice), music?, fresh?}`: a narrated video essay from the analysed recordings (nothing is analysed
 //!   again): Claude lays out the argument, picks the shots for each spoken line and the game's own lines to play in the clear.
@@ -302,6 +302,8 @@ struct Draft {
     frame_blur: f64,
     /// Video Essay from Recordings: how far to go (plan | video), notes on the plan, whose lines get captions, the game's level under the voice (dB).
     essay_to: &'static str,
+    /// More plans files (one per line): their recordings are used together with the first file's.
+    essay_more: String,
     essay_notes: String,
     essay_captions: &'static str,
     essay_game_db: f64,
@@ -568,6 +570,7 @@ impl Draft {
             frame_opacity: 35.0,
             frame_blur: 50.0,
             essay_to: "plan",
+            essay_more: String::new(),
             essay_notes: String::new(),
             essay_captions: "voice",
             essay_game_db: -24.0,
@@ -767,6 +770,11 @@ impl Draft {
         d.essay_captions = pick("essayCaptions", &ESSAY_CAPTIONS.map(|a| a.0), d.essay_captions);
         if let Some(v) = p.get("essayNotes").and_then(Value::as_str) {
             d.essay_notes = v.to_string();
+        }
+        match p.get("morePlans") {
+            Some(Value::Array(a)) => d.essay_more = a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"),
+            Some(Value::String(v)) => d.essay_more = v.clone(),
+            _ => {}
         }
         if let Some(v) = p.get("gameSound").and_then(Value::as_f64) {
             d.essay_game_db = v.clamp(-60.0, 0.0).round();
@@ -980,6 +988,7 @@ impl Draft {
         m.insert("frameBlur".into(), json!(self.frame_blur));
         m.insert("essayTo".into(), json!(self.essay_to));
         m.insert("essayNotes".into(), json!(self.essay_notes));
+        m.insert("morePlans".into(), json!(essay_more_files(&self.essay_more)));
         m.insert("essayCaptions".into(), json!(self.essay_captions));
         m.insert("gameSound".into(), json!(self.essay_game_db));
         m.insert("fresh".into(), json!(self.fresh));
@@ -1551,6 +1560,17 @@ impl Draft {
                     return Err("Choose the voice for the video (or go only as far as the plan).".into());
                 }
                 a = vec!["essay".into(), self.topic.trim().into(), "--plans".into(), self.input.trim().into()];
+                for f in essay_more_files(&self.essay_more) {
+                    if !exists(&f) {
+                        return Err(format!("This plans file does not exist: {f}"));
+                    }
+                    if f != self.input.trim() {
+                        a.push(f);
+                    }
+                }
+                if !self.out.trim().is_empty() {
+                    push(&mut a, "--out-dir", self.out.trim());
+                }
                 push(&mut a, "--minutes", &format!("{}", (self.seconds / 6.0).round() / 10.0));
                 push(&mut a, "--language", self.language);
                 push(&mut a, "--to", self.essay_to);
@@ -3639,6 +3659,133 @@ fn edit_job(ctx: &egui::Context, id: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// What is wrong at one time of a finished video.
+#[derive(Clone, Default)]
+struct FixRow {
+    from: String,
+    to: String,
+    what: &'static str,
+    issue: String,
+}
+
+/// "Fix with Claude" of a finished job in AI Jobs: what is wrong with the whole video, and at which times.
+#[derive(Clone, Default)]
+struct FixForm {
+    open: bool,
+    general: String,
+    rows: Vec<FixRow>,
+}
+
+const FIX_WHAT: [(&str, &str); 3] = [("picture", "Picture"), ("sound", "Sound"), ("captions", "Captions")];
+
+fn fix_form_id(job: u64) -> egui::Id {
+    egui::Id::new(("ei-ai-fix", job))
+}
+
+/// A time as typed (`75`, `1:15`, `0:01:15`) in seconds.
+fn clock_seconds(text: &str) -> Option<f64> {
+    let parts: Vec<&str> = text.trim().split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut total = 0.0;
+    for (k, part) in parts.iter().enumerate() {
+        let v: f64 = part.trim().parse().ok()?;
+        if !v.is_finite() || v < 0.0 || (k > 0 && v >= 60.0) {
+            return None;
+        }
+        total = total * 60.0 + v;
+    }
+    Some(total)
+}
+
+/// Whole seconds as m:ss (or h:mm:ss).
+fn clock_text(secs: f64) -> String {
+    let t = secs.max(0.0).round() as u64;
+    if t >= 3600 { format!("{}:{:02}:{:02}", t / 3600, t % 3600 / 60, t % 60) } else { format!("{}:{:02}", t / 60, t % 60) }
+}
+
+/// The notes a correction is asked with: what is wrong with the whole video, then one line per time.
+fn fix_text(f: &FixForm) -> Result<String, String> {
+    let mut lines: Vec<String> = f.general.lines().map(|l| l.trim().trim_start_matches('-').trim()).filter(|l| !l.is_empty()).map(str::to_string).collect();
+    for (k, r) in f.rows.iter().enumerate() {
+        let issue = r.issue.split_whitespace().collect::<Vec<_>>().join(" ");
+        if issue.is_empty() && r.from.trim().is_empty() && r.to.trim().is_empty() {
+            continue; // (an empty row)
+        }
+        if issue.is_empty() {
+            return Err(format!("Time {}: say what is wrong there.", k + 1));
+        }
+        let from = clock_seconds(&r.from).ok_or(format!("Time {}: write where it begins as minutes:seconds, like 1:15.", k + 1))?;
+        let what = FIX_WHAT.iter().find(|w| w.0 == r.what).map_or("picture", |w| w.0);
+        if r.to.trim().is_empty() {
+            lines.push(format!("At {} of the video, the {what}: {issue}", clock_text(from)));
+        } else {
+            let to = clock_seconds(&r.to).ok_or(format!("Time {}: write where it ends as minutes:seconds, like 1:30.", k + 1))?;
+            if to <= from {
+                return Err(format!("Time {}: it ends before it begins.", k + 1));
+            }
+            lines.push(format!("From {} to {} of the video, the {what}: {issue}", clock_text(from), clock_text(to)));
+        }
+    }
+    if lines.is_empty() {
+        return Err("Say what is wrong, for the whole video or at a time in it.".into());
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Whether a finished job of this kind can be corrected from AI Jobs (its tool takes notes and makes it again).
+fn can_fix(kind: Option<Kind>) -> bool {
+    matches!(kind, Some(Kind::Essay | Kind::PlanMake | Kind::Explain | Kind::Topic | Kind::Music))
+}
+
+/// The settings a finished job is made again with, carrying the creator's notes on what was wrong.
+fn fix_draft(kind: Kind, params: &Value, out_dir: Option<&str>, notes: &str) -> Result<Draft, String> {
+    let mut d = Draft::from_params(kind, params);
+    d.fresh = false; // (what is still right is kept)
+    d.retrying = true;
+    match kind {
+        Kind::Essay => {
+            d.essay_notes = notes.to_string();
+            if d.out.trim().is_empty()
+                && let Some(o) = out_dir
+            {
+                d.out = o.to_string(); // (the same essay, wherever it was made)
+            }
+        }
+        Kind::PlanMake => {
+            d.plan_fix = notes.to_string();
+            d.plan_check = false;
+        }
+        Kind::Explain => d.explain_notes = notes.to_string(),
+        Kind::Topic | Kind::Music => d.feedback = notes.to_string(),
+        _ => return Err("This kind of job cannot be corrected here yet: use Edit & Retry.".into()),
+    }
+    Ok(d)
+}
+
+/// Make a finished job again with the creator's notes. It waits in the queue when another job is running.
+fn fix_job(id: u64, notes: &str) -> Result<String, String> {
+    let (kind, params, steps, out_dir) = with_job(id, |j| {
+        (j.status == Status::Done).then(|| (j.kind, j.params.clone(), j.steps.clone(), j.result.get("out_dir").and_then(Value::as_str).map(str::to_string)))
+    })
+    .flatten()
+    .ok_or("That job is not finished, or no longer listed.")?;
+    let kind = kind.ok_or("This job has no settings to make it again with.")?;
+    let params = params
+        .or_else(|| params_from_args(kind.id(), steps.first().and_then(|s| s.get(2..)).unwrap_or_default()))
+        .ok_or("EI did not keep this job's settings: start it again from the AI menu.")?;
+    let mut d = fix_draft(kind, &params, out_dir.as_deref(), notes)?;
+    let busy = jobs().lock().unwrap_or_else(PoisonError::into_inner).iter().any(|j| j.status == Status::Running && !j.quiet);
+    if busy {
+        let n = queue_draft(&mut d)?;
+        Ok(format!("The correction waits in the queue ({n} waiting): another job is running"))
+    } else {
+        run_draft(&mut d)?;
+        Ok("Claude is correcting it: what it changed is listed in the new job's log".into())
+    }
+}
+
 /// Put a draft in the queue instead of running it now. Returns the number waiting.
 fn queue_draft(d: &mut Draft) -> Result<usize, String> {
     if d.kind == Kind::Voice {
@@ -3849,6 +3996,7 @@ enum Pick {
     StyleSources,
     TvFolder,
     OwnMedia,
+    MorePlans,
     MusicFolder,
     CharacterAdd,
     CharacterPicture,
@@ -4098,9 +4246,30 @@ fn saved_explainers() -> Vec<(String, String, String)> {
     found.into_iter().map(|f| f.1).take(60).collect()
 }
 
-/// The Video Essay from Recordings rows. Returns true when the music file should be chosen.
-fn essay_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> bool {
-    let mut choose_music = false;
+/// The plans files written one per line, as a list.
+fn essay_more_files(text: &str) -> Vec<String> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()
+}
+
+/// The Video Essay from Recordings rows. Returns what should be chosen (the music, one more plans file).
+fn essay_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> Option<Pick> {
+    let mut choose = None;
+    ui.label("More plans files");
+    ui.vertical(|ui| {
+        let r = ui.add(
+            egui::TextEdit::multiline(&mut d.essay_more)
+                .hint_text("optional: the plans.json of another game (or of more recordings), one per line; the essay can then use them together")
+                .desired_rows(2)
+                .desired_width(430.0),
+        );
+        elems.push((format!("{p}.morePlans"), r.rect, d.essay_more.clone()));
+        let b = ui.small_button("Add a Plans File…");
+        elems.push((format!("{p}.morePlans.add"), b.rect, "Add a Plans File…".into()));
+        if b.clicked() {
+            choose = Some(Pick::MorePlans);
+        }
+    });
+    ui.end_row();
     ui.label("The idea");
     let r = ui.add(
         egui::TextEdit::multiline(&mut d.topic)
@@ -4201,14 +4370,16 @@ fn essay_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String
         });
         ui.end_row();
         ui.label("Music (optional)");
-        choose_music = path_row(ui, &mut d.music, &format!("{p}.music"), "a song, or any video: its sound is laid quietly under the voice", elems);
+        if path_row(ui, &mut d.music, &format!("{p}.music"), "a song, or any video: its sound is laid quietly under the voice", elems) {
+            choose = Some(Pick::Music);
+        }
         ui.end_row();
     }
     ui.label("Start over");
     let r = ui.checkbox(&mut d.fresh, "Plan it anew (drops the plan of this idea)");
     elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
     ui.end_row();
-    choose_music
+    choose
 }
 
 /// The Explainer Video rows. Returns what should be chosen from disk (the music, or the folder of own pictures), if asked.
@@ -4917,8 +5088,8 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         Kind::Repair => {}
                         Kind::PlanMake => plan_rows(ui, &mut d, &p, &mut elems),
                         Kind::Essay => {
-                            if essay_rows(ui, &mut d, &p, &mut elems) {
-                                pick = Some(Pick::Music);
+                            if let Some(asked) = essay_rows(ui, &mut d, &p, &mut elems) {
+                                pick = Some(asked);
                             }
                         }
                         Kind::Explain => {
@@ -5517,14 +5688,17 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             CharacterAsk::Nothing => {}
                         }
                     }
-                    if !matches!(d.kind, Kind::Voice | Kind::Hooks | Kind::Repair | Kind::PlanMake | Kind::Essay) {
-                        let folder_out =
-                            matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package | Kind::Explain) || planning;
+                    if !matches!(d.kind, Kind::Voice | Kind::Hooks | Kind::Repair | Kind::PlanMake) {
+                        let folder_out = matches!(
+                            d.kind,
+                            Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package | Kind::Explain | Kind::Essay
+                        ) || planning;
                         ui.label(if folder_out { "Output folder" } else { "Save as" });
                         let hint = match d.kind {
                             Kind::Script => "automatic (Movies/EI/Scripts)",
                             Kind::Topic => "automatic (Movies/EI/Topics/<topic>)",
                             Kind::Explain => "automatic (Movies/EI/Explainers/<what it explains>)",
+                            Kind::Essay => "automatic (Movies/EI/Essays/<the idea>)",
                             Kind::Tv => "automatic (“EI on TV” next to the clips)",
                             Kind::Download => "a playlist gets a folder named after it in here",
                             Kind::Package => "a folder “<topic> - package” in here",
@@ -5727,8 +5901,17 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     d.script = f;
                 }
             }
+            Pick::MorePlans => {
+                if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f("Plans", &["json"])) {
+                    let mut files = essay_more_files(&d.essay_more);
+                    if !files.contains(&f) {
+                        files.push(f);
+                    }
+                    d.essay_more = files.join("\n");
+                }
+            }
             Pick::Out => {
-                if matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Download | Kind::Package | Kind::Explain) {
+                if matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Download | Kind::Package | Kind::Explain | Kind::Essay) {
                     if let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|f| f()) {
                         if d.kind == Kind::Download {
                             let _ = save_setting("download_dir", &dir); // the default next time
@@ -5780,7 +5963,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     d.explain_notes.clear();
                     d.explain_approve = false;
                     d.explain_listed = false;
-                } else {
+                } else if d.kind != Kind::Essay {
                     d.out.clear(); // (a fresh automatic output name for the next one)
                 }
             }
@@ -6499,6 +6682,8 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         outputs: Vec<String>,
         out_dir: Option<String>,
         importable: bool,
+        fixable: bool,
+        changed: Vec<String>,
         log: String,
     }
     let rows: Vec<Row> = jobs()
@@ -6534,6 +6719,13 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 .unwrap_or_default(),
             out_dir: j.result.get("out_dir").and_then(Value::as_str).map(str::to_string),
             importable: j.kind.is_some() && j.status == Status::Done,
+            fixable: j.status == Status::Done && can_fix(j.kind) && (j.params.is_some() || !j.steps.is_empty()),
+            changed: j
+                .result
+                .get("changed")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default(),
             log: j.log.join("\n"),
         })
         .collect();
@@ -6547,6 +6739,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut pause: Option<(u64, bool)> = None;
     let mut retry: Option<(u64, Option<bool>)> = None;
     let mut edit_retry: Option<u64> = None;
+    let mut fix: Option<(u64, Result<String, String>)> = None;
     let mut reveal: Option<String> = None;
     let mut open_file: Option<String> = None;
     let mut import: Option<u64> = None;
@@ -6757,7 +6950,83 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             import = Some(r.id);
                         }
                     }
+                    if r.fixable {
+                        let b = ui.button("Fix with Claude…").on_hover_text(
+                            "Say what is wrong, for the whole video or at times in it (picture, sound, captions): only that is changed, and it is made again",
+                        );
+                        elems.push((format!("{pid}.fix"), b.rect, "Fix with Claude…".into()));
+                        if b.clicked() {
+                            ui.ctx().data_mut(|m| {
+                                let f = m.get_temp_mut_or_default::<FixForm>(fix_form_id(r.id));
+                                f.open = !f.open;
+                                if f.open && f.rows.is_empty() {
+                                    f.rows.push(FixRow { what: "picture", ..FixRow::default() });
+                                }
+                            });
+                        }
+                    }
                 });
+                if !r.changed.is_empty() {
+                    ui.label(egui::RichText::new("What Claude changed for your notes:").strong());
+                    for (k, c) in r.changed.iter().enumerate() {
+                        let l = ui.add(egui::Label::new(format!("• {c}")).wrap());
+                        elems.push((format!("ai.jobs.{}.changed.{k}", r.id), l.rect, c.clone()));
+                    }
+                }
+                let mut form = ui.ctx().data(|m| m.get_temp::<FixForm>(fix_form_id(r.id))).unwrap_or_default();
+                if r.fixable && form.open {
+                    let pid = format!("ai.jobs.{}.fix", r.id);
+                    ui.group(|ui| {
+                        ui.label("What is wrong? Claude changes only that and makes it again. What it changed is then listed here.");
+                        let g = ui.add(
+                            egui::TextEdit::multiline(&mut form.general)
+                                .hint_text("about the whole video (optional), e.g. the ending is too slow; less about Jin")
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY),
+                        );
+                        elems.push((format!("{pid}.general"), g.rect, form.general.clone()));
+                        let mut remove = None;
+                        for (k, row) in form.rows.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label("From");
+                                let a = ui.add(egui::TextEdit::singleline(&mut row.from).hint_text("1:15").desired_width(52.0));
+                                elems.push((format!("{pid}.{k}.from"), a.rect, row.from.clone()));
+                                ui.label("to");
+                                let b = ui.add(egui::TextEdit::singleline(&mut row.to).hint_text("1:30").desired_width(52.0));
+                                elems.push((format!("{pid}.{k}.to"), b.rect, row.to.clone()));
+                                combo_row(ui, &mut row.what, &FIX_WHAT, &format!("{pid}.{k}.what"), &mut elems);
+                                let i = ui.add(egui::TextEdit::singleline(&mut row.issue).hint_text("what is wrong there").desired_width(300.0));
+                                elems.push((format!("{pid}.{k}.issue"), i.rect, row.issue.clone()));
+                                let x = ui.small_button("✕").on_hover_text("Remove this time");
+                                elems.push((format!("{pid}.{k}.remove"), x.rect, "Remove".into()));
+                                if x.clicked() {
+                                    remove = Some(k);
+                                }
+                            });
+                        }
+                        if let Some(k) = remove
+                            && k < form.rows.len()
+                        {
+                            form.rows.remove(k);
+                        }
+                        ui.horizontal(|ui| {
+                            let a = ui.button("+ Add a Time").on_hover_text("One more place in the video where something is wrong");
+                            elems.push((format!("{pid}.add"), a.rect, "+ Add a Time".into()));
+                            if a.clicked() && form.rows.len() < 40 {
+                                form.rows.push(FixRow { what: "picture", ..FixRow::default() });
+                            }
+                            let go = ui.button("Fix It");
+                            elems.push((format!("{pid}.run"), go.rect, "Fix It".into()));
+                            if go.clicked() {
+                                fix = Some((r.id, fix_text(&form).and_then(|notes| fix_job(r.id, &notes))));
+                            }
+                        });
+                    });
+                    if matches!(fix, Some((id, Ok(_))) if id == r.id) {
+                        form = FixForm::default(); // (sent: the form closes)
+                    }
+                    ui.ctx().data_mut(|m| m.insert_temp(fix_form_id(r.id), form));
+                }
                 egui::CollapsingHeader::new("Log").id_salt(("ei-ai-log", r.id)).show(ui, |ui| {
                     let c = ui.small_button("Copy Log");
                     elems.push((format!("ai.jobs.{}.copyLog", r.id), c.rect, "Copy Log".into()));
@@ -6804,6 +7073,9 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         && let Err(e) = edit_job(ctx, j)
     {
         app.ui.status = e;
+    }
+    if let Some((_, said)) = fix {
+        app.ui.status = said.unwrap_or_else(|e| e);
     }
     if let Some((j, redo)) = retry
         && retry_job(j, redo).is_some()
@@ -7452,6 +7724,47 @@ mod tests {
     }
 
     #[test]
+    fn fix_notes_and_the_job_made_again() {
+        assert_eq!(clock_seconds("75"), Some(75.0));
+        assert_eq!(clock_seconds(" 1:15 "), Some(75.0));
+        assert_eq!(clock_seconds("1:02:03"), Some(3723.0));
+        for bad in ["", "x", "1:75", "-3", "1:2:3:4", "inf", "nan"] {
+            assert_eq!(clock_seconds(bad), None, "{bad}");
+        }
+        assert_eq!(clock_text(75.4), "1:15");
+        assert_eq!(clock_text(3723.0), "1:02:03");
+        let row = |from: &str, to: &str, what: &'static str, issue: &str| FixRow { from: from.into(), to: to.into(), what, issue: issue.into() };
+        let f = FixForm {
+            open: true,
+            general: "- the ending is slow\n\n".into(),
+            rows: vec![row("0:58", "74", "sound", " the oath   is cut "), row("", "", "picture", ""), row("2:10", "", "captions", "Saito is misspelt")],
+        };
+        assert_eq!(
+            fix_text(&f).unwrap(),
+            "the ending is slow\nFrom 0:58 to 1:14 of the video, the sound: the oath is cut\nAt 2:10 of the video, the captions: Saito is misspelt"
+        );
+        assert!(fix_text(&FixForm::default()).is_err());
+        for bad in
+            [row("1:10", "1:05", "picture", "x"), row("soon", "", "picture", "x"), row("1:10", "later", "picture", "x"), row("1:10", "1:20", "picture", " ")]
+        {
+            assert!(fix_text(&FixForm { rows: vec![bad], ..FixForm::default() }).is_err());
+        }
+        // every tool that can correct gets the notes its own way; the others say so
+        let e =
+            fix_draft(Kind::Essay, &json!({"input": "/p/plans.json", "topic": "x", "essayTo": "video", "voice": "v", "fresh": true}), Some("/essays/x"), "n")
+                .unwrap();
+        assert!(e.essay_notes == "n" && e.out == "/essays/x" && !e.fresh && e.essay_to == "video");
+        let kept = fix_draft(Kind::Essay, &json!({"input": "/p/plans.json", "topic": "x", "out": "/mine"}), Some("/essays/x"), "n").unwrap();
+        assert_eq!(kept.out, "/mine");
+        assert_eq!(fix_draft(Kind::PlanMake, &json!({"input": "/p/plans.json", "pick": "2", "check": true}), None, "n").unwrap().plan_fix, "n");
+        assert_eq!(fix_draft(Kind::Explain, &json!({"topic": "x"}), None, "n").unwrap().explain_notes, "n");
+        assert_eq!(fix_draft(Kind::Topic, &json!({"topic": "x"}), None, "n").unwrap().feedback, "n");
+        assert!(fix_draft(Kind::Split, &json!({}), None, "n").is_err());
+        assert!(can_fix(Some(Kind::Essay)) && !can_fix(Some(Kind::Download)) && !can_fix(None));
+        assert!(fix_job(u64::MAX, "n").is_err()); // (no such job)
+    }
+
+    #[test]
     fn essay_arguments() {
         let dir = std::env::temp_dir().join("ei-essay-args-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7474,6 +7787,16 @@ mod tests {
         assert!(Draft::from_params(Kind::Essay, &json!({"input": file, "topic": " "})).engine_args().is_err());
         assert!(Draft::from_params(Kind::Essay, &json!({"input": file, "topic": "x", "essayTo": "video"})).engine_args().is_err()); // (a video needs a voice)
         assert!(Draft::from_params(Kind::Essay, &json!({"topic": "x"})).engine_args().is_err()); // (no plans file)
+        // several plans files (several games together) and a folder of its own
+        let other = dir.join("tsushima.json");
+        std::fs::write(&other, b"{}").unwrap();
+        let o = other.to_string_lossy().to_string();
+        let mut m = Draft::from_params(Kind::Essay, &json!({"input": file, "topic": "x", "morePlans": [o, file], "out": "/tmp/my essay"}));
+        let ma = m.engine_args().unwrap();
+        assert_eq!(ma[..8], ["essay", "x", "--plans", &file, &o, "--out-dir", "/tmp/my essay", "--minutes"]);
+        let mut again = Draft::from_params(Kind::Essay, &m.to_params());
+        assert_eq!(again.engine_args().unwrap(), ma);
+        assert!(Draft::from_params(Kind::Essay, &json!({"input": file, "topic": "x", "morePlans": "/nowhere/plans.json"})).engine_args().is_err());
         assert_eq!(Kind::from_command("ai.essay"), Some(Kind::Essay));
         let _ = std::fs::remove_dir_all(&dir);
     }

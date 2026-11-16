@@ -336,4 +336,22 @@ Built as units for other tools:
   cuts, sound written to disk piece by piece (never a whole recording in memory), ducking, captions, music, tall frame.
 - `essay.py` only plans and calls those two, `voice.speak` and `captions.build_ass`.
 
-Not done: several plans files in the window; a review of each shot by looking at its frame before the video.
+The window takes more plans files (one per line, "Add a Plans File…") and an output folder.
+
+Not done: a review of each shot by looking at its frame before the video.
+
+## Fix with Claude in AI Jobs (2026-11-16)
+
+A finished job of Essay, Make Video from Plan, Explainer, Video from Topic or Auto Edit Clips to Music shows
+"Fix with Claude…" in AI Jobs: a box for the whole video and rows "from – to, Picture/Sound/Captions, what is
+wrong". "Fix It" writes the notes ("From 0:58 to 1:14 of the video, the sound: …") and makes the job again with
+them through the tool's own correction (`essay --notes`, `plan-make --fix`, `explain --note`, `--feedback`);
+it waits in the queue when another job runs. Code: `FixForm`, `fix_text`, `fix_draft`, `fix_job` in `ai_tools.rs`.
+
+- Only the essay knows times in the made video today: `timeline.json` keeps every beat's time, and the revision
+  is given that table (`essay.made_text`). The other tools get the same notes as plain text.
+- Essay beats can carry corrections that need no new voice: `game_db` (game level under a line), `gain_db`
+  (a played line), `caption` (text shown instead, "" for none). The plan from before is `essay.previous.json`.
+- What Claude changed (and what it did differently, with the reason) comes back as `changed` in the result and is
+  listed under the job.
+- It is a form, not a chat: one round of notes per run.
