@@ -17,6 +17,8 @@ Nothing is analysed again: what was found in each recording is read from next to
      ("play"). What the idea claims but the recordings do not show is listed as a doubt.
    You can stop here (`--to plan`), read it, and change it with `--notes`.
 2. Voice: the lines are spoken once in your cloned voice (or a macOS voice).
+   Every round of notes is kept in the essay's folder (fixes.md): what you said, what was changed,
+   what is still open. The next round is given all of it (fix_log).
 3. Video: each line gets its shots for exactly as long as it is spoken, the game's own sound
    stays quietly under your voice, and the game's lines play in the clear between yours. Wide,
    or delivered tall with the picture dimmed and blurred behind.
@@ -35,6 +37,7 @@ import time
 from pathlib import Path
 
 import autocut as ac
+import fix_log
 import gameplay_plan as gp
 from autocut import AutocutError, log
 
@@ -118,7 +121,15 @@ Answer with only this JSON:
  "publish": {{"title": "...", "description": "2-4 sentences", "tags": ["..."]}}}}"""
 
 
-def revise_prompt(essay: dict, notes: str, details: list[str], made: str = "") -> str:
+CAN_SET = """## What the creator can change themselves in EI (not you)
+These are settings of "Video Essay from Recordings" (AI Jobs → Edit & Retry), not part of the plan: the voice and its speaking pace,
+takes per line, the length, the language, wide or tall delivery (with the picture behind dimmed and blurred), captions for the voice
+only / the game's lines too / none, how loud the game is under the voice everywhere, music under the video. If a note needs one of
+these, do what you can in the plan and name the setting in "open". You cannot see or hear the video: you know it from the table of
+beats and the recordings' analysis, so when a note is about something only eyes or ears can judge, say in "open" what to check."""
+
+
+def revise_prompt(essay: dict, notes: str, details: list[str], made: str = "", earlier: str = "") -> str:
     video = f"""
 ## The video as it was made (the creator's times are times in THIS video; each row is one beat with its time in the video)
 {made}
@@ -142,14 +153,19 @@ in the table below and fix that:
 If a note cannot be done with what the stretches below hold, do the nearest thing that serves what the creator wants and say so
 plainly in "changed".
 
+{CAN_SET}
+
+{earlier}
 ## The essay now
 {json.dumps({k: essay.get(k) for k in ("title", "thesis", "chapters", "doubts", "publish")}, ensure_ascii=False, indent=1)}
 {video}
 ## The stretches of the recordings it may use (every 5 seconds: time, action, what is on screen; every line said with its time)
 {chr(10).join(details)}
 
-Answer with only the whole essay again as JSON in the same form, with one more field: "changed": one short sentence per change you
-made (and per thing you did differently from what was asked, with the reason), in plain English for the creator."""
+Answer with only the whole essay again as JSON in the same form, with two more fields. "changed": one short sentence per change you
+made (and per thing you did differently from what was asked, with the reason), in plain English for the creator. "open": what was
+asked (now or in an earlier round) and is still not done, each with what it needs: a setting, a recording that is not there, a check
+by the creator; an empty list when nothing is open."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -262,6 +278,7 @@ def clean_essay(raw: dict, lib) -> dict:
     return {"title": str(raw.get("title", "")).strip()[:140], "chapters": chapters,
             "doubts": [" ".join(str(d).split())[:500] for d in raw.get("doubts") or [] if str(d).strip()][:10],
             "changed": [" ".join(str(d).split())[:400] for d in raw.get("changed") or [] if str(d).strip()][:12],
+            "open": [" ".join(str(d).split())[:400] for d in (raw.get("open") if isinstance(raw.get("open"), list) else []) if str(d).strip()][:12],
             "publish": {"title": str(pub.get("title", "")).strip()[:140], "description": str(pub.get("description", "")).strip()[:1500],
                         "tags": [str(t).strip()[:40] for t in pub.get("tags") or [] if str(t).strip()][:20]}}
 
@@ -293,6 +310,8 @@ def essay_md(essay: dict, lib=None) -> str:
         out += ["## For you to decide or check", ""] + [f"- {d}" for d in essay["doubts"]] + [""]
     if essay.get("changed"):
         out += ["## Changed after your last notes", ""] + [f"- {d}" for d in essay["changed"]] + [""]
+    if essay.get("open"):
+        out += ["## Still open", ""] + [f"- {d}" for d in essay["open"]] + [""]
     out += ["---", "To change something: run it again with notes (\"chapter 2: open on the duel, not the ride\"). The times and lines can also be changed in essay.json."]
     return "\n".join(out) + "\n"
 
@@ -497,11 +516,14 @@ def make(idea: str, plans: list[str], out_dir: str | None = None, *, minutes: fl
                 made = made_text(json.loads((folder / "timeline.json").read_text(encoding="utf-8")))
             except (OSError, ValueError):
                 pass  # (no video was made yet: the notes are about the plan)
-            new = clean_essay(sw.extract_json(sw.ask_claude(revise_prompt(essay, notes, details_for(outline, lib), made), model, timeout=1200)), lib)
+            new = clean_essay(sw.extract_json(sw.ask_claude(revise_prompt(essay, notes, details_for(outline, lib), made, fix_log.block(folder)), model, timeout=1200)), lib)
+            fix_log.add(folder, notes, new["changed"], new["open"], tool="essay")
+            for c in new["open"]:
+                log(f"still open: {c}")
             (folder / "essay.previous.json").write_text(json.dumps(essay, ensure_ascii=False, indent=1), encoding="utf-8")  # (to go back to)
             for c in new["changed"]:
                 log(f"changed: {c}")
-            essay = {**essay, **{k: v for k, v in new.items() if v or k == "changed"}, "noted": (essay.get("noted") or []) + [{"when": time.strftime("%Y-%m-%d %H:%M"), "text": notes.strip()[:1000]}]}
+            essay = {**essay, **{k: v for k, v in new.items() if v or k in ("changed", "open")}, "noted": (essay.get("noted") or []) + [{"when": time.strftime("%Y-%m-%d %H:%M"), "text": notes.strip()[:1000]}]}
         else:
             essay = {**essay, **{k: v for k, v in clean_essay(essay, lib).items() if k == "chapters"}}  # (changed by hand: made safe again)
         ej.write_text(json.dumps(essay, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -512,7 +534,7 @@ def make(idea: str, plans: list[str], out_dir: str | None = None, *, minutes: fl
         log(f"  to check: {d[:200]}")
     outputs = [str(folder / "essay.md"), str(ej)]
     result = {"outputs": outputs, "out_dir": str(folder), "title": essay["title"], "lines": len(says(essay)), "plays": n_play, "video": None,
-              "changed": essay.get("changed", []) if notes.strip() else []}
+              "changed": essay.get("changed", []) if notes.strip() else [], "open": essay.get("open", []) if notes.strip() else []}
     if to == "plan":
         log(f"the plan is ready to read: {folder / 'essay.md'}")
         return result

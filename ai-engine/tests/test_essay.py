@@ -166,7 +166,7 @@ def test_a_plan_is_written_and_kept_and_changed_with_notes(tmp_path, monkeypatch
             return json.dumps({"title": "Revenge or Honor", "thesis": "Atsu is not Jin.", "hook": "h", "doubts": ["no Tsushima footage"],
                                "chapters": [{"title": "The choice", "point": "p", "stretches": [{"r": 1, "start": "0:00:00", "end": "0:00:40", "why": "Jubei"}]}]})
         if "wants changes" in prompt:
-            return json.dumps({**RAW, "title": "Revenge or Honor (2)", "changed": ["opens on the duel"]})
+            return json.dumps({**RAW, "title": "Revenge or Honor (2)", "changed": ["opens on the duel"], "open": ["louder music: a setting (Music)"]})
         return json.dumps(RAW)
 
     monkeypatch.setattr(sw, "ask_claude", claude)
@@ -187,6 +187,15 @@ def test_a_plan_is_written_and_kept_and_changed_with_notes(tmp_path, monkeypatch
     # after a video was made, notes can name times in it: the revision is given the video beat by beat
     (out / "timeline.json").write_text(json.dumps({"beats": [{"chapter": 1, "start": 0.0, "end": 3.0, "kind": "say", "text": "Atsu is not saving an island.", "from": "R1 0:00:20"}]}))
     es.make("", [], str(out), to="plan", notes="0:00 to 0:03, the sound: the game is too loud under my voice")
+    # the second round knows the first: what was asked, what was changed, what is still open
+    assert "Earlier rounds" not in asked[2] and "Round 1" in asked[3] and "asked: open on the duel" in asked[3] and "changed: opens on the duel" in asked[3]
+    assert "still open: louder music: a setting (Music)" in asked[3] and r2["open"] == ["louder music: a setting (Music)"]
+    import fix_log
+
+    kept = fix_log.rounds(out)
+    assert [k["round"] for k in kept] == [1, 2] and kept[1]["notes"] == ["0:00 to 0:03, the sound: the game is too loud under my voice"]
+    assert "## Round 2" in (out / "fixes.md").read_text() and "**Still open:**" in (out / "fixes.md").read_text() and fix_log.still_open(out) == kept[1]["open"]
+    assert fix_log.block(tmp_path / "nothing") == "" and fix_log.rounds(tmp_path) == []
     assert "as it was made" in asked[3] and "[0:00–0:03] chapter 1 · voice: Atsu is not saving an island." in asked[3] and "game_db" in asked[3]
     with pytest.raises(AutocutError):
         es.make("", [], str(out), to="video")  # (no voice chosen)

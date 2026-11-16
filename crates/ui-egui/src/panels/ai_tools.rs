@@ -6684,6 +6684,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
         importable: bool,
         fixable: bool,
         changed: Vec<String>,
+        still_open: Vec<String>,
         log: String,
     }
     let rows: Vec<Row> = jobs()
@@ -6723,6 +6724,12 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
             changed: j
                 .result
                 .get("changed")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default(),
+            still_open: j
+                .result
+                .get("open")
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
                 .unwrap_or_default(),
@@ -6973,11 +6980,18 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         elems.push((format!("ai.jobs.{}.changed.{k}", r.id), l.rect, c.clone()));
                     }
                 }
+                if !r.still_open.is_empty() {
+                    ui.label(egui::RichText::new("Still open (kept for the next round, in fixes.md next to the video):").strong());
+                    for (k, c) in r.still_open.iter().enumerate() {
+                        let l = ui.add(egui::Label::new(format!("• {c}")).wrap());
+                        elems.push((format!("ai.jobs.{}.open.{k}", r.id), l.rect, c.clone()));
+                    }
+                }
                 let mut form = ui.ctx().data(|m| m.get_temp::<FixForm>(fix_form_id(r.id))).unwrap_or_default();
                 if r.fixable && form.open {
                     let pid = format!("ai.jobs.{}.fix", r.id);
                     ui.group(|ui| {
-                        ui.label("What is wrong? Claude changes only that and makes it again. What it changed is then listed here.");
+                        ui.label("What is wrong? Claude changes only that and makes it again. What it changed is then listed here. It remembers the earlier rounds of this video.");
                         let g = ui.add(
                             egui::TextEdit::multiline(&mut form.general)
                                 .hint_text("about the whole video (optional), e.g. the ending is too slow; less about Jin")

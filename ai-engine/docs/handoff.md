@@ -355,3 +355,8 @@ it waits in the queue when another job runs. Code: `FixForm`, `fix_text`, `fix_d
 - What Claude changed (and what it did differently, with the reason) comes back as `changed` in the result and is
   listed under the job.
 - It is a form, not a chat: one round of notes per run.
+- Memory per video: `fix_log.py` (a unit any tool can use) keeps every round in the video's folder (`fixes.json`,
+  `fixes.md` to read): what was said, what was changed, what is still open. The essay's revision is given the
+  earlier rounds, so a note that comes back ("still too quiet") is done another way, and earlier corrections are
+  kept. The revision is also told which things are EI settings (voice pace, tall, captions, music) and names
+  them under "open" instead of pretending. Only the essay uses `fix_log` so far.
