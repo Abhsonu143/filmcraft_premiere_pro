@@ -7011,7 +7011,7 @@ fn show_jobs(app: &mut FilmcraftApp, ctx: &egui::Context) {
                                 combo_row(ui, &mut row.what, &FIX_WHAT, &format!("{pid}.{k}.what"), &mut elems);
                                 let i = ui.add(egui::TextEdit::singleline(&mut row.issue).hint_text("what is wrong there").desired_width(300.0));
                                 elems.push((format!("{pid}.{k}.issue"), i.rect, row.issue.clone()));
-                                let x = ui.small_button("✕").on_hover_text("Remove this time");
+                                let x = ui.small_button("Remove").on_hover_text("Remove this time");
                                 elems.push((format!("{pid}.{k}.remove"), x.rect, "Remove".into()));
                                 if x.clicked() {
                                     remove = Some(k);
