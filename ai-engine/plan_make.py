@@ -333,7 +333,15 @@ def hook_cut(plan: dict, cuts: list[dict], analyses: dict[str, dict | None], on_
     return best if best_said or not second else second
 
 
+def fix_rounds(plan: dict) -> list[dict]:
+    """The corrections kept in the plan, as rounds (fix_log's form)."""
+    return [{"round": k, "when": str(x.get("when", "")), "tool": "plan-make", "notes": [str(x.get("note", ""))], "changed": [str(x.get("did", ""))] if x.get("did") else [],
+             "open": [str(o) for o in x.get("open") or []]} for k, x in enumerate((x for x in plan.get("fixes") or [] if isinstance(x, dict)), 1)]
+
+
 def fix_prompt(plan: dict, game: str, blocks: list[str], note: str, captions: list[str]) -> str:
+    import fix_log
+
     now = "\n".join(f"- stretch {c.get('part')}: {gp.hms(c['start'])}–{gp.hms(c['end'])} ({c['end'] - c['start']:.0f} s): {c.get('note', '')}" for c in plan.get("cuts") or [])
     hook = plan.get("hook_cut")
     limit = MAX_SECONDS.get(plan.get("platform"), 0)
@@ -353,6 +361,7 @@ Its captions now:
 ## What the creator says is wrong
 {note}
 
+{fix_log.text(fix_rounds(plan))}
 ## The recording around it (per 5 seconds: action 0-1, what is on screen, scene cuts; indented: every line said, with its time)
 {chr(10).join(blocks)}
 
@@ -363,9 +372,11 @@ Its captions now:
 {f"  The pieces together stay under {limit - 7:.0f} seconds." + chr(10) if limit else ""}- hook: a new teaser of 2 to 3 seconds from inside the pieces when the teaser is what is wrong; "none" when the creator wants no teaser; otherwise null.
 - captions: when words of a caption are wrong, the wrong words exactly as they stand in the captions above, and the right words.
   Only what the creator asks for, or a name they tell you is misspelled. Otherwise an empty list.
-- did: one short plain sentence on what you changed, or why nothing could be changed.
+- did: one short plain sentence on what you changed (and what you did differently from what was asked, with the reason), or why
+  nothing could be changed.
+- open: what the creator asked (now or in an earlier round) that is still not done, each with what it needs; an empty list when nothing is.
 Answer with only this JSON:
-{{"cuts": null, "hook": null, "captions": [{{"wrong": "...", "right": "..."}}], "did": "..."}}"""
+{{"cuts": null, "hook": null, "captions": [{{"wrong": "...", "right": "..."}}], "did": "...", "open": []}}"""
 
 
 def apply_fix(plan: dict, game: str, analyses: list[dict | None], note: str, captions: list[str]) -> str:
@@ -402,7 +413,8 @@ def apply_fix(plan: dict, game: str, analyses: list[dict | None], note: str, cap
     if n:
         done.append(f"{n} caption correction(s)")
     did = str(answer.get("did", "")).strip()[:300]
-    plan.setdefault("fixes", []).append({"note": note[:500], "did": did, "when": time.strftime("%Y-%m-%d %H:%M")})
+    still = [" ".join(str(o).split())[:300] for o in (answer.get("open") if isinstance(answer.get("open"), list) else []) if str(o).strip()][:8]
+    plan.setdefault("fixes", []).append({"note": note[:500], "did": did, "open": still, "when": time.strftime("%Y-%m-%d %H:%M")})
     return f"{did} ({', '.join(done) if done else 'nothing was changed'})"
 
 
@@ -1444,6 +1456,9 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
                 log("corrected: " + apply_fix(plan, game, [by_rec[str(p["recording"])] for p in parts], fix.strip(), shown))
             except ValueError as e:
                 raise AutocutError(f"the correction could not be read ({e})") from e
+            import fix_log
+
+            fix_log.keep(old[0], fix_rounds(plan))  # (to read next to the video: fixes.md)
             fresh = False  # (the corrected plan is what is made)
         if plan.get("no_hook"):
             hook = False
@@ -1505,6 +1520,8 @@ def make(plans_file: str, *, pick: str = "", request: str = "", out_dir: str | N
     folder, name = video_folder(pj, idx, plan, out_dir)
     res = {"outputs": [], "out_dir": str(folder), "plan": idx + 1, "title": plan.get("title"), "pieces": len(cuts), "seconds": plan["cut_s"], "plans": str(pj),
            "hook": bool(teaser)}
+    if fix.strip() and plan.get("fixes"):
+        res["changed"], res["open"] = [str(plan["fixes"][-1].get("did", ""))], list(plan["fixes"][-1].get("open") or [])
     if teaser:  # (from here on the teaser is simply the first piece)
         cuts = [teaser, *cuts]
     if cuts_only:

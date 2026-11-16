@@ -130,7 +130,12 @@ Answer with only this JSON:
  "open_questions": ["..."]}}"""
 
 
-def revise_prompt(plan: dict, notes: list[dict], data: dict) -> str:
+def said_note(n: dict) -> str:
+    """A note as the creator gave it, with its chapter."""
+    return (f"chapter {n['chapter']}: " if n.get("chapter") else "") + str(n.get("text", ""))
+
+
+def revise_prompt(plan: dict, notes: list[dict], data: dict, earlier: str = "") -> str:
     facts = "\n".join(f"F{k}. {f['fact']} {f.get('url', '')}" + (f" quote: “{f['quote']}”" if f.get("quote") else "") for k, f in enumerate(data.get("facts", []), 1))
     said = "\n".join(f"- {'chapter ' + str(n['chapter']) + ': ' if n.get('chapter') else 'the whole video: '}{n['text']}" for n in notes)
     keep = {k: plan.get(k) for k in ("title", "promise", "audience", "chapters", "open_questions")}
@@ -152,7 +157,9 @@ Each chapter's "media" lists the real things to be seen ({{"what", "search": 2-4
 "why"}}): free-licensed photos and video are searched for each and looked at. A note may ask for more, fewer or other ones; one the creator
 says to do without is removed.
 
-Answer with only the whole plan again as JSON, in the same form, with one more field: "changed": one short sentence per change you made."""
+{earlier}
+Answer with only the whole plan again as JSON, in the same form, with one more field: "changed": one short sentence per change you made
+(and per thing you did differently from what was asked, with the reason)."""
 
 
 def clean_plan(raw: dict, data: dict) -> dict:
@@ -413,7 +420,7 @@ Answer with only this JSON:
 with one entry per chapter of the plan, in order."""
 
 
-def script_revise_prompt(script: dict, notes: list[dict], plan: dict, data: dict) -> str:
+def script_revise_prompt(script: dict, notes: list[dict], plan: dict, data: dict, earlier: str = "") -> str:
     said = "\n".join(f"- {'chapter ' + str(n['chapter']) + ': ' if n.get('chapter') else 'the whole video: '}{n['text']}" for n in notes)
     which = sorted({n["chapter"] for n in notes if n.get("chapter")}) if all(n.get("chapter") for n in notes) else list(range(1, len(script["chapters"]) + 1))
     now = json.dumps([{"chapter": k, "title": script["chapters"][k - 1]["title"], "scenes": script["chapters"][k - 1]["scenes"], "lines": script["chapters"][k - 1]["lines"]} for k in which],
@@ -434,6 +441,7 @@ would have done it differently. Everything said must still rest on the research;
 ## Scene forms
 {SCENE_FORMS}
 
+{earlier}
 Answer with only this JSON: {{"chapters": [{{"chapter": 2, "scenes": [...], "lines": [...]}}], "changed": ["one short sentence per change"]}}
 with every chapter given above, whole, in the same form."""
 
@@ -697,12 +705,14 @@ def check_script(script: dict, data: dict, ask) -> None:
         log(f"  {c['where']}: {c['problem'][:140]}")
 
 
-def revise_script(script: dict, notes: list[dict], plan: dict, data: dict, model: str | None, ask=None) -> dict:
+def revise_script(script: dict, notes: list[dict], plan: dict, data: dict, model: str | None, ask=None, folder=None) -> dict:
     import script_writer as sw
 
     ask = ask or (lambda prompt: sw.extract_json(sw.ask_claude(prompt, model, timeout=1200)))
     log(f"your notes on the script: {'; '.join(n['text'][:80] for n in notes)}")
-    answer = ask(script_revise_prompt(script, notes, plan, data))
+    import fix_log
+
+    answer = ask(script_revise_prompt(script, notes, plan, data, fix_log.block(folder) if folder else ""))
     for c in (answer.get("chapters") if isinstance(answer, dict) else None) or []:
         try:
             k = int(c.get("chapter", 0))
@@ -717,6 +727,8 @@ def revise_script(script: dict, notes: list[dict], plan: dict, data: dict, model
     script["status"] = "draft"
     for c in script["changed"]:
         log(f"changed: {c}")
+    if folder:
+        fix_log.add(folder, [said_note(n) for n in notes], script["changed"], tool="explain: script")
     check_script(script, data, ask)
     return script
 
@@ -858,7 +870,9 @@ def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language:
                     "made": time.strftime("%Y-%m-%d %H:%M")}
         if asked:
             log(f"your notes: {'; '.join(n['text'][:80] for n in asked)}")
-            answer = sw.extract_json(sw.ask_claude(revise_prompt(plan, asked, data), model, timeout=900))
+            import fix_log
+
+            answer = sw.extract_json(sw.ask_claude(revise_prompt(plan, asked, data, fix_log.block(folder)), model, timeout=900))
             revised = clean_plan(answer, data)
             when = time.strftime("%Y-%m-%d %H:%M")
             plan = {**plan, **revised, "notes": (plan.get("notes") or []) + [{**n, "when": when} for n in asked],
@@ -866,6 +880,7 @@ def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language:
                     "status": "draft"}
             for c in plan["changed"]:
                 log(f"changed: {c}")
+            fix_log.add(folder, [said_note(n) for n in asked], plan["changed"], tool="explain: plan")
         if asked:
             script = None  # (the plan changed: its script is written again)
     with ac.stage("media"):
@@ -896,7 +911,8 @@ def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language:
     if weak:
         log(f"{len(weak)} claim(s) are not confirmed word for word in a source (marked in plan.md): " + "; ".join(f"ch {n}: {c[:60]}" for n, c in weak[:4]))
     res = {"outputs": [str(md), str(pj), str(rj)], "out_dir": str(folder), "status": plan["status"], "title": plan["title"], "chapters": len(plan["chapters"]),
-           "seconds": sum(c["seconds"] for c in plan["chapters"]), "unconfirmed": len(weak), "facts": len(data["facts"]), "step": "plan"}
+           "seconds": sum(c["seconds"] for c in plan["chapters"]), "unconfirmed": len(weak), "facts": len(data["facts"]), "step": "plan",
+           "changed": list(plan.get("changed") or []) if asked else []}
     if plan["status"] != "approved":
         log(f"the plan waits for you: read {md}, then approve it or give notes")
         return res
@@ -912,7 +928,7 @@ def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language:
         if new:
             script = write_script(plan, data, model)
         if for_script:
-            script = revise_script(script, for_script, plan, data, model)
+            script = revise_script(script, for_script, plan, data, model, folder=folder)
         script["show_sources"] = show_sources
         if new or for_script or any(sc["type"] == "footage" and not sc.get("file") for ch in script["chapters"] for sc in ch["scenes"]):
             fetch_footage(script, folder)
@@ -930,7 +946,7 @@ def make(want: str, out_dir: str | None = None, *, minutes: float = 6, language:
         smd.write_text(script_md(script, data["facts"]), encoding="utf-8")
     words = sum(len(ln["text"].split()) for ch in script["chapters"] for ln in ch["lines"])
     log(f"script: {words} words in {sum(len(ch['lines']) for ch in script['chapters'])} lines, {sum(len(ch['scenes']) for ch in script['chapters'])} scenes · {script['status']}")
-    res = {**res, "outputs": [str(smd), str(sj)] + res["outputs"], "status": script["status"], "step": "script", "words": words,
+    res = {**res, "outputs": [str(smd), str(sj)] + res["outputs"], "status": script["status"], "step": "script", "words": words, **({"changed": list(script.get("changed") or [])} if for_script else {}),
            "open_checks": sum(1 for c in script.get("checks", []) if not c["corrected"])}
     if script["status"] != "approved":
         log(f"the script waits for you: read {smd}, then approve it or give notes")

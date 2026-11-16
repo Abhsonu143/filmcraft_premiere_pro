@@ -359,4 +359,9 @@ it waits in the queue when another job runs. Code: `FixForm`, `fix_text`, `fix_d
   `fixes.md` to read): what was said, what was changed, what is still open. The essay's revision is given the
   earlier rounds, so a note that comes back ("still too quiet") is done another way, and earlier corrections are
   kept. The revision is also told which things are EI settings (voice pace, tall, captions, music) and names
-  them under "open" instead of pretending. Only the essay uses `fix_log` so far.
+  them under "open" instead of pretending.
+- Also remembered: Make Video from Plan (rounds live in the plan's `fixes`, given to the next correction through
+  `fix_log.text`, written as `fixes.md` in the video's folder) and Explainer (plan notes and script notes, `fix_log.add`).
+  Video from Topic and Auto Edit Clips to Music keep every feedback text themselves (`feedback.json`) and follow all
+  of it on each retry, but do not record what was changed.
+- A chain works: a correction is a new job in AI Jobs with its own "Fix with Claude…".

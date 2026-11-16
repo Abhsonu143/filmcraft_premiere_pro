@@ -8,6 +8,7 @@ a later one, a note that comes back ("still too quiet") is known to have been tr
 what is still open is not forgotten.
 
     fix_log.block(folder)                       the earlier rounds, as text for a prompt ("" when none)
+    fix_log.text(rounds)                        the same for rounds a tool keeps itself
     fix_log.add(folder, notes, changed, open)   one more round
 """
 
@@ -65,9 +66,22 @@ def still_open(folder) -> list[str]:
     return list(all_[-1].get("open", [])) if all_ else []
 
 
+def keep(folder, all_: list[dict]) -> None:
+    """Writes rounds a tool keeps elsewhere (in its plan) into the video's folder too, to read."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / FILE).write_text(json.dumps(all_[-MOST:], ensure_ascii=False, indent=1), encoding="utf-8")
+    (folder / READ).write_text(as_md(all_[-MOST:]), encoding="utf-8")
+
+
 def block(folder, last: int = 8) -> str:
     """The earlier rounds as a section of a prompt ("" when there were none)."""
-    all_ = rounds(folder)[-last:]
+    return text(rounds(folder), last)
+
+
+def text(all_: list[dict], last: int = 8) -> str:
+    """Rounds as a section of a prompt ("" when there are none)."""
+    all_ = all_[-last:]
     if not all_:
         return ""
     out = ["## Earlier rounds of corrections on this same video (oldest first)",

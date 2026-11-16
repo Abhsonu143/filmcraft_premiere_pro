@@ -106,13 +106,18 @@ def test_a_plan_becomes_a_video(tmp_path, monkeypatch):
     monkeypatch.setattr(pm.gp, "research_game", lambda game, writer="claude", fresh=False: {"summary": "s"})
     asked = []
     monkeypatch.setattr(sw, "ask_claude", lambda prompt, model=None, timeout=600: (asked.append(prompt), json.dumps(
-        {"cuts": [{"part": 1, "start": "0:00:05", "end": "0:00:11", "note": "only the hello"}], "hook": "none", "captions": [{"wrong": "friend", "right": "Friend"}], "did": "Kept only the hello."}
+        {"cuts": [{"part": 1, "start": "0:00:05", "end": "0:00:11", "note": "only the hello"}], "hook": "none", "captions": [{"wrong": "friend", "right": "Friend"}], "did": "Kept only the hello.", "open": ["music: a setting"]}
         if "found something wrong" in prompt else {"lines": []}))[1])
     r = pm.make(str(pj), pick="2", fix="the second part is boring, drop it; no teaser; Friend is a name", cuts_only=True)
     fixed = json.loads(pj.read_text())["plans"][1]
     assert [c["part"] for c in fixed["cuts"]] == [1] and fixed["no_hook"] is True and not r["hook"] and fixed["fixes"][0]["did"] == "Kept only the hello."
     assert {"wrong": "friend", "right": "Friend"} in fixed["caption_fixes"] and "the second part is boring" in asked[0] and "Hi there, old friend." in asked[0]
     assert "The creator found these wrong" in pm.cuts_prompt(fixed, "Game", [])
+    # the round is remembered: the next correction is given it, and it can be read next to the video
+    assert r["changed"] == ["Kept only the hello."] and r["open"] == ["music: a setting"] and "Earlier rounds" not in asked[0]
+    nxt = pm.fix_prompt(fixed, "Game", [], "still boring", [])
+    assert "Round 1" in nxt and "asked: the second part is boring" in nxt and "changed: Kept only the hello." in nxt and "still open: music: a setting" in nxt
+    assert "Kept only the hello." in (pm.Path(r["out_dir"]) / "fixes.md").read_text()
     with pytest.raises(AutocutError, match="needs Claude"):
         pm.make(str(pj), pick="2", fix="x", writer="rules")
     # asking for a video in words: a new plan is written from the recordings, added and made

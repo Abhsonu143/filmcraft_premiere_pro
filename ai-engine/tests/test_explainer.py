@@ -76,6 +76,14 @@ def test_a_plan_is_written_reviewed_changed_and_approved(tmp_path, monkeypatch):
     plan = json.loads((tmp_path / "gen" / "plan.json").read_text())
     assert asked == ["research", "plan", "revise"] and plan["title"] == "Generators, Plainly" and [n["chapter"] for n in plan["notes"]] == [2, 0]
     assert plan["changed"] == ["Chapter 2 opens on the traceback."] and r["status"] == "waiting for your approval" and plan["hints"] == "focus on bugs"
+    # the round is kept next to the video, and the next round of notes is given it
+    import fix_log
+
+    kept = fix_log.rounds(out)
+    assert r["changed"] == plan["changed"] and kept[0]["notes"] == ["chapter 2: show the traceback first", "no jokes"] and kept[0]["changed"] == plan["changed"]
+    assert "Earlier rounds" not in ex.revise_prompt(plan, [{"chapter": 0, "text": "x"}], RESEARCH)
+    again = ex.revise_prompt(plan, [{"chapter": 0, "text": "still jokes in it"}], RESEARCH, fix_log.block(out))
+    assert "Round 1" in again and "asked: no jokes" in again and "changed: Chapter 2 opens on the traceback." in again
     assert ex.make("how generators work", out, approve=True)["status"] == "approved" and asked == ["research", "plan", "revise"]
     assert ex.make("another thing", str(tmp_path / "other"))["status"] == "approved"  # (no review asked for: written, kept, approved)
     with pytest.raises(AutocutError):
