@@ -284,9 +284,18 @@ fn execute(
                 bytes += rep.bytes;
                 // the clip now starts at the range start: shift its uses, take the new file's info
                 proj.shift_media_time(w.item, r.start);
-                let b = std::fs::read(&w.out).map_err(|e| format!("{}: {e}", w.out))?;
                 let fname = Path::new(&w.out).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let info = filmcraft_media::open_bytes(&fname, b.into(), &openers).map_err(|e| format!("{}: {e}", w.out))?.info().clone();
+                // (read in place where there is a file reader: a consolidated clip can be many gigabytes)
+                #[cfg(any(unix, windows))]
+                let opened = filmcraft_media::reader::FileReader::open(Path::new(&w.out)).map_err(|e| format!("{}: {e}", w.out)).and_then(|r| {
+                    filmcraft_media::reader::open_reader(&fname, std::sync::Arc::new(r), &filmcraft_codecs::reader_openers(), &openers)
+                        .map_err(|e| format!("{}: {e}", w.out))
+                });
+                #[cfg(not(any(unix, windows)))]
+                let opened = std::fs::read(&w.out)
+                    .map_err(|e| format!("{}: {e}", w.out))
+                    .and_then(|b| filmcraft_media::open_bytes(&fname, b.into(), &openers).map_err(|e| format!("{}: {e}", w.out)));
+                let info = opened?.info().clone();
                 if let Some(mm) = proj.item_mut(w.item).and_then(|i| i.as_media_mut()) {
                     mm.info = info;
                     mm.proxy = None;

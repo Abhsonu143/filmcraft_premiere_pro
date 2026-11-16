@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+"""narrate: the voiceover editor. Cuts your footage to a narration the way an editor would.
+
+Input: a voiceover (any audio/video, your recording or a cloned-voice narration from voice.py),
+optionally the script it came from, and footage: many short clips, a few long ones, or both.
+
+What decides which picture goes where
+  1. The narration is split into lines (phrases, at breaths and sentence ends). Each line gets
+     a picture brief: the script's "visual" note when it came from a script, else a short
+     English shot description written by the language model from the words (works for Hindi),
+     else the English translation of the line.
+  2. The footage is understood: long files are split at their own cuts into shots; every second
+     is described with CLIP (what is in frame, aerial/wide/medium/close), and rated for
+     sharpness, exposure, shake and camera motion (cached, so a second edit is quick).
+  3. For every line, candidate windows of exactly the right length are scored: how well they
+     show what is being said (CLIP text–image match, averaged over the window), how good they
+     look, whether the camera energy fits the delivery (excited lines get motion, calm lines get
+     stillness), and for the first line, an establishing wide/aerial shot.
+  4. The whole edit is then chosen together (beam search), not line by line: no window is used
+     twice, the same clip is not used back to back, shot sizes vary (wide -> medium -> close),
+     and footage keeps its real-life order when the narration tells a story in order.
+  5. Timing: cuts land on line boundaries, a few frames before the words (picture leads sound,
+     as editors do); long lines get a second shot at a breath; pauses are covered, never black.
+     New sections get a dissolve; the edit fades in and out.
+  6. Sound: the voice, a little of each clip's natural sound under it (so it feels real, not a
+     slideshow), optional music ducked under the voice, loudness for social platforms.
+     Captions (optional) use the script's exact words, Devanagari for Hindi.
+
+    python narrate.py voice.wav --clips footage/ --out edit.mp4
+    python narrate.py narration.wav --narration narration.narration.json --clips a.mp4 b.mp4 --aspect vertical --captions
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import re
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import numpy as np
+
+import autocut as ac
+from autocut import AutocutError, log
+
+ASPECTS = {"horizontal": (1920, 1080), "vertical": (1080, 1920), "square": (1080, 1080)}
+PACE_MAX = {"slow": 6.5, "medium": 4.8, "fast": 3.2}  # longest single shot (s)
+EMOTION_MOTION = {"excited": 0.8, "hook": 0.7, "cta": 0.5, "story": 0.5, "curious": 0.45, "suspense": 0.35, "serious": 0.3, "neutral": 0.4, "warm": 0.3, "calm": 0.15}
+
+
+# ---------------------------------------------------------------------------------------------
+# Narration lines
+# ---------------------------------------------------------------------------------------------
+
+
+def lines_from_words(words: list[dict], duration: float, min_len: float = 1.2, max_len: float = 7.0) -> list[dict]:
+    """Phrases from a transcript: split at sentence ends, commas and breaths; tiny bits merged."""
+    import clip_edit as ce
+
+    ph = ce.phrases(words, max_len=max_len, pause=0.35)
+    out: list[dict] = []
+    for p in ph:
+        if out and (p["end"] - p["start"] < min_len or out[-1]["end"] - out[-1]["start"] < min_len) and p["end"] - out[-1]["start"] <= max_len:
+            out[-1]["end"] = p["end"]
+            out[-1]["text"] += " " + p["text"]
+            out[-1]["words"] += p["words"]
+        else:
+            out.append({"start": p["start"], "end": p["end"], "text": p["text"], "words": list(p["words"])})
+    for l in out:
+        l.setdefault("emotion", "neutral")
+        l.setdefault("visual", "")
+        l.setdefault("section", None)
+    return out
+
+
+def lines_from_narration(nar: dict) -> list[dict]:
+    return [{"start": float(s["start"]), "end": float(s["end"]), "text": s["text"], "emotion": s.get("emotion", "neutral"),
+             "intensity": float(s.get("intensity", 0.6)), "visual": s.get("visual", ""), "section": s.get("section"), "words": []}
+            for s in nar.get("segments", [])]
+
+
+def align_script(lines: list[dict], script: dict) -> None:
+    """Borrow emotion/visual/section from a script for lines of a recorded read (text overlap)."""
+    import voice as vo
+
+    segs = script.get("segments", [])
+    if not segs:
+        return
+    for l in lines:
+        best, best_s = None, 0.0
+        lt = set(vo.norm_text(w) for w in l["text"].split())
+        for s in segs:
+            st = set(vo.norm_text(w) for w in s["text"].split())
+            j = len(lt & st) / max(1, len(lt | st))
+            if j > best_s:
+                best, best_s = s, j
+        if best and best_s >= 0.25:
+            l["emotion"] = best.get("emotion", l["emotion"])
+            if "intensity" in best:
+                l["intensity"] = best["intensity"]
+            l["visual"] = l["visual"] or best.get("visual", "")
+            l["section"] = best.get("section")
+
+
+def describe_lines(lines: list[dict], how: str, model: str | None) -> None:
+    """Picture briefs (English) for lines without one."""
+    todo = [l for l in lines if not l.get("visual")]
+    if not todo or how == "none":
+        return
+    numbered = "\n".join(f"{i + 1}. {l['text']}" for i, l in enumerate(todo))
+    prompt = ("These are consecutive lines of a video voiceover (they may be Hindi, English or Hinglish). For each line, write the ideal "
+              "B-roll shot to show while it is spoken, in English, 4 to 12 words, concrete and visual (what is in frame, and the shot size: "
+              "aerial, wide, medium or close-up). Keep the story's place and subject consistent between lines.\n"
+              "Reply with only a JSON list of strings, one per line, in order.\n\n" + numbered)
+    try:
+        if how == "claude":
+            import script_writer as sw
+
+            raw = sw.ask_claude(prompt, None, timeout=300)
+        else:
+            import llm
+
+            outs = llm.ask([prompt], model, max_tokens=60 * len(todo) + 50)
+            raw = outs[0] if outs else ""
+        m = re.search(r"\[.*\]", raw, re.S)
+        arr = json.loads(m.group(0)) if m else []
+    except Exception as e:  # briefs are a help, not a requirement
+        log(f"no shot descriptions ({type(e).__name__}: {str(e)[:100]}); matching on the words")
+        arr = []
+    for l, v in zip(todo, arr):
+        if isinstance(v, str) and v.strip():
+            l["visual"] = v.strip()
+
+
+def _translate_worker(wav: str, model: str) -> list[dict]:
+    import mlx_whisper
+
+    r = mlx_whisper.transcribe(wav, path_or_hf_repo=model, task="translate", condition_on_previous_text=False)
+    return [{"start": s["start"], "end": s["end"], "text": s["text"]} for s in r.get("segments", [])]
+
+
+def english_gloss(voice: str, lines: list[dict], model: str) -> None:
+    """Lines still without a brief get the English translation of what is said at that time."""
+    todo = [l for l in lines if not l.get("visual")]
+    if not todo:
+        return
+    if all(not re.search(r"[ऀ-ॿ]", l["text"]) for l in todo):
+        for l in todo:
+            l["visual"] = l["text"]
+        return
+    with tempfile.TemporaryDirectory(prefix="ei-tr-") as tmp:
+        wav = str(Path(tmp) / "v.wav")
+        ac.extract_audio(voice, wav)
+        segs = ac.run_isolated(_translate_worker, wav, model)
+    for l in todo:
+        txt = " ".join(s["text"] for s in segs if s["end"] > l["start"] and s["start"] < l["end"])
+        l["visual"] = txt.strip() or l["text"]
+
+
+CAMERA_WORDS = re.compile(r"\b(drone|aerial|shot|shots|wide|medium|close-?up|closeup|tracking|tracks?|orbit(ing)?|reveal(ing)?|slow(ly)?|low|high|"
+                          r"angle|pan(ning)?|tilt(ing)?|push(ing)?|pull(ing)?|dolly|handheld|cinematic|dramatic|footage|b-roll|view|camera|"
+                          r"top-?down|overhead|establishing|static|steady|follow(ing)?|frame|framed|fpv|pov|flying|flies|fly|over|above|"
+                          r"from|of|the|a|an|in|with|and|at|into|toward|towards|up|down)\b", re.I)
+
+
+def subject_only(brief: str) -> str:
+    """'Low drone tracking shot following a winding river up a green valley' -> 'winding river green valley'
+    (camera words match every clip of a drone-only library equally; the subject is what differs)."""
+    t = re.sub(r"[,.;:!?()]", " ", brief)
+    t = CAMERA_WORDS.sub(" ", t)
+    return re.sub(r"\s+", " ", t).strip() or brief
+
+
+def queries(line: dict) -> list[str]:
+    q = [line.get("visual") or line["text"], subject_only(line.get("visual") or line["text"])]
+    if line["text"] and not re.search(r"[\u0900-\u097F]", line["text"]):
+        q.append(line["text"])
+    return [x[:300] for x in q]
+
+
+def line_embeddings(lines: list[dict]) -> np.ndarray:
+    """One query vector per line: the brief, its subject alone, and the words, averaged."""
+    qs = [queries(l) for l in lines]
+    flat = [x for q in qs for x in q]
+    emb = np.asarray(ac.run_isolated(_text_worker, flat), dtype=np.float32)
+    out, k = [], 0
+    weights = [1.0, 1.3, 0.6]
+    for q in qs:
+        v = sum(emb[k + j] * weights[j] for j in range(len(q)))
+        out.append(v / (np.linalg.norm(v) + 1e-9))
+        k += len(q)
+    return np.asarray(out)
+
+
+# ---------------------------------------------------------------------------------------------
+# Footage
+# ---------------------------------------------------------------------------------------------
+
+
+def _text_worker(texts: list[str]) -> list[list[float]]:
+    import open_clip
+    import torch
+
+    import voiceover_cut as vc
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    model, _, _ = open_clip.create_model_and_transforms(vc.CLIP_MODEL[0], pretrained=vc.CLIP_MODEL[1], device=device)
+    model.eval()
+    tok = open_clip.get_tokenizer(vc.CLIP_MODEL[0])
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(texts), 64):
+            e = model.encode_text(tok(texts[i : i + 64]).to(device))
+            out += (e / e.norm(dim=-1, keepdim=True)).float().cpu().numpy().tolist()
+    return out
+
+
+def index_footage(paths: list[str]) -> list[dict]:
+    """Per clip: duration, fps, created time, 1-Hz CLIP embeddings, shot size per second,
+    quality and motion per second, and its own internal cuts (so long files become shots)."""
+    import footage as fo
+
+    clips = []
+    for p in paths:
+        info = ac.probe(p)
+        if not info.has_video or info.duration < 0.8:
+            log(f"skipping (no usable video): {Path(p).name}")
+            continue
+        clips.append({"path": p, "duration": info.duration, "fps": info.fps or 30.0, "audio": info.has_audio})
+    if not clips:
+        raise AutocutError("no usable video clips")
+    t0 = time.time()
+    log(f"analysing {len(clips)} clip(s) (motion, sharpness, cuts; cached afterwards)")
+    for k, c in enumerate(clips, 1):
+        a = fo.analyse(c["path"])
+        q = fo.moment_quality(a)
+        mot = np.asarray(a["motion"], dtype=np.float32)
+        n = max(1, int(np.ceil(c["duration"])))
+        per = lambda v: np.asarray([float(np.mean(v[int(i * fo.FPS) : int((i + 1) * fo.FPS)])) if int(i * fo.FPS) < len(v) else (float(v[-1]) if len(v) else 0.0) for i in range(n)])  # noqa: E731
+        c["quality"] = per(q) if len(q) else np.full(n, 0.6)
+        c["motion"] = per(mot) if len(mot) else np.zeros(n)
+        med = float(np.median(mot)) if len(mot) else 1.0
+        cuts = [i / fo.FPS for i in np.nonzero(mot > max(30.0, 6 * med))[0]] if len(mot) else []
+        c["cuts"] = [t for t in cuts if 0.5 < t < c["duration"] - 0.5]
+        c["created"] = a.get("created") or 0.0
+        if k % 10 == 0:
+            log(f"progress {k}/{len(clips)} clips analysed")
+    imgs, text = fo.semantics([c["path"] for c in clips])
+    for c in clips:
+        e = imgs.get(c["path"])
+        c["emb"] = e if e is not None and len(e) else np.zeros((1, 512), np.float32)
+        d = fo.describe(c["emb"], text)
+        c["size"] = d["size"] or ["wide"]
+        c["look"] = np.asarray(d["look"] or [0.0])
+    log(f"footage understood in {time.time() - t0:.0f}s")
+    return clips
+
+
+# ---------------------------------------------------------------------------------------------
+# Choosing pictures
+# ---------------------------------------------------------------------------------------------
+
+
+def shots_for_lines(lines: list[dict], total: float, pace: str, lead: float = 0.12) -> list[dict]:
+    """Timeline slots: one per line (two or three when a line is long), covering 0..total
+    without gaps. Cuts sit `lead` s before the line starts (picture leads sound)."""
+    mx = PACE_MAX.get(pace, 4.8)
+    starts = [0.0] + [max(0.0, l["start"] - lead) for l in lines[1:]]
+    ends = starts[1:] + [total]
+    slots = []
+    import narrate_craft as nc
+
+    for i, (a, b, l) in enumerate(zip(starts, ends, lines)):
+        n = max(1, int(np.ceil((b - a) / (mx * nc.pace_factor(l)))))  # tense lines cut quicker, calm ones breathe
+        cuts = [a + (b - a) * k / n for k in range(1, n)]
+        if n > 1 and l.get("words"):  # move each even split onto the nearest breath (within 1 s)
+            breaths = [((w1["end"] + w2["start"]) / 2 - lead, w2["start"] - w1["end"]) for w1, w2 in zip(l["words"], l["words"][1:])]
+            snapped = []
+            for c in cuts:
+                near = [(abs(t - c) - 0.5 * g, t) for t, g in breaths if abs(t - c) <= 1.0 and g >= 0.12]
+                snapped.append(min(near)[1] if near else c)
+            cuts = sorted(c for c in snapped if a + 1.0 < c < b - 1.0)
+        pts = [a, *cuts, b]
+        for k, (x, y) in enumerate(zip(pts, pts[1:])):
+            slots.append({"start": x, "end": y, "line": i, "part": k, "of": len(pts) - 1})
+    return [s for s in slots if s["end"] - s["start"] > 0.2]
+
+
+def candidates(slot: dict, line: dict, q_emb: np.ndarray, clips: list[dict], first: bool, k: int = 30, hinted: set[int] | None = None,
+               hook: bool = False, own: set[int] | None = None) -> list[dict]:
+    """Best windows (clip, in) of the slot's length, with their unary score."""
+    dur = slot["end"] - slot["start"]
+    emo = line.get("emotion", "neutral")
+    want_motion = EMOTION_MOTION[emo] if emo in EMOTION_MOTION else 0.15 + 0.7 * __import__("emotions").info(emo)["arousal"]
+    out = []
+    for ci, c in enumerate(clips):
+        if c["duration"] < dur + 0.1:
+            continue
+        sims = c["emb"] @ q_emb  # per second
+        mot_all = c["motion"]
+        mot_n = np.clip(mot_all / max(1e-3, float(np.percentile(mot_all, 90)) if len(mot_all) else 1.0), 0, 1.5)
+        step = 0.5 if c["duration"] < 120 else 1.0
+        for a in np.arange(0.0, c["duration"] - dur - 0.05, step):
+            b = a + dur
+            if any(a + 0.15 < t < b - 0.15 for t in c["cuts"]):
+                continue  # never across the clip's own cut
+            i0, i1 = int(a), max(int(a) + 1, int(np.ceil(b)))
+            sem = float(np.mean(sims[i0:i1])) if i1 <= len(sims) else float(np.mean(sims[i0:])) if i0 < len(sims) else 0.0
+            qual = float(np.mean(c["quality"][i0:i1])) if i0 < len(c["quality"]) else 0.5
+            look = float(np.mean(c["look"][i0:i1])) if i0 < len(c["look"]) else 0.0
+            mot = float(np.mean(mot_n[i0:i1])) if i0 < len(mot_n) else 0.3
+            size = c["size"][min(i0, len(c["size"]) - 1)]
+            out.append({"clip": ci, "in": round(float(a), 2), "sem": sem, "qual": qual, "look": look, "mot": mot, "size": size})
+    if not out:
+        return []
+    any_stills = any(c.get("still") for c in clips)
+    # meaning first: how much better than the footage's typical match for this line
+    sems = np.asarray([x["sem"] for x in out])
+    mu, sd = float(np.median(sems)), float(sems.std() + 1e-6)
+    for x in out:
+        s = 1.0 * (x["sem"] - mu) / sd + 0.5 * x["qual"] + 0.2 * float(np.clip(x["look"], -1, 1)) - 0.3 * abs(min(1.0, x["mot"]) - want_motion)
+        if first and x["size"] in ("aerial", "wide") and not hook:
+            s += 0.2  # establish the place first
+        if hook:  # the first seconds: the most striking pictures (sharp, well exposed, moving)
+            s += 0.6 * x["qual"] + 0.4 * min(1.0, x["mot"]) + 0.2 * float(np.clip(x["look"], -1, 1))
+        if hinted and x["clip"] in hinted:
+            s += 1.2  # media found for exactly this line (topic videos)
+        if clips[x["clip"]].get("card"):
+            s -= 0.6  # text cards are seasoning: real pictures first
+        elif any_stills and not clips[x["clip"]].get("still"):
+            s += 0.3  # moving footage beats a photo
+        x["score"] = float(s)
+    out.sort(key=lambda x: -x["score"])
+    # keep variety in the shortlist: at most 4 windows per clip
+    per: dict[int, int] = {}
+    short = []
+    for x in out:
+        if per.get(x["clip"], 0) >= 4:
+            continue
+        per[x["clip"]] = per.get(x["clip"], 0) + 1
+        short.append(x)
+        if len(short) >= k:
+            break
+    if own:  # the creator's own footage always stays in the running (its share of the video is set later)
+        have = {(x["clip"], x["in"]) for x in short}
+        mine = [x for x in out if x["clip"] in own and (x["clip"], x["in"]) not in have]
+        per_own: dict[int, int] = {}
+        for x in mine:
+            if per_own.get(x["clip"], 0) < 2 and len(per_own) < 8:
+                per_own[x["clip"]] = per_own.get(x["clip"], 0) + 1
+                short.append(x)
+    return short
+
+
+def same_scene(clips: list[dict], a: dict, b: dict) -> float:
+    """0 … 1: how much two windows look like the same scene (CLIP picture similarity above 0.85)."""
+    ea, eb = clips[a["clip"]].get("emb", ()), clips[b["clip"]].get("emb", ())
+    if not len(ea) or not len(eb):
+        return 0.0
+    va, vb = ea[min(len(ea) - 1, int(a["in"]))], eb[min(len(eb) - 1, int(b["in"]))]
+    na, nb = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+    if na < 1e-6 or nb < 1e-6:
+        return 0.0
+    return float(np.clip((float(va @ vb) / (na * nb) - 0.85) / 0.12, 0.0, 1.0))
+
+
+def choose(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_order: bool, beam: int = 12, max_cards: int | None = None,
+           own: set[int] | None = None, own_bias: float = 0.0) -> list[dict]:
+    """The whole edit at once (beam search over slots). A still (photo, title card: `clip["still"]`)
+    is one moment: shown once, never in two slots. `max_cards`: the most text screens (never more
+    than about a quarter of the shots). `own_bias`: how much the creator's own footage is preferred."""
+    card_cap = max(1, len(slots) // 4) if max_cards is None else max(0, min(int(max_cards), max(1, len(slots) // 4)))
+    State = tuple  # (score, picks list, used {clip: [(a,b)]})
+    beams: list[tuple[float, list[dict], dict]] = [(0.0, [], {})]
+    for si, (slot, cs) in enumerate(zip(slots, cands)):
+        dur = slot["end"] - slot["start"]
+        nxt: list[tuple[float, list[dict], dict]] = []
+        for score, picks, used in beams:
+            prev = picks[-1] if picks else None
+            for c in cs:
+                spans = used.get(c["clip"], [])
+                if any(not (c["in"] + dur + 0.5 <= a or c["in"] >= b + 0.5) for a, b in spans):
+                    continue  # never show the same moment twice
+                if spans and clips[c["clip"]].get("still"):
+                    continue  # a photo or card is one moment however long its clip
+                if clips[c["clip"]].get("card"):
+                    if prev is not None and clips[prev["clip"]].get("card"):
+                        continue  # never two text cards in a row
+                    if sum(1 for q in picks if clips[q["clip"]].get("card")) >= card_cap:
+                        continue  # cards: at most about a quarter of the shots, or the creator's own limit
+                s = c["score"] + (own_bias if own and c["clip"] in own else 0.0)
+                if prev is not None:
+                    if prev["clip"] == c["clip"]:
+                        s -= 0.6 if slot["part"] == 0 else 0.2  # same clip again (softer inside one long line)
+                    look_alike = same_scene(clips, prev, c)
+                    if look_alike > 0:
+                        s -= 0.9 * look_alike  # the same place again right away reads as a repeat
+                    if prev["size"] == c["size"] and len(picks) >= 2 and picks[-2]["size"] == c["size"]:
+                        s -= 0.2  # three of the same shot size in a row
+                    if story_order and clips[c["clip"]]["created"] and clips[prev["clip"]]["created"]:
+                        if clips[c["clip"]]["created"] + 1 < clips[prev["clip"]]["created"]:
+                            s -= 0.12  # going back in time
+                s -= 0.1 * len(spans)  # spread across the footage
+                nu = dict(used)
+                nu[c["clip"]] = spans + [(c["in"], c["in"] + dur)]
+                nxt.append((score + s, picks + [c], nu))
+        if not nxt:  # ran out of fresh footage: allow reuse rather than fail (a text screen only when nothing else is left)
+            again = next((c for c in cs if not clips[c["clip"]].get("card")), cs[0] if cs else None)
+            nxt = [(score + again["score"] - 1.0, picks + [again], used) for score, picks, used in beams[:1] if again]
+            if not nxt:
+                raise AutocutError("not enough footage for the narration")
+        nxt.sort(key=lambda x: -x[0])
+        beams = nxt[:beam]
+    return beams[0][1]
+
+
+# ---------------------------------------------------------------------------------------------
+# Render
+# ---------------------------------------------------------------------------------------------
+
+
+def own_share_of(slots: list[dict], picks: list[dict], own: set[int]) -> float:
+    total = sum(s["end"] - s["start"] for s in slots)
+    return sum(s["end"] - s["start"] for s, p in zip(slots, picks) if p["clip"] in own) / total if total > 0 else 0.0
+
+
+def choose_with_share(slots: list[dict], cands: list[list[dict]], clips: list[dict], story_order: bool, own: set[int], share: float,
+                      max_cards: int | None = None) -> tuple[list[dict], float]:
+    """The edit whose share of the creator's own footage (by time) comes closest to `share` (0 … 1).
+    (the picks, the share reached). Each photo is still one moment, so few photos cannot fill much."""
+    def run(bias: float):
+        try:
+            picks = choose(slots, cands, clips, story_order, max_cards=max_cards, own=own, own_bias=bias)
+        except AutocutError:
+            return None
+        return picks, own_share_of(slots, picks, own)
+
+    best = run(0.0)
+    if best is None:
+        raise AutocutError("not enough footage for the narration")
+    more = best[1] < share
+    for bias in (0.6, 1.2, 2.5, 5.0, 12.0):  # (more of it, or less of it, step by step until the share is crossed)
+        if abs(best[1] - share) < 0.04:
+            break
+        got = run(bias if more else -bias)
+        if got is None:
+            continue
+        crossed = (got[1] >= share) if more else (got[1] <= share)
+        if abs(got[1] - share) < abs(best[1] - share):
+            best = got
+        if crossed:
+            break
+    return best
+
+
+def tall_frame_filter(W: int, H: int, TW: int, TH: int, opacity: float, blur: float = 0.0) -> str:
+    """A wide picture as a tall video: the picture itself across the middle, and the same picture
+    filling the frame behind it at `opacity` (0 … 1, over black), softened by `blur` (0: sharp … 1:
+    only colour and light are left). Ends in the label [framed]."""
+    o = min(1.0, max(0.0, float(opacity)))
+    b = min(1.0, max(0.0, float(blur)))
+    fh = int(round(TW * H / W / 2)) * 2
+    # (blurred at a quarter of the size: the same softness for a fraction of the work)
+    soft = f"scale={TW // 8 * 2}:{TH // 8 * 2},gblur=sigma={b * 14:.2f},scale={TW}:{TH}:flags=bilinear," if b > 0.01 else ""
+    return (f"[0:v]split=2[fa][fb];[fa]scale={TW}:{TH}:force_original_aspect_ratio=increase,crop={TW}:{TH},{soft}format=rgb24,"
+            f"colorchannelmixer=rr={o:.3f}:gg={o:.3f}:bb={o:.3f}[fbg];[fb]scale={TW}:{fh}[ffg];[fbg][ffg]overlay=0:{(TH - fh) // 2},format=yuv420p[framed]")
+
+
+def build_shots(slots: list[dict], picks: list[dict], lines: list[dict], clips: list[dict], fps: float, W: int, H: int) -> list[dict]:
+    shots = []
+    push = True
+    for i, (s, p) in enumerate(zip(slots, picks)):
+        frames = max(1, int(round(s["end"] * fps)) - int(round(s["start"] * fps)))
+        c = clips[p["clip"]]
+        mot = float(np.mean(c["motion"][int(p["in"]) : int(p["in"] + frames / fps) + 1])) if len(c["motion"]) else 0.0
+        sh = {"clip": c["path"], "in": p["in"], "frames": frames, "speed": 1.0, "line": s["line"], "text": lines[s["line"]]["text"],
+              "visual": lines[s["line"]].get("visual", ""), "match": round(p["sem"], 3), "size": p["size"]}
+        if mot < float(np.percentile(c["motion"], 40) if len(c["motion"]) else 1.0) and frames / fps >= 2.0:
+            sh["zoom"] = {"from": 1.0, "to": 1.06} if push else {"from": 1.06, "to": 1.0}  # still shots breathe
+            push = not push
+        if i > 0 and s["part"] == 0:
+            prev_sec = lines[slots[i - 1]["line"]].get("section")
+            cur_sec = lines[s["line"]].get("section")
+            gap = lines[s["line"]]["start"] - lines[slots[i - 1]["line"]]["end"]
+            _ = (prev_sec, cur_sec)
+            if gap > 0.9:  # a real pause in the narration (mood changes: narrate_craft.treat)
+                sh["transition_in"] = {"type": "dissolve", "frames": int(round(0.4 * fps))}
+        shots.append(sh)
+    if shots:
+        shots[0]["fade_in"] = int(round(0.4 * fps))
+        shots[-1]["fade_out"] = int(round(0.8 * fps))
+    return shots
+
+
+def caption_words(lines: list[dict]) -> list[dict]:
+    """Word timings from each line's exact text (spread over the line by length)."""
+    out = []
+    for l in lines:
+        if l.get("words"):
+            out += [{"word": w["word"], "start": w["start"], "end": w["end"]} for w in l["words"]]
+            continue
+        ws = l["text"].split()
+        if not ws:
+            continue
+        total = sum(len(w) + 1 for w in ws)
+        t = l["start"]
+        span = l["end"] - l["start"]
+        for w in ws:
+            d = span * (len(w) + 1) / total
+            out.append({"word": " " + w, "start": t, "end": t + d * 0.92})
+            t += d
+    return out
+
+
+def build_sound(voice: str, shots: list[dict], clips: list[dict], fps: float, total: float, dst: Path, music: str | None,
+                ambience_db: float, music_db: float) -> None:
+    """Voice + natural sound of the shown clips (low) + optional music, ducked under the voice."""
+    import music as mu
+
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", voice]
+    parts = [f"[0:a]aresample=48000,apad,atrim=0:{total:.4f},asetpts=PTS-STARTPTS[voice]"]
+    mix = ["[voice]"]
+    n = 1
+    with_audio = {c["path"] for c in clips if c["audio"]}
+    if ambience_db > -60 and shots:
+        labels = []
+        for k, s in enumerate(shots):
+            d = s["frames"] / fps
+            if s["clip"] in with_audio:
+                cmd += ["-ss", f"{s['in']:.3f}", "-t", f"{d + 0.2:.3f}", "-i", s["clip"]]
+                parts.append(f"[{n}:a]aresample=48000,asetpts=PTS-STARTPTS,atrim=0:{d:.4f},apad,atrim=0:{d:.4f},afade=t=in:d=0.08,afade=t=out:st={max(0, d - 0.08):.4f}:d=0.08[n{k}]")
+                n += 1
+            else:
+                parts.append(f"anullsrc=r=48000:cl=mono,atrim=0:{d:.4f}[n{k}]")
+            labels.append(f"[n{k}]")
+        parts.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1,aformat=channel_layouts=mono,volume={10 ** (ambience_db / 20):.4f}[amb]")
+        mix.append("[amb]")
+    if music:
+        m = mu.analyse(music)
+        start = mu.choose_window(m, total)
+        cmd += ["-ss", f"{start:.3f}", "-t", f"{total + 0.5:.3f}", "-i", music]
+        parts.append(f"[{n}:a]aresample=48000,apad,atrim=0:{total:.4f},afade=t=in:d=1.0,afade=t=out:st={max(0, total - 2.5):.4f}:d=2.5,volume={10 ** (music_db / 20):.4f}[mus]")
+        n += 1
+        mix.append("[mus]")
+    if len(mix) > 1:
+        parts.append("[voice]asplit=2[v1][v2]")
+        bed = mix[1:]
+        if len(bed) > 1:
+            parts.append(f"{''.join(bed)}amix=inputs={len(bed)}:normalize=0[bed]")
+        else:
+            parts.append(f"{bed[0]}anull[bed]")
+        parts.append("[bed][v2]sidechaincompress=threshold=0.03:ratio=6:attack=15:release=450[duck]")
+        parts.append("[v1][duck]amix=inputs=2:normalize=0:duration=first[mixed]")
+        out = "[mixed]"
+    else:
+        out = "[voice]"
+    parts.append(f"{out}loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000,atrim=0:{total:.4f}[ao]")
+    graph = ";\n".join(parts)
+    with tempfile.TemporaryDirectory(prefix="ei-nsnd-") as tmp:
+        g = Path(tmp) / "g.txt"
+        g.write_text(graph)
+        ac.run(cmd + ac.filter_script_args(str(g)) + ["-map", "[ao]", "-c:a", "pcm_s16le", str(dst)])
+
+
+def make(voice: str, clips_in: list[str], out: str, *, narration: str | None = None, script: str | None = None, aspect: str = "horizontal",
+         pace: str = "medium", captions: bool = False, caption_style: str = "clean", music: str | None = None, music_db: float = -20.0,
+         ambience_db: float = -24.0, describe: str = "local", model: str | None = None, story_order: bool = True, look: str = "natural",
+         whisper_model: str = ac.DEFAULT_WHISPER, workers: int = 2, plan_only: bool = False, hints: dict[str, list[int]] | None = None,
+         stills: set[str] | None = None, cards: set[str] | None = None, sound: dict | None = None, resolution: str = "1080p",
+         hook: str = "auto", niche: str = "", screen_text: str | None = None, max_cards: int | None = None, own: set[str] | None = None,
+         own_share: float | None = None, tall_frame: float | None = None, frame_blur: float = 0.5) -> dict:
+    """`sound`: optional emotional sound design (score.options): music per mood, hits, risers, pauses.
+    `max_cards`: the most text screens. `own` + `own_share`: the creator's own clips and how much of
+    the length (0 … 1) they should cover. `tall_frame`: a wide edit delivered tall, the same picture
+    behind it at this opacity (0 … 1) and softened by `frame_blur` (0 … 1); captions are then laid out for the tall frame."""
+    import render
+
+    sound_opts = sound
+    import voiceover_cut as vc
+
+    ac.require_tools()
+    voice = str(Path(voice).resolve())
+    vinfo = ac.probe(voice)
+    if not vinfo.has_audio:
+        raise AutocutError("the voiceover has no sound")
+    if aspect not in ASPECTS:
+        raise AutocutError(f"aspect must be one of {', '.join(ASPECTS)}")
+    W, H = ac.sized(*ASPECTS[aspect], resolution)
+    fps = 30.0
+    total = vinfo.duration
+    t0 = time.time()
+    sibling = Path(voice).with_suffix(".narration.json")
+    if not narration and not script and sibling.is_file():
+        narration = str(sibling)  # a cloned-voice narration from voice.py: exact lines, emotions, shot ideas
+        log(f"using {sibling.name}")
+    if narration:
+        lines = lines_from_narration(json.loads(Path(narration).read_text(encoding="utf-8")))
+        lang = next((s.get("lang") for s in json.loads(Path(narration).read_text(encoding="utf-8")).get("segments", []) if s.get("lang")), None)
+    else:
+        sc = json.loads(Path(script).read_text(encoding="utf-8")) if script and script.endswith(".json") else None
+        prompt = " ".join(s["text"] for s in sc["segments"])[:800] if sc else (Path(script).read_text(encoding="utf-8")[:800] if script else None)
+        tr = ac.transcribe(voice, model=whisper_model, prompt=prompt)
+        lang = tr.get("language")
+        lines = lines_from_words(tr["words"], total)
+        if sc:
+            align_script(lines, sc)
+    if not lines:
+        raise AutocutError("no speech found in the voiceover")
+    log(f"{len(lines)} narration lines")
+    ac.progress_plan({"understanding": 0.45, "planning": 0.15, "rendering": 0.25, "sound": 0.15})
+    describe_lines(lines, describe, model)
+    english_gloss(voice, lines, whisper_model)
+    import narrate_craft as nc
+
+    if hook not in nc.HOOK_MODES:
+        raise AutocutError(f"hook must be one of {', '.join(nc.HOOK_MODES)}")
+    work = Path(tempfile.mkdtemp(prefix="ei-narrate-hook-"))
+    hook_text = None
+    if hook in ("auto", "teaser", "both") and total >= 15:
+        ti = nc.teaser_pick(lines)
+        if ti is not None:  # the cold open: the narration's strongest line first
+            voice_t = work / "voice-with-teaser.wav"
+            lines, head = nc.with_teaser(voice, lines, ti, voice_t)
+            voice, total = str(voice_t), total + head
+            log(f"hook: opens on “{lines[0]['text'][:60]}” ({lines[0].get('emotion')}), then the start")
+        elif hook == "teaser":
+            log("hook: no line is strong enough for a cold open; starting with the first line")
+    if hook in ("auto", "text", "both") and screen_text and len(screen_text.split()) <= 10:
+        hook_text = screen_text.strip()
+        log(f"hook text on screen: “{hook_text}” (yours)")
+    elif hook in ("auto", "text", "both"):
+        hook_text = nc.screen_hook(lines, niche, "hi" if any(re.search(r"[ऀ-ॿ]", str(x.get("text", ""))) for x in lines) else "en",
+                                   "claude", model)
+        log(f"hook text on screen: “{hook_text}”")
+    with ac.stage("understanding"):
+        clips = index_footage(vc.collect_clips(clips_in))
+    planning = contextlib.ExitStack()
+    planning.enter_context(ac.stage("planning"))
+    q = line_embeddings(lines)
+    slots = shots_for_lines(lines, total, pace)
+    if hook != "off":
+        slots = nc.fast_open(slots)
+    for c in clips:
+        c["still"] = c["path"] in (stills or set()) or c["path"] in (cards or set())
+        c["card"] = c["path"] in (cards or set())
+    by_line: dict[int, set[int]] = {}
+    for ci, c in enumerate(clips):
+        for li in (hints or {}).get(c["path"], []):
+            by_line.setdefault(int(li), set()).add(ci)
+    own_ix = {ci for ci, c in enumerate(clips) if c["path"] in (own or set())}
+    if max_cards is not None and max_cards <= 0 and any(not c["card"] for c in clips):
+        for c in clips:  # no text screens at all: they are not even candidates
+            if c["card"]:
+                c["duration"] = 0.0
+    cands = [candidates(s, lines[s["line"]], q[s["line"]], clips, first=(i == 0), hinted=by_line.get(s["line"]), hook=bool(s.get("hook")) and hook != "off",
+                        own=own_ix if own_share is not None else None)
+             for i, s in enumerate(slots)]
+    if own_ix and own_share is not None:
+        picks, reached = choose_with_share(slots, cands, clips, story_order, own_ix, min(1.0, max(0.0, own_share)), max_cards)
+        log(f"your own footage covers {reached * 100:.0f}% of the length (asked: {own_share * 100:.0f}%)"
+            + ("; there is not enough of it for more: a photo is shown once" if reached < own_share - 0.1 else ""))
+    else:
+        picks = choose(slots, cands, clips, story_order, max_cards=max_cards)
+    shots = build_shots(slots, picks, lines, clips, fps, W, H)
+    by_path = {c["path"]: c for c in clips}
+    craft = nc.treat(shots, slots, lines, by_path, fps)
+    framed = nc.frame_for_shape(shots, W, H, fps, by_path)
+    log(f"craft: {craft['punches']} punch-in(s), {craft['slow']} slow-motion shot(s), {craft['transitions']} mood transition(s), "
+        f"{framed} shot(s) framed on their subject")
+    outp = Path(out).resolve()
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    plan = {"version": 2, "mode": "narrate", "voice": voice, "width": W, "height": H, "fps": fps, "look": look, "lines": lines, "shots": shots,
+            "music": music, "language": lang, "hook": hook, "hook_text": hook_text}
+    plan_path = outp.with_suffix(".narrate.json")
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=1, default=float), encoding="utf-8")
+    used = len({s["clip"] for s in shots})
+    log(f"planned {len(shots)} shots from {used} clip(s) for {total:.0f}s of narration in {time.time() - t0:.0f}s; "
+        f"mean picture match {np.mean([s['match'] for s in shots]):.2f}")
+    planning.close()
+    if plan_only:
+        __import__("shutil").rmtree(work, ignore_errors=True)
+        return {"outputs": [], "plan": str(plan_path), "out_dir": str(outp.parent)}
+    with tempfile.TemporaryDirectory(prefix="ei-narrate-") as tmp:
+        # rendered shots are kept next to the output until the edit is done: a retry reuses them
+        rwork = outp.parent / ".ei-work" / outp.stem
+        rwork.mkdir(parents=True, exist_ok=True)
+        rplan = rwork / "plan.json"
+        rplan.write_text(json.dumps({**plan, "lines": []}, default=float))
+        video = Path(tmp) / "video.mp4"
+        with ac.stage("rendering"):
+            render.render(rplan, str(video), workers=workers)
+        sound = Path(tmp) / "sound.wav"
+        vtotal = sum(s["frames"] for s in shots) / fps
+        sounding = contextlib.ExitStack()
+        sounding.enter_context(ac.stage("sound"))
+        if sound_opts:  # voice + clip sound first, then the score over it (ducking under the voice alone)
+            import score
+
+            base = Path(tmp) / "base.wav"
+            build_sound(voice, shots, clips, fps, vtotal, base, None, ambience_db, music_db)
+            who = score.tag_emotions(lines, sound_opts.get("tag", "claude"), model)
+            cuts, t_ = [], 0.0
+            for s_ in shots[:-1]:
+                t_ += s_["frames"] / fps
+                cuts.append(round(t_, 3))
+            sp = score.render(str(base), lines, vtotal, sound, duck_source=voice, cuts=cuts, plan_path=outp.with_suffix(".score.json"),
+                              **{k: v for k, v in sound_opts.items() if k != "tag"})
+            credits = score.credits(sp)
+            if credits:
+                outp.with_suffix(".credits.txt").write_text("\n".join(credits) + "\n", encoding="utf-8")
+            log(f"sound design: emotions from {who}; " + ("; ".join(credits) or "no music credits needed"))
+        else:
+            build_sound(voice, shots, clips, fps, vtotal, sound, str(Path(music).resolve()) if music else None, ambience_db, music_db)
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(sound)]
+        words = caption_words(lines)
+        framed = tall_frame is not None and W > H
+        CW, CH = ac.sized(1080, 1920, resolution) if framed else (W, H)  # (captions are laid out for the frame that is delivered)
+        if framed:
+            log(f"tall frame: the wide picture across the middle of {CW}x{CH}, the same picture behind it at {min(1.0, max(0.0, tall_frame)) * 100:.0f}%"
+                + (f", blurred {min(1.0, max(0.0, frame_blur)) * 100:.0f}%" if frame_blur > 0.01 else ", sharp"))
+        if (captions and words) or hook_text:
+            import captions as cap
+
+            ass = cap.build_ass(words if captions else [], None, CW, CH, total, caption_style, "off")
+            if hook_text:
+                ass = nc.hook_ass(ass, hook_text, CW, CH)
+            if any(re.search(r"[ऀ-ॿ]", w["word"]) for w in words) or re.search(r"[ऀ-ॿ]", hook_text or ""):
+                ass = ass.replace("Avenir Next Heavy", "Kohinoor Devanagari").replace("Avenir Next Demi Bold", "Kohinoor Devanagari")
+            af = Path(tmp) / "c.ass"
+            af.write_text(ass, encoding="utf-8")
+            e = str(af).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+            if framed:
+                cmd += ["-filter_complex", tall_frame_filter(W, H, CW, CH, tall_frame, frame_blur) + f";[framed]subtitles=filename='{e}'[vout]"]
+            else:
+                cmd += ["-vf", f"subtitles=filename='{e}'"]
+            cmd += ["-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(CW, CH)]
+        elif framed:
+            cmd += ["-filter_complex", tall_frame_filter(W, H, CW, CH, tall_frame, frame_blur).replace("[framed]", "[vout]"), "-c:v", "h264_videotoolbox", "-b:v", ac.bitrate_for(CW, CH)]
+        else:
+            cmd += ["-c:v", "copy"]
+        partial = outp.with_name(outp.stem + ".part.mp4")
+        cmd += ["-map", "[vout]" if framed else "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(partial)]
+        ac.run(cmd)
+        partial.replace(outp)
+    import shutil
+
+    sounding.close()
+    shutil.rmtree(work, ignore_errors=True)
+    shutil.rmtree(outp.parent / ".ei-work" / outp.stem, ignore_errors=True)  # the edit is done: its kept shots are not needed
+    try:
+        (outp.parent / ".ei-work").rmdir()
+    except OSError:
+        pass
+    if words:
+        outp.with_suffix(".srt").write_text(ac.to_srt(ac.group_words(words, max_words=7, max_chars=42)), encoding="utf-8")
+    log(f"done: {outp.name} in {time.time() - t0:.0f}s")
+    return {"outputs": [str(outp)], "plan": str(plan_path), "out_dir": str(outp.parent)}
+
+
+def add_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("voice", help="the voiceover (audio or video)")
+    p.add_argument("--clips", nargs="+", required=True, help="footage files and/or folders")
+    p.add_argument("--out", required=True)
+    p.add_argument("--narration", help=".narration.json from voice.py (exact lines, emotions, visuals)")
+    p.add_argument("--script", help=".script.json or .txt the voiceover was read from")
+    p.add_argument("--aspect", default="horizontal", choices=list(ASPECTS))
+    p.add_argument("--resolution", default="1080p", choices=list(ac.RESOLUTIONS), help="1080p, or 4k in any shape")
+    p.add_argument("--pace", default="medium", choices=list(PACE_MAX))
+    p.add_argument("--captions", action="store_true")
+    p.add_argument("--caption-style", default="clean", choices=["pop", "clean", "boxed"])
+    p.add_argument("--music")
+    p.add_argument("--music-db", type=float, default=-20.0)
+    p.add_argument("--ambience-db", type=float, default=-24.0, help="natural sound of the clips under the voice (-60 = off)")
+    p.add_argument("--describe", default="local", choices=["claude", "local", "none"], help="who writes picture briefs for lines")
+    p.add_argument("--llm", default="default")
+    p.add_argument("--no-story-order", action="store_true")
+    p.add_argument("--look", default="natural")
+    p.add_argument("--plan-only", action="store_true")
+    p.add_argument("--hook", default="auto", choices=["auto", "teaser", "text", "both", "off"],
+                   help="auto: open on the strongest line (cold open) + an on-screen hook + fast first cuts; teaser/text: only one; off: none")
+    p.add_argument("--niche", default="", help="the channel's niche (for the hook library)")
+    import score
+
+    score.add_sound_args(p)
+
+
+def run_args(a) -> dict:
+    import score
+
+    return make(a.voice, a.clips, a.out, narration=a.narration, script=a.script, aspect=a.aspect, pace=a.pace, captions=a.captions,
+                caption_style=a.caption_style, music=a.music, music_db=a.music_db, ambience_db=a.ambience_db, describe=a.describe,
+                model=a.llm, story_order=not a.no_story_order, look=a.look, workers=getattr(a, "workers", 2), plan_only=a.plan_only,
+                sound=score.options(a), resolution=a.resolution, hook=a.hook, niche=a.niche)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_args(ap)
+    try:
+        print(json.dumps(run_args(ap.parse_args(argv)), ensure_ascii=False))
+    except AutocutError as e:
+        log(f"error: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

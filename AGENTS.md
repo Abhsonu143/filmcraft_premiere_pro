@@ -86,7 +86,8 @@ reproduce an image (for example, point lists traced from someone else's icon).
    `crates/media`, procedural looks in `crates/render`) are original work under the project licence
    and are listed in `ATTRIBUTION.md`.
 7. **When in doubt, leave it out** and draw or generate it yourself.
-8. **The one exception: first-party ArtCraft brand marks.** The ArtCraft name and logos in `docs/brand/`
+8. **(EI fork: the ArtCraft marks have been removed from this repository; EI draws its own wordmark and
+   icon in code. Upstream's rule follows for reference.) The one exception: first-party ArtCraft brand marks.** The ArtCraft name and logos in `docs/brand/`
    are trademarks of the ArtCraft Team, not open source, usable only unmodified and only in the context of
    FilmCraft under `docs/brand/LICENSE-brand.txt`; forks and modified versions must remove them. They still
    need a sidecar and an `ATTRIBUTION.md` row (licence `LicenseRef-ArtCraft-Trademark`). No other

@@ -6,8 +6,9 @@
 //! [`resolve`] maps a family + style name (as stored in projects) to a face and the synthetic
 //! bold/italic needed when the family lacks that style. Unknown families fall back to Inter.
 
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
 use skrifa::instance::{LocationRef, Size};
 use skrifa::{FontRef, MetadataProvider};
@@ -182,13 +183,27 @@ pub struct VMetrics {
     pub underline_thickness: f32,
 }
 
+/// A font file's bytes, read once however many faces of it are in use: the faces of a collection
+/// (`.ttc`) share one copy instead of each holding the whole file.
+fn read_shared(path: &Path) -> Option<Arc<Vec<u8>>> {
+    static FILES: OnceLock<Mutex<HashMap<PathBuf, Weak<Vec<u8>>>>> = OnceLock::new();
+    let mut files = FILES.get_or_init(Default::default).lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(b) = files.get(path).and_then(Weak::upgrade) {
+        return Some(b);
+    }
+    let b = Arc::new(std::fs::read(path).ok()?);
+    files.retain(|_, w| w.strong_count() > 0);
+    files.insert(path.to_path_buf(), Arc::downgrade(&b));
+    Some(b)
+}
+
 impl Face {
     fn bytes(&self) -> Option<&[u8]> {
         self.bytes
             .get_or_init(|| match &self.info.data {
                 FaceData::Static(b) => Some(FaceBytes::Static(b)),
                 FaceData::Shared(b) => Some(FaceBytes::Shared(b.clone())),
-                FaceData::File(p) => std::fs::read(p).ok().map(|v| FaceBytes::Shared(Arc::new(v))),
+                FaceData::File(p) => read_shared(p).map(FaceBytes::Shared),
             })
             .as_ref()
             .map(FaceBytes::get)
@@ -196,6 +211,29 @@ impl Face {
     /// A copy of the font file's bytes (None if it is missing or unreadable).
     pub fn data(&self) -> Option<Vec<u8>> {
         self.bytes().map(<[u8]>::to_vec)
+    }
+    /// Whether the face covers every character of `text`, without keeping a font file it had not
+    /// loaded yet in memory (for searching many installed fonts once).
+    pub fn covers_unloaded(&self, text: &str) -> bool {
+        let check = |b: &[u8]| FontRef::from_index(b, self.info.index).is_ok_and(|f| text.chars().all(|c| f.charmap().map(c).is_some_and(|g| g.to_u32() != 0)));
+        match (self.bytes.get(), &self.info.data) {
+            (Some(Some(b)), _) => check(b.get()),
+            (Some(None), _) => false,
+            (None, FaceData::File(p)) => std::fs::read(p).is_ok_and(|b| check(&b)),
+            (None, _) => self.bytes().is_some_and(check),
+        }
+    }
+    /// A copy of the font file's bytes that leaves an unloaded file unloaded (the one copy is the
+    /// caller's).
+    pub fn data_unloaded(&self) -> Option<Vec<u8>> {
+        match (self.bytes.get(), &self.info.data) {
+            (None, FaceData::File(p)) => std::fs::read(p).ok(),
+            _ => self.data(),
+        }
+    }
+    /// Whether this face's font data is in memory.
+    pub fn is_loaded(&self) -> bool {
+        self.bytes.get().is_some_and(Option::is_some)
     }
     /// The parsed font (None if the file is missing or unreadable).
     pub fn font(&self) -> Option<FontRef<'_>> {
@@ -475,7 +513,79 @@ pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
             return f.id;
         }
     }
-    prefer
+    system_fallback(c, &p).unwrap_or(prefer)
+}
+
+/// Fallback order among installed fonts: faces made for the script first, broad ones last.
+fn fallback_rank(family: &str) -> u8 {
+    let f = family.to_ascii_lowercase();
+    if f.starts_with('.') || f.contains("last resort") {
+        3 // (macOS private UI faces)
+    } else if [
+        "devanagari",
+        "bangla",
+        "gurmukhi",
+        "gujarati",
+        "tamil",
+        "telugu",
+        "kannada",
+        "malayalam",
+        "kohinoor",
+        "hiragino",
+        "pingfang",
+        "heiti",
+        "songti",
+        "arabic",
+        "geeza",
+        "hebrew",
+        "thai",
+        "noto sans",
+        "emoji",
+    ]
+    .iter()
+    .any(|k| f.contains(k))
+    {
+        0
+    } else if f.contains("arial unicode") {
+        2
+    } else {
+        1
+    }
+}
+
+/// An installed font for a character no loaded face has. The search reads each font file once
+/// and keeps only the face it picks (keeping every installed font cost 3 GB); the answer, also
+/// "none", is remembered per character.
+fn system_fallback(c: char, like: &Face) -> Option<FaceId> {
+    static FOUND: OnceLock<Mutex<HashMap<char, Option<FaceId>>>> = OnceLock::new();
+    let found = FOUND.get_or_init(Default::default);
+    if let Some(r) = found.lock().unwrap_or_else(PoisonError::into_inner).get(&c) {
+        return *r;
+    }
+    if cfg!(target_arch = "wasm32") || c.is_whitespace() {
+        return None;
+    }
+    scan_system();
+    let faces = all_faces();
+    let mut cands: Vec<&Arc<Face>> = faces.iter().filter(|f| f.info.origin == "system" && !f.is_loaded()).collect();
+    cands.sort_by_key(|f| (fallback_rank(&f.info.family), f.info.italic != like.info.italic, f.info.weight.abs_diff(like.info.weight)));
+    // one read per file, whatever its number of faces
+    let mut seen: HashMap<PathBuf, Option<Vec<u32>>> = HashMap::new();
+    let mut pick = None;
+    for f in cands {
+        let FaceData::File(path) = &f.info.data else { continue };
+        let covering = seen.entry(path.clone()).or_insert_with(|| {
+            let bytes = std::fs::read(path).ok()?;
+            let n = skrifa::FontRef::fonts(&bytes).count().min(256) as u32;
+            Some((0..n).filter(|i| FontRef::from_index(&bytes, *i).is_ok_and(|font| font.charmap().map(c).is_some_and(|g| g.to_u32() != 0))).collect())
+        });
+        if covering.as_ref().is_some_and(|v| v.contains(&f.info.index)) {
+            pick = Some(f.id);
+            break;
+        }
+    }
+    found.lock().unwrap_or_else(PoisonError::into_inner).insert(c, pick);
+    pick
 }
 
 #[cfg(test)]
@@ -501,6 +611,23 @@ mod tests {
         // Inter Bold Italic: nearest is Italic (400) → synth bold
         let bi = resolve("Inter", "Bold Italic");
         assert!(face(bi.face).info.italic && bi.synth_bold && !bi.synth_italic);
+    }
+
+    /// Regression: titles found a font for Hindi, Chinese or Arabic only among fonts already in
+    /// memory, which held only while every installed font was (the 3 GB leak). Now the installed
+    /// fonts are searched when needed and only the chosen one stays loaded.
+    #[test]
+    fn missing_characters_find_an_installed_font() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let inter = resolve("Inter", "Regular").face;
+        for c in ['क', '中', 'ع'] {
+            let f = face(fallback_for(c, inter));
+            assert!(f.has_char(c), "{c} fell back to {} without it", f.info.family);
+        }
+        let loaded = all_faces().iter().filter(|f| f.info.origin == "system" && f.is_loaded()).count();
+        assert!(loaded <= 12, "{loaded} system faces kept in memory");
     }
 
     #[test]

@@ -1,0 +1,295 @@
+"""Voice cloning, script writing and the voiceover editor: pure logic (no models)."""
+
+import json
+
+import numpy as np
+import pytest
+
+import narrate as nr
+import script_writer as sw
+import voice as vo
+import voice_prompts as vp
+
+
+def W(word, s, e):
+    return {"word": word, "start": s, "end": e}
+
+
+# ---------------------------------------------------------------- prompts
+
+
+def test_prompts_cover_both_languages_and_deliveries():
+    ps = vp.prompts(["hi", "mix", "en"])
+    langs = {p["lang"] for p in ps}
+    assert langs == {"en", "hi"} and {p["set"] for p in ps} == {"hi", "mix", "en"}
+    assert [p["set"] for p in vp.prompts(["en"])] == ["en"] * 25  # 24 sentences + free talk
+    assert vp.prompts(["en", "mix"])[0]["set"] == "en" and vp.prompts(["mix"])[0]["lang"] == "hi"
+    emos = {p["emotion"] for p in ps if not p.get("free")}
+    assert {"calm", "excited", "curious", "serious", "warm", "suspense", "hook", "cta"} <= emos
+    hindi = " ".join(p["text"] for p in ps if p["lang"] == "hi")
+    for sound in ["ख", "घ", "छ", "झ", "ठ", "ढ", "थ", "ध", "फ", "भ", "ड़", "ढ़", "ँ", "ज़", "फ़", "क्ष", "त्र", "ज्ञ"]:
+        assert sound in hindi, sound
+    assert len({p["id"] for p in ps}) == len(ps)
+
+
+# ---------------------------------------------------------------- transcripts & style
+
+
+def test_parse_srt_and_rolling_vtt():
+    srt = "1\n00:00:01,000 --> 00:00:02,500\nHello there\n\n2\n00:00:02,500 --> 00:00:04,000\nfriends of mine\n"
+    cues = sw.parse_timed(srt)
+    assert [c["text"] for c in cues] == ["Hello there", "friends of mine"] and cues[0]["start"] == pytest.approx(1.0)
+    vtt = ("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nतो दोस्तों आज\n\n00:00:02.000 --> 00:00:04.000\nतो दोस्तों आज हम चलेंगे\n\n"
+           "00:00:04.000 --> 00:00:06.000\nहम चलेंगे <c>spiti</c> की ओर\n")
+    assert [c["text"] for c in sw.parse_timed(vtt)] == ["तो दोस्तों आज", "हम चलेंगे", "spiti की ओर"]
+
+
+def test_style_profile_detects_hinglish_and_rate():
+    cues = [{"start": i * 4.0, "end": i * 4.0 + 3.5, "text": "तो अभी हम लोग drone उड़ाने वाले हैं, बहुत ही amazing view है!"} for i in range(20)]
+    prof = sw.analyse_style([{"name": "a", "cues": cues, "text": " ".join(c["text"] for c in cues)}])
+    assert prof["language"] == "hinglish"
+    assert 150 <= prof["words_per_minute"] <= 250
+    assert prof["exclamation_rate"] > 0.5 and "हम लोग" in prof["signature_phrases"]
+
+
+def test_pick_caption_track_never_a_translation():
+    assert sw.pick_track({"subtitles": {"en": []}, "automatic_captions": {"hi-orig": []}}) == ("en", False)
+    assert sw.pick_track({"language": "hi", "automatic_captions": {"hi-orig": [], "en": []}}) == ("hi-orig", True)
+    assert sw.pick_track({"language": "fr", "automatic_captions": {"fr-orig": [], "en": []}}) is None
+
+
+def test_script_prompt_and_cleaning():
+    p = sw.build_prompt("Spiti trip", niche="travel", seconds=60, language="hinglish", tone="", audience="", notes="", style=None, footage=["river"])
+    assert "Hinglish" in p and "JSON" in p and "river" in p
+    assert sw.target_words(60, "en", None, wpm_override=120) < sw.target_words(60, "en", None, wpm_override=180)
+    seg = sw.clean_segment({"text": "  Hello (laughs) **world** #travel ", "emotion": "ANGRY", "energy": "x", "pause_after": 9})
+    assert seg["text"] == "Hello world travel" and seg["emotion"] == "Anger" and seg["energy"] == 0.5 and seg["pause_after"] == 2.0
+    assert sw.clean_segment({"text": "x", "emotion": "bored"})["emotion"] == "Neutral"
+    assert sw.clean_segment({"text": "x", "emotion": "awe", "intensity": 3})["intensity"] == 1.0
+    assert "Triumph" in p and "intensity" in p
+    data = sw.extract_json('Sure!\n```json\n{"title": "T", "segments": []}\n```')
+    assert data["title"] == "T"
+
+
+# ---------------------------------------------------------------- voice
+
+
+def test_audio_features_and_pitch():
+    t = np.arange(vo.SR * 2) / vo.SR
+    y = (0.3 * np.sin(2 * np.pi * 150 * t)).astype(np.float32)
+    f = vo.features(y, words=5)
+    assert f["pitch_hz"] == pytest.approx(150, rel=0.05) and f["clipped"] == 0
+    padded = np.concatenate([np.zeros(vo.SR), y, np.zeros(vo.SR)])
+    assert len(vo.trim_silence(padded)) < len(padded) * 0.6
+
+
+def test_cer_and_language():
+    assert vo.cer("Hello, world!", "hello world") == 0
+    assert vo.cer("नमस्ते दोस्तों", "नमस्ते दोस्तो") < 0.15
+    assert vo.detect_lang("आज का video") == "hi" and vo.detect_lang("today") == "en"
+
+
+def test_phrase_cuts_for_references():
+    ws = [W(" w", i * 0.4, i * 0.4 + 0.3) for i in range(10)] + [W(" x", 6 + i * 0.4, 6 + i * 0.4 + 0.3) for i in range(12)]
+    cuts = vo.phrase_cuts(ws)
+    assert len(cuts) == 2 and all(3 <= b - a <= 12 for a, b, _ in cuts)
+
+
+def test_reference_choice_prefers_language_and_delivery():
+    def ref(f, lang, emo, q=0.9, lvl=-20):
+        return {"file": f, "lang": lang, "emotion": emo, "quality": q, "similarity": 0.8, "text": "x", "features": {"level_db": lvl, "dur": 7}}
+
+    prof = {"refs": [ref("a", "en", "calm"), ref("b", "hi", "calm"), ref("c", "hi", "excited", lvl=-14), ref("d", "hi", "excited", q=0.2)]}
+    assert vo.choose_ref(prof, "hi", "excited", 0.85, {})["file"] == "c"
+    assert vo.choose_ref(prof, "en", "excited", 0.85, {})["file"] in ("a", "c")
+    assert vo.choose_ref(prof, "hi", "calm", 0.2, {})["file"] == "b"
+    p1, p2 = vo.engine_params({"emotion": "calm", "energy": 0.2}, "chatterbox"), vo.engine_params({"energy": 0.9, "pace": "fast"}, "chatterbox")
+    assert p1["exaggeration"] < p2["exaggeration"] and p2["cfg_weight"] < p1["cfg_weight"]
+
+
+def test_script_segments_from_json_and_text(tmp_path):
+    j = tmp_path / "s.script.json"
+    j.write_text(json.dumps({"language": "hinglish", "segments": [{"text": "नमस्ते", "emotion": "warm"}, {"text": " "}]}), encoding="utf-8")
+    segs, lang = vo.script_segments(str(j))
+    assert lang == "hi" and len(segs) == 1
+    segs, lang = vo.script_segments("[excited] What a view! [calm] Then silence. [Awe 0.9] Look up.")
+    assert lang == "en" and [s["emotion"] for s in segs] == ["Excitement", "Calmness", "Awe"] and segs[2]["intensity"] == 0.9
+
+
+# ---------------------------------------------------------------- voiceover editor
+
+
+def test_subject_only_strips_camera_words():
+    assert nr.subject_only("Low drone tracking shot following a winding river up a green valley") == "winding river green valley"
+    assert nr.subject_only("aerial shot") == "aerial shot"  # nothing left: keep the brief
+
+
+def test_slots_cover_the_timeline_and_split_long_lines():
+    lines = [{"start": 0.3, "end": 3.0, "text": "a", "words": []}, {"start": 3.4, "end": 14.0, "text": "b",
+             "words": [W(" w", 3.4 + i, 3.4 + i + 0.7) for i in range(10)]}]
+    slots = nr.shots_for_lines(lines, 15.0, "medium")
+    assert slots[0]["start"] == 0 and slots[-1]["end"] == 15.0
+    assert all(abs(a["end"] - b["start"]) < 1e-9 for a, b in zip(slots, slots[1:]))  # no gaps, never black
+    assert slots[1]["start"] == pytest.approx(3.4 - 0.12)  # picture leads the words
+    assert sum(1 for s in slots if s["line"] == 1) >= 3 and max(s["end"] - s["start"] for s in slots) <= nr.PACE_MAX["medium"] + 1.3
+
+
+def test_choice_never_repeats_a_moment_and_varies_clips():
+    clips = [{"created": 0.0}, {"created": 0.0}]
+    slots = [{"start": i * 3.0, "end": i * 3.0 + 3, "line": i, "part": 0} for i in range(4)]
+    best = [{"clip": 0, "in": 0.0, "score": 3.0, "sem": 0.3, "size": "wide"}, {"clip": 0, "in": 10.0, "score": 2.9, "sem": 0.3, "size": "wide"},
+            {"clip": 1, "in": 0.0, "score": 2.8, "sem": 0.3, "size": "close"}, {"clip": 1, "in": 8.0, "score": 2.7, "sem": 0.3, "size": "medium"}]
+    picks = nr.choose(slots, [best] * 4, clips, story_order=False)
+    spans = {(p["clip"], p["in"]) for p in picks}
+    assert len(spans) == 4  # every moment used once
+    assert all(a["clip"] != b["clip"] for a, b in zip(picks, picks[1:]))  # alternate clips
+
+
+def test_caption_words_follow_the_script_text():
+    ws = nr.caption_words([{"start": 1.0, "end": 3.0, "text": "आज हम पहाड़ों पर हैं", "words": []}])
+    assert [w["word"].strip() for w in ws] == ["आज", "हम", "पहाड़ों", "पर", "हैं"]
+    assert ws[0]["start"] == 1.0 and ws[-1]["end"] <= 3.0
+
+
+def test_hindi_check_ignores_spelling_of_english_words_and_numbers():
+    text = "बस तीस percent battery बची थी"
+    assert vo.speech_error("बस 30% बैटरी बची थी", text) < 0.2  # said right, written differently
+    assert vo.speech_error("मैं कुछ और ही बोल रहा हूँ", "पूरा पहाड़ golden हो गया") > 0.5
+    assert vo.speech_error("Today I am here", "Today I'm here") < 0.3
+
+
+def test_speech_start_detection():
+    room = [-62.0] * 20
+    assert vo.detect_speech(room + [-30.0, -28.0]) == 20
+    assert vo.detect_speech(room) is None
+    # talking from the very first moment is still speech (the room level is the quiet end)
+    assert vo.detect_speech([-30.0] * 10 + [-60.0] * 30) == 0
+    assert vo.detect_speech([-80.0] * 10 + [-70.0] * 5) is None  # very quiet, below the floor
+
+
+def test_end_of_speech_in_a_noisy_room():
+    room = [-62.0 + (i % 3) for i in range(30)]  # fan noise wobbling around -61 dB
+    speech = [-45.0 + (i % 5) for i in range(60)]
+    dbs, quiet = room + speech, 0.0
+    after = [-60.0, -58.5, -61.0, -59.0] * 10  # noise blips after speaking
+    stopped = None
+    for k, d in enumerate(after):
+        dbs.append(d)
+        quiet = vo.quiet_after(dbs, quiet, 0.05)
+        if quiet >= 1.4:
+            stopped = k
+            break
+    assert stopped is not None and stopped < 40
+    # still talking: never quiet
+    dbs, quiet = room + speech, 0.0
+    for d in speech:
+        dbs.append(d)
+        quiet = vo.quiet_after(dbs, quiet, 0.05)
+    assert quiet < 0.3
+
+
+def test_lines_grouped_into_passages():
+    segs = [{"text": "One short line.", "pause_after": 0.3}, {"text": "Two short line.", "pause_after": 0.3}, {"text": "Three.", "pause_after": 1.0},
+            {"text": "After a long pause.", "pause_after": 0.3}, {"text": "नमस्ते दोस्तों।", "pause_after": 0.3}]
+    plan = [{"lang": "en", "energy": 0.5}] * 4 + [{"lang": "hi", "energy": 0.5}]
+    ch = vo.group_lines(segs, plan)
+    assert [c["lines"] for c in ch] == [[0, 1, 2], [3], [4]]  # a long pause and a language change start new passages
+    assert ch[0]["text"] == "One short line. Two short line. Three." and ch[2]["lang"] == "hi"
+
+
+def test_split_points_find_the_breath():
+    t = np.arange(vo.SR * 2) / vo.SR
+    speech = (0.3 * np.sin(2 * np.pi * 150 * t)).astype(np.float32)
+    y = np.concatenate([speech, np.zeros(int(0.3 * vo.SR), np.float32), speech[: vo.SR]])  # 2 s, breath, 1 s
+    pts = vo.split_points(y, ["a much longer first sentence here", "short"])
+    assert pts[0] == 0 and pts[-1] == pytest.approx(len(y) / vo.SR)
+    assert 2.0 <= pts[1] <= 2.3  # inside the breath, not at the proportional guess
+
+
+def test_pauses_never_carry_a_piece_of_speech():
+    sr = vo.SR
+    rng = np.random.default_rng(0)
+    quiet = (rng.normal(0, 0.0008, sr)).astype(np.float32)  # a room, about -62 dB
+    talk = (0.2 * np.sin(2 * np.pi * 180 * np.arange(sr) / sr)).astype(np.float32)
+    # a recording with a real pause gives its room; one that is speech from end to end gives nothing
+    tone = vo.room_tone([np.concatenate([talk, quiet, talk]), talk])
+    assert len(tone) == sr // 5 and float(np.abs(tone).max()) < 0.01
+    assert len(vo.room_tone([talk, talk])) == 0
+    fill = vo.pause_fill(tone, sr // 2)
+    assert len(fill) == sr // 2 and 0 < float(np.abs(fill).max()) < 0.01
+    # a saved room tone that is really a bit of a word (from before the check) is not used: silence
+    bad = np.concatenate([quiet[: sr // 10], talk[: sr // 10]])
+    assert not vo.pause_fill(bad, sr // 2).any() and not vo.pause_fill(np.zeros(0, np.float32), 100).any()
+    assert len(vo.pause_fill(tone, 0)) == 0
+
+
+
+# ---------------------------------------------------------------- the pace of the voice
+
+
+def test_pauses_between_sentences_are_opened():
+    sr = vo.SR
+    word = (0.3 * np.sin(2 * np.pi * 200 * np.arange(sr) / sr)).astype(np.float32)  # 1 s of "speech"
+    y = np.concatenate([word, np.zeros(int(0.1 * sr), np.float32), word, word])  # a breath after the first sentence, none after the second
+    out, bounds = vo.open_pauses(y, [0.0, 1.05, 2.1, 3.1], 0.5, np.zeros(0, np.float32))
+    assert len(out) / sr == pytest.approx(3.1 + 0.4, abs=0.05)  # the breath is now half a second
+    assert bounds[1] == pytest.approx(1.25, abs=0.05) and bounds[2] == pytest.approx(2.5, abs=0.05) and bounds[-1] == pytest.approx(len(out) / sr, abs=0.01)
+    assert np.abs(out[int(1.05 * sr) : int(1.45 * sr)]).max() == 0 and np.abs(out[int(2.45 * sr) : int(2.55 * sr)]).max() > 0.2  # no silence put into speech
+    same, b = vo.open_pauses(word, [0.0, 1.0], 0.5, np.zeros(0, np.float32))
+    assert len(same) == len(word) and b == [0.0, 1.0]
+
+
+def test_a_narration_is_fitted_to_the_asked_length():
+    assert vo.fit_length(50.0, 5.0, 1.5, None) == (1.5, 1.0)
+    scale, speed = vo.fit_length(50.0, 5.0, 1.5, 60.0)  # 58.1 s by itself: the pauses give the rest
+    assert speed == 1.0 and 50.0 + 5.0 * scale + vo.END_GAP == pytest.approx(60.0)
+    scale, speed = vo.fit_length(50.0, 5.0, 1.5, 54.0)  # too long: shortest pauses, then a little faster
+    assert scale == pytest.approx(0.9) and 1.0 < speed <= 1.06 and 50.0 / speed + 5.0 * scale + vo.END_GAP == pytest.approx(54.0, abs=0.1)
+    scale, speed = vo.fit_length(50.0, 5.0, 1.5, 30.0)  # far too long: never more than 6% faster
+    assert speed == 1.06
+    assert vo.fit_length(50.0, 5.0, 1.0, 90.0) == (1.6, 0.94)  # far too short: never more than 6% slower
+    assert set(vo.PACES) == {"reference", "relaxed", "slow"} and vo.PACES["slow"][3] < vo.PACES["relaxed"][3] < 1.0
+
+
+def test_the_script_is_sized_to_what_the_voice_does(tmp_path, monkeypatch):
+    monkeypatch.setattr(vo, "voices_dir", lambda: tmp_path)
+    (tmp_path / "me").mkdir()
+    prof = {"name": "me", "refs": [], "stats": {"en": {"words_per_s": 3.5}}}
+    (tmp_path / "me" / "profile.json").write_text(json.dumps(prof))
+    assert sw.voice_wpm("me", "en") == pytest.approx(189) and sw.voice_wpm("me", "en", "relaxed") == pytest.approx(189 * 0.8)
+    prof["paces"] = {"en": {"relaxed": 160.0}}
+    (tmp_path / "me" / "profile.json").write_text(json.dumps(prof))
+    assert sw.voice_wpm("me", "en", "relaxed") == 160.0 and sw.voice_wpm("me", "en", "reference") == pytest.approx(200.0)  # (measured wins)
+    assert sw.voice_wpm("nobody", "en") is None
+    assert sw.target_words(120, "en", None, wpm_override=160.0) == 320  # two minutes at this voice's pace
+    # a script far over the length is written once more, and the closer one is kept
+    asked = []
+
+    def claude(prompt, model=None):
+        asked.append(prompt)
+        n = 120 if len(asked) == 1 else 78
+        return json.dumps({"title": "T", "segments": [{"text": " ".join(["word"] * n), "emotion": "neutral"}]})
+
+    monkeypatch.setattr(sw, "ask_claude", claude)
+    res = sw.write_script("a topic", str(tmp_path / "s"), seconds=30, pace_voice="me", pace="relaxed")
+    script = json.loads(open(res["script"]).read())
+    assert len(asked) == 2 and "has 120 words" in asked[1] and script["words"] == 78  # 30 s at 160 words a minute: 80 words
+
+
+def test_emphasis_words_are_found_and_said_with_weight(monkeypatch):
+    words = [[" Do", 0.0, 0.2], [" these", 0.2, 0.5], [" eight", 0.5, 0.9], [" things,", 0.9, 1.3], [" first.", 1.4, 1.9], [" Day", 2.0, 2.2], [" one!", 2.2, 2.6]]
+    assert vo.find_words(words, ["eight", "FIRST", "day one", "missing"]) == [(0.5, 0.9), (1.4, 1.9), (2.0, 2.6)]
+    assert vo.find_words(words, ["first", "eight"]) == [(1.4, 1.9)] and vo.find_words([], ["x"]) == []  # (in the order they are said)
+    monkeypatch.setattr(vo, "tempo", lambda y, f: np.repeat(y, 2)[: int(len(y) / f)])  # (stands in for ffmpeg)
+    sr = vo.SR
+    tone = lambda f: (0.2 * np.sin(2 * np.pi * f * np.arange(int(0.4 * sr)) / sr)).astype(np.float32)  # noqa: E731
+    gap = np.zeros(int(0.06 * sr), np.float32)
+    y = np.concatenate([tone(200), gap, tone(300), gap, tone(250)])
+    out = vo.stress(y, [(0.46, 0.86)], np.zeros(0, np.float32))  # the second "word"
+    speed, db_up, pause = vo.STRESS
+    assert len(out) / sr == pytest.approx(len(y) / sr + 0.4 / speed - 0.4 + pause, abs=0.03)  # slower, after a short pause
+    assert np.abs(out[int(0.65 * sr) : int(0.85 * sr)]).max() == pytest.approx(0.2 * 10 ** (db_up / 20), rel=0.05)  # and louder
+    assert np.abs(out[: int(0.38 * sr)] - y[: int(0.38 * sr)]).max() == 0  # nothing before it is touched
+    assert len(vo.stress(y, [(0.46, 0.47)], np.zeros(0, np.float32))) == len(y)  # too short to be a word: left alone
+    takes = {0: [{"cer": 0.0, "sim": 0.8, "emb": None, "cps": 14, "prange": 1.5, "heard": ""}, {"cer": 0.0, "sim": 0.8, "emb": None, "cps": 14, "prange": 2.1, "heard": ""}]}
+    assert vo.pick_takes([{}], takes, 2.0)[0]["prange"] == 2.1 and vo.pick_takes([{}], takes)[0]["prange"] == 1.5  # the livelier take, when asked

@@ -1,11 +1,11 @@
-FilmCraft
+EI, a modified version of FilmCraft (https://github.com/storytold/filmcraft)
 Copyright (c) 2026 ArtCraft Team and the FilmCraft contributors.
+Modifications (EI rebrand, AI menu, ai-engine/) by the EI contributors.
 Licensed under the MIT License or the Apache License, Version 2.0, at your option
 (LICENSE-MIT, LICENSE-APACHE).
 
-The ArtCraft name, wordmark and logos in docs/brand/ are trademarks of the ArtCraft Team. They are
-not open source and are not covered by the license above; their terms are in
-docs/brand/LICENSE-brand.txt.
+The ArtCraft name, wordmark and logos are trademarks of the ArtCraft Team. EI does not use them;
+upstream's brand files were removed from this modified version.
 
 Third-party material
 

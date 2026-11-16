@@ -5,3 +5,9 @@ plan/
 /log
 .DS_Store
 .claude/worktrees/
+# EI AI engine: Python environment, caches, test media, renders and plans (never commit media)
+ai-engine/.venv*/
+ai-engine/**/__pycache__/
+ai-engine/.pytest_cache/
+ai-engine/fixtures/
+ai-engine/**/*.work/

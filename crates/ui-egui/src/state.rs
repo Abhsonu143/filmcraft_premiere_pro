@@ -393,10 +393,10 @@ pub struct UiState {
     /// Collapsed effect sections in Effect Controls ("clip:index").
     pub collapsed_fx: Vec<String>,
     pub show_menu_bar: bool,
-    /// The header bar (Home, Import, Edit, Export, workspaces). An app that embeds FilmCraft can hide it.
+    /// The header bar (Home, Import, Edit, Export, workspaces). An app that embeds EI can hide it.
     #[serde(default = "shown")]
     pub show_header: bool,
-    /// The status bar (hints, messages, job progress). An app that embeds FilmCraft can hide it.
+    /// The status bar (hints, messages, job progress). An app that embeds EI can hide it.
     #[serde(default = "shown")]
     pub show_status_bar: bool,
     pub dark: bool,

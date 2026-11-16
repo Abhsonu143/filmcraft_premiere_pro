@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""ei_engine: the one entry point the EI app (AI menu) runs. Every subcommand logs progress lines
+to stderr ("[autocut] …") and ends by printing one line to stdout:
+
+    EI_RESULT {"ok": true, "outputs": [...], "otio": "...", "srt": "...", "out_dir": "..."}
+    EI_RESULT {"ok": false, "error": "..."}
+
+Subcommands (all paths absolute or relative to the current folder):
+    doctor                                   what is installed (python packages, ffmpeg features)
+    split     VIDEO --out-dir D [--clip-len 60] [--quality same|exact|high|medium|small]
+    music     --clips C... --music M --out O.mp4 [--length 30] [--aspect vertical] [--pace medium]
+    reference REF --clips C... --out O.mp4 [--aspect same]
+    talk      VIDEO --out O.mp4 [--preset long] [--captions] [--music M]
+    voiceover VOICE --clips C... --out O.mp4 [--script S] [--narration N] [--music M] [--captions] [--aspect horizontal]
+              the voiceover editor (narrate.py): picks which footage goes under which line
+    script-style SOURCES... --name N       learn a talking style from .txt/.srt/.vtt or YouTube links
+    script-write --topic T --out O [--language en|hi|hinglish] [--seconds 60] [--style N] [--backend claude|local]
+    voice-prompts / voice-mics / voice-record --out F / voice-enroll --name N [--files F...] [--takes T.json] / voice-list
+    speak     --voice N --script S --out O.wav   a script in your cloned voice (+ .narration.json); N = mac:<voice> for macOS voices
+              [--sound-design --music-source internet|folder|ai|none]   also "<O> - scored.wav": music per emotion, hits, risers
+    download  URL [--audio-only] [--out-dir D] [--items 1-20]   a YouTube playlist/video, highest quality (or audio only)
+    gameplay-plan RECORDINGS... --game G [--count 12] [--focus F] [--analyse-only]   what to publish from gameplay recordings
+    character --voice V --narration N [--video F] --out O [--character NAME] [--character-look studio|cutout|green]   an animated presenter
+    package   --clips C... --topic T [--hook H | --find-hook] [--platforms youtube shorts instagram reels] [--languages en hi]
+              thumbnails, titles, hooks and hashtags (a folder "<topic> - package")
+    social    accounts | connect youtube|meta|threads … | post --video V --targets … [--package P] [--at T] | run-due | list
+              post to YouTube, Instagram, Facebook and Threads (see social.py)
+    hooks-sync [--niches N...] [--geo IN US]   refresh the local hook library from what is hot (trends, top videos, Claude)
+    hooks-list [--topic T --niche N]            the best hooks for a video (offline), or the library's state
+    score     VOICE.wav --narration N.json --out O.wav   the sound design alone (or --narration X.score.json to mix an edited plan)
+    tv-scan FOLDER / tv-frame REC --out P.png / tv-calibrate REC --quad … --ref-t T
+    tv-make   CLIP --recordings FOLDER --out O.mp4 [--orientation horizontal|vertical]   clip on the TV, backlight matched
+    topic     TOPIC_OR_LINK [--seconds 60] [--voice N | --script-only] [--sources free youtube cards]   researched video
+    clips     VIDEO --out-dir D [--count 5] [--min 10] [--max 60] [--target 48] [--aspect vertical] [--llm KEY]
+    audio     FILE... [--format mp3|m4a|wav|aiff|flac|alac|opus|ogg] [--quality original|best|high|medium|small]
+    llm       [--set-default KEY]   the local language models and the saved default
+
+The engine runs as its own process: if it fails or is cancelled, the editor is unaffected.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import autocut as ac  # noqa: E402
+from autocut import AutocutError, log  # noqa: E402
+
+
+def result(**kw) -> None:
+    print("EI_RESULT " + json.dumps(kw), flush=True)
+
+
+def doctor() -> dict:
+    out: dict = {"python": sys.version.split()[0], "executable": sys.executable, "engine": str(Path(__file__).resolve().parent)}
+    pk = {}
+    for mod in ("numpy", "PIL", "opentimelineio", "mlx_whisper", "open_clip", "torch", "mlx_lm", "mlx_audio", "speechbrain", "yt_dlp"):
+        pk[mod] = importlib.util.find_spec(mod) is not None
+    out["packages"] = pk
+    ff = shutil.which("ffmpeg")
+    out["ffmpeg"] = ff
+    if ff:
+        enc = subprocess.run([ff, "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+        flt = subprocess.run([ff, "-hide_banner", "-filters"], capture_output=True, text=True).stdout
+        out["videotoolbox"] = "h264_videotoolbox" in enc
+        out["subtitles"] = " subtitles " in flt
+    # What each feature needs: the core features run with numpy alone; captions need Whisper,
+    # footage matching needs CLIP (both optional: features degrade, they don't fail).
+    out["ready"] = bool(ff) and pk["numpy"]
+    out["features"] = {
+        "split": bool(ff),
+        "music": bool(ff) and pk["numpy"],
+        "reference": bool(ff) and pk["numpy"],
+        "reference_visual_match": pk["open_clip"] and pk["torch"],
+        "talk": bool(ff),
+        "captions": pk["mlx_whisper"],
+        "voiceover": bool(ff) and pk["mlx_whisper"],
+        "otio": pk["opentimelineio"],
+        "voice_clone": pk["mlx_audio"],
+        "voice_check": pk["speechbrain"],
+        "scripts_claude": bool(shutil.which("claude") or Path("/opt/homebrew/bin/claude").is_file()),
+        "scripts_local": pk["mlx_lm"],
+        "youtube_styles": pk["yt_dlp"],
+    }
+    return out
+
+
+def otio_for(plan_path: Path) -> dict:
+    try:
+        import otio_export
+
+        o = otio_export.export_plan_file(plan_path)
+        srt = o.with_suffix(".srt")
+        return {"otio": str(o), **({"srt": str(srt)} if srt.is_file() else {})}
+    except AutocutError as e:  # OTIO is a bonus: the video is already rendered
+        log(f"OTIO export skipped: {e}")
+        return {}
+
+
+def run(argv: list[str]) -> dict:
+    if argv[:1] == ["social"]:  # (its own commands: accounts, connect, post, run-due, …)
+        import social
+
+        return social.handle(argv[1:])
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("doctor")
+    p = sub.add_parser("split")
+    p.add_argument("input")
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--clip-len", type=float, default=60.0)
+    p.add_argument("--quality", default="same", choices=["same", "exact", "high", "medium", "small"])
+    import director
+
+    director.add_music_args(sub.add_parser("music"), workers=False)  # same options as director.py
+    director.add_reference_args(sub.add_parser("reference"), workers=False)
+    import extract_audio
+    import highlights
+
+    highlights.add_args(sub.add_parser("clips", help="long video -> N short clips, each edited from several pieces"))
+    extract_audio.add_args(sub.add_parser("audio", help="save the sound of videos as audio files"))
+    import narrate
+    import script_writer
+    import topic_video
+    import tv_light
+    import voice
+
+    script_writer.add_args(sub, "script-")
+    tv_light.add_args(sub)
+    topic_video.add_args(sub.add_parser("topic", help="topic or link -> research -> script -> voice -> edited video"))
+    voice.add_args(sub)
+    import hooks
+
+    hooks.add_args(sub)
+    import yt_download
+
+    yt_download.add_args(sub.add_parser("download", help="a YouTube playlist or video in the highest quality, or only its audio"))
+    import character
+    import pause_repair
+    import plan_make
+    import presenter
+    import gameplay_plan
+
+    character.add_args(sub.add_parser("character", help="an animated 3D presenter that speaks a voiceover, over a video or as its own clip"))
+    presenter.add_args(sub.add_parser("presenter", help="your own camera as the presenter of a generated video: record its lines one by one"))
+    pause_repair.add_args(sub.add_parser("repair-pauses", help="a copy of a video folder with the sound taken out of the voice's pauses"))
+    plan_make.add_args(sub.add_parser("plan-make", help="make the video of a plan from Plan Videos (or of a new plan for what you ask)"))
+    gameplay_plan.add_args(sub.add_parser("gameplay-plan", help="plan videos from a list of gameplay recordings (analysed once, kept next to them)"))
+    import explainer
+
+    explainer.add_args(sub.add_parser("explain", help="an explainer video (coding, research, social…): researched and planned in chapters you can review, change and approve"))
+    import essay
+
+    essay.add_args(sub.add_parser("essay", help="a narrated video essay (a question, a comparison, an argument) made from your analysed recordings, in your voice"))
+    import thumbnails
+
+    thumbnails.add_args(sub.add_parser("package", help="thumbnails, titles, hooks and hashtags for YouTube and Instagram (English, Hindi)"))
+    import score
+
+    score.add_args(sub.add_parser("score", help="emotional sound design under a voice: music per mood, hits, risers, pauses"))
+    pl = sub.add_parser("llm", help="list language models / set the default")
+    pl.add_argument("--set-default")
+    p = sub.add_parser("talk")
+    p.add_argument("input")
+    p.add_argument("--out", required=True)
+    p.add_argument("--preset", default="long", choices=sorted(ac.PRESETS))
+    p.add_argument("--captions", action="store_true")
+    p.add_argument("--music")
+    p.add_argument("--resolution", default="1080p", choices=list(ac.RESOLUTIONS))
+    p = sub.add_parser("voiceover")
+    narrate.add_args(p)
+    p.add_argument("--preset", choices=sorted(ac.PRESETS), help="older option: short = vertical")
+    for sp in sub.choices.values():
+        sp.add_argument("--workers", type=int, default=2)
+    a = ap.parse_args(argv)
+
+    if a.cmd == "doctor":
+        return doctor()
+    if a.cmd == "clips":
+        return highlights.run_args(a)
+    if a.cmd == "audio":
+        return extract_audio.run_args(a)
+    if a.cmd.startswith("tv-"):
+        return tv_light.run_args(a)
+    if a.cmd == "topic":
+        return topic_video.run_args(a)
+    if a.cmd.startswith("script-"):
+        return script_writer.run_args(a)
+    if a.cmd.startswith("voice-") or a.cmd == "speak":
+        return voice.run_args(a)
+    if a.cmd == "score":
+        return score.run_args(a)
+    if a.cmd.startswith("hooks-"):
+        return hooks.run_args(a)
+    if a.cmd == "download":
+        return yt_download.run_args(a)
+    if a.cmd == "package":
+        return thumbnails.run_args(a)
+    if a.cmd == "gameplay-plan":
+        return gameplay_plan.run_args(a)
+    if a.cmd == "character":
+        return character.run_args(a)
+    if a.cmd == "presenter":
+        return presenter.run_args(a)
+    if a.cmd == "plan-make":
+        return plan_make.run_args(a)
+    if a.cmd == "explain":
+        return explainer.run_args(a)
+    if a.cmd == "essay":
+        return essay.run_args(a)
+    if a.cmd == "repair-pauses":
+        return pause_repair.run_args(a)
+    if a.cmd == "voiceover":
+        if getattr(a, "preset", None) == "short" and a.aspect == "horizontal":
+            a.aspect = "vertical"
+        return narrate.run_args(a)
+    if a.cmd == "llm":
+        import llm
+
+        if a.set_default:
+            llm.save_default(a.set_default)
+        cur = llm.load_settings().get("llm_model", llm.DEFAULT)
+        return {"default": cur, "models": {k: {"repo": v[0], "size": v[1], "license": v[2], "note": v[3]} for k, v in llm.MODELS.items()}}
+    if a.cmd == "split":
+        import split_video
+
+        files = split_video.split(a.input, a.out_dir, a.clip_len, a.quality)
+        return {"outputs": files, "out_dir": str(Path(a.out_dir).resolve())}
+
+    out = Path(a.out).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if a.cmd in ("music", "reference"):
+        import director
+
+        return director.run(a)
+    if a.cmd == "talk":
+        plan_path = out.with_name(out.stem + ".plan.json")
+        args = ["auto", a.input, "--preset", a.preset, "-o", str(plan_path), "--out", str(out), "--codec", "h264", "--resolution", a.resolution]
+        if a.captions:
+            args.append("--captions")
+        if a.music:
+            args += ["--music", a.music]
+        if ac.main(args) != 0:
+            raise AutocutError("talking-head edit failed (see the log above)")
+        return {"outputs": [str(out)], "plan": str(plan_path), "out_dir": str(out.parent), **otio_for(plan_path)}
+    raise AutocutError(f"unknown command {a.cmd}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        res = run(sys.argv[1:] if argv is None else argv)
+    except AutocutError as e:
+        log(f"error: {e}")
+        result(ok=False, error=str(e))
+        return 1
+    except SystemExit as e:  # argparse errors
+        if e.code not in (0, None):
+            result(ok=False, error="invalid arguments")
+        return int(e.code or 0)
+    except Exception as e:  # never leave the app waiting without an answer
+        log(f"unexpected error: {type(e).__name__}: {e}")
+        result(ok=False, error=f"{type(e).__name__}: {e}")
+        return 1
+    result(ok=True, **res)
+    return 0
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    sys.exit(main())

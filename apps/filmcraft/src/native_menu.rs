@@ -27,8 +27,8 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Sho
     let mut native: Vec<(String, MenuItem)> = Vec::new();
     let mut titles: Vec<(String, Submenu)> = Vec::new();
     let bar = Menu::new();
-    let app_menu = Submenu::new("FilmCraft", true);
-    // FilmCraft ▸ Settings ▸ <category> (Premiere's app-menu layout; General is Cmd+,)
+    let app_menu = Submenu::new("EI", true);
+    // EI ▸ Settings ▸ <category> (Premiere's app-menu layout; General is Cmd+,)
     let settings = Submenu::new(app.ui.language.tr("Settings"), true);
     titles.push(("Settings".into(), settings.clone()));
     for it in items.iter().filter(|i| i.id.starts_with("app.settings.")) {
@@ -38,8 +38,8 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Sho
         let _ = settings.append(&mi);
     }
     let _ = app_menu.append_items(&[
-        &MenuItem::with_id("app.about", "About FilmCraft", true, None),
-        &MenuItem::with_id("help.discord", "Join the ArtCraft Discord…", true, None),
+        &MenuItem::with_id("app.about", "About EI", true, None),
+        &MenuItem::with_id("ai.setup", "AI Engine Setup…", true, None),
         &PredefinedMenuItem::separator(),
         &settings,
         &PredefinedMenuItem::separator(),

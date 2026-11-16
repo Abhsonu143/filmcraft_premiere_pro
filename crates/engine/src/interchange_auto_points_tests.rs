@@ -216,3 +216,70 @@ fn relinking_later_resolves_the_anchor_that_waited_for_the_real_size() {
     assert_eq!(motion_point(&first_clip(&t, seq), "anchor"), Vec2::new(160.0, 90.0));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Files on disk, except that a movie can't be read whole: only through the in-place reader.
+struct NoWholeMovies(std::sync::atomic::AtomicUsize);
+impl crate::Services for NoWholeMovies {
+    fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        if path.ends_with(".mov") {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(std::io::Error::other(format!("{path}: read whole")));
+        }
+        crate::FsServices.read_file(path)
+    }
+    fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+        crate::FsServices.write_file(path, data)
+    }
+    fn file_size(&self, path: &str) -> std::io::Result<u64> {
+        crate::FsServices.file_size(path)
+    }
+    fn read_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        crate::FsServices.read_range(path, offset, len)
+    }
+    fn reader(&self, path: &str) -> Option<std::io::Result<filmcraft_media::SharedReader>> {
+        crate::FsServices.reader(path)
+    }
+}
+
+/// An edit's linked media is opened in place, never read whole: importing the edit of a 4-hour
+/// recording read the 17 GB file into memory twice (EI reached 34 GB).
+#[test]
+fn an_interchange_import_opens_linked_media_in_place() {
+    let d = tmp_dir("ix-in-place");
+    std::fs::create_dir_all(d.join("media")).unwrap();
+    make_movie(&d.join("media/shot.mov"), DemoScene::OceanSunset, 320, 180, 24);
+    let doc = d.join("cut.xml");
+    std::fs::write(&doc, xml_with_a_scale_only_motion_filter()).unwrap();
+    let files = std::sync::Arc::new(NoWholeMovies(std::sync::atomic::AtomicUsize::new(0)));
+    let mut s = Session { services: files.clone(), ..Default::default() };
+    let (r, seq) = import(&mut s, &doc);
+    assert_eq!(r["linkedMedia"], 1, "{r}");
+    assert_eq!(s.project.source_size(first_clip(&s, seq).item), Some((320, 180)));
+    assert_eq!(files.0.load(std::sync::atomic::Ordering::SeqCst), 0, "the movie was read whole");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Opt-in: EI_BIG_EDIT=/path/to/edit.otio imports a real (large) edit and reads pictures and sound
+/// across it, to measure memory (`/usr/bin/time -l` on the test binary).
+#[test]
+fn a_big_real_edit_opens_and_plays() {
+    let Ok(doc) = std::env::var("EI_BIG_EDIT") else { return };
+    let mut s = Session::default();
+    let t0 = std::time::Instant::now();
+    let r = s.execute("file.import", json!({"paths": [doc]})).unwrap();
+    eprintln!("imported in {:?}: {}", t0.elapsed(), r["documents"][0]);
+    let seq = ItemId(r["sequences"][0].as_u64().unwrap());
+    let items: Vec<ItemId> = s.project.items.values().filter(|i| i.as_media().is_some()).map(|i| i.id).collect();
+    for id in items {
+        let Some(src) = s.media.source_for(&s.project, id, &*s.services) else { continue };
+        let dur = src.info().duration.to_units_floor(48_000).max(0);
+        // pictures and 4 s of sound at 20 points across the whole recording
+        for k in 0..20i64 {
+            let at = dur * k / 20;
+            let _ = src.video_frame(filmcraft_media::FrameRequest { time: Tick::from_units(at, 48_000), scale: 0.25 });
+            let _ = src.audio(at, 48_000 * 4, 48_000);
+        }
+        eprintln!("read {} across {} s", s.project.item(id).map(|i| i.name.clone()).unwrap_or_default(), dur / 48_000);
+    }
+    assert!(s.project.sequence(seq).is_some());
+}

@@ -43,31 +43,35 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.ui.mode = crate::state::Mode::Edit;
         }
     }
-    // Community and project links.
+    // EI's AI tools, one click from the Home screen.
     let y = 90.0 + 150.0 + 36.0;
-    // ArtCraft wordmark (first-party trademark, docs/brand/), then the section title.
     let logo = crate::brand::paint_wordmark(ui, rect.min + vec2(24.0, y), 15.0, app.ui.dark);
     let tx = logo.map_or(rect.min.x + 24.0, |r| r.max.x + 12.0);
-    ui.painter().text(pos2(tx, rect.min.y + y), Align2::LEFT_CENTER, tl!("Community"), Tokens::semibold(15.0), t.text);
+    ui.painter().text(pos2(tx, rect.min.y + y), Align2::LEFT_CENTER, crate::i18n::t("AI"), Tokens::semibold(15.0), t.text);
     let mut x = rect.min.x + 24.0;
-    for (i, (id, label, url)) in crate::links::ALL.iter().take(4).enumerate() {
+    let tools = [
+        ("ai.music", "Auto Edit Clips to Music…", crate::icons::Icon::Audio),
+        ("ai.reference", "Edit Like a Reference Video…", crate::icons::Icon::Film),
+        ("ai.split", "Split Long Video into Clips…", crate::icons::Icon::Razor),
+        ("ai.talk", "Talking Head Auto-Cut…", crate::icons::Icon::Mic),
+    ];
+    for (i, (id, label, icon)) in tools.into_iter().enumerate() {
         let primary = i == 0;
-        let label = if primary { tl!("Join us on Discord") } else { crate::i18n::t(label) };
+        let label = crate::i18n::t(label);
         let g = ui.painter().layout_no_wrap(label.to_string(), Tokens::ui(13.0), t.text);
         let r = Rect::from_min_size(pos2(x, rect.min.y + y + 18.0), vec2(g.size().x + 44.0, 34.0));
-        let resp = ui.interact(r, egui::Id::new(("imp-link", *id)), Sense::click()).on_hover_text(*url);
-        app.auto.add(&format!("import.link.{}", id.trim_start_matches("help.")), r, label);
+        let resp = ui.interact(r, egui::Id::new(("imp-ai", id)), Sense::click());
+        app.auto.add(&format!("import.{id}"), r, label);
         let (bg, fg) = if primary {
             (if resp.hovered() { t.accent_hover } else { t.accent }, Color32::WHITE)
         } else {
             (if resp.hovered() { t.hover } else { t.tl_header_bg }, t.text)
         };
         ui.painter().rect_filled(r, 8.0, bg);
-        let icon = [crate::icons::Icon::Chat, crate::icons::Icon::Globe, crate::icons::Icon::Globe, crate::icons::Icon::Code][i];
         crate::icons::paint(ui.painter(), Rect::from_center_size(pos2(r.min.x + 20.0, r.center().y), vec2(16.0, 16.0)), icon, fg);
         ui.painter().galley(pos2(r.min.x + 34.0, r.center().y - g.size().y / 2.0), g, fg);
         if resp.clicked() {
-            crate::links::open(&ctx, url);
+            let _ = crate::menus::invoke(app, &ctx, id, json!({}));
         }
         x = r.max.x + 12.0;
     }
