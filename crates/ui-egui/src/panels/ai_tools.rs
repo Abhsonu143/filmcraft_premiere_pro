@@ -29,6 +29,10 @@
 //!   check?}`: the video of a plan from Plan Videos, or of a new plan written for what is asked; the result (`.otio` + `.srt`) opens in
 //!   the timeline. `fix`: what is wrong with the video made before (corrected in the plan, then made again); `captionFix`: caption words
 //!   corrected in this and every later make; `check`: nothing is made, the finished video is checked (`check.txt` next to it).
+//! - `ai.essay {input (plans.json of Plan Videos), topic (the idea: a question, a comparison, an argument), seconds?=360, language?,
+//!   essayTo?=plan|video, essayNotes?, voice?, takes?, speechPace?, tallFrame?, frameOpacity?, frameBlur?, essayCaptions?=voice|all|none,
+//!   gameSound?=-24 (dB under the voice), music?, fresh?}`: a narrated video essay from the analysed recordings (nothing is analysed
+//!   again): Claude lays out the argument, picks the shots for each spoken line and the game's own lines to play in the clear.
 //! - `ai.explain {topic (what to explain), hints?, explainKind?=auto|coding|technical|research|science|history|social|political|business|general,
 //!   seconds?=360, language?, to?=plan|script|video, review?=true, approve?, explainNotes? (one per line; "3: …" is chapter 3),
 //!   noteFor?=auto|plan|script, voice?, takes?, speechPace?, design?=clean|dark|viral, aspect?, explainCaptions?=auto|sentence|words|none,
@@ -100,6 +104,7 @@ pub enum Kind {
     Repair,
     PlanMake,
     Explain,
+    Essay,
 }
 
 impl Kind {
@@ -122,6 +127,7 @@ impl Kind {
             Kind::Package => "package",
             Kind::Repair => "repair",
             Kind::PlanMake => "planMake",
+            Kind::Essay => "essay",
             Kind::Explain => "explain",
         }
     }
@@ -144,6 +150,7 @@ impl Kind {
             "ai.package" => Kind::Package,
             "ai.repair" => Kind::Repair,
             "ai.planMake" => Kind::PlanMake,
+            "ai.essay" => Kind::Essay,
             "ai.explain" => Kind::Explain,
             _ => return None,
         })
@@ -167,6 +174,7 @@ impl Kind {
             Kind::Package => "Thumbnails, Titles & Hashtags",
             Kind::Repair => "Repair Sounds in Pauses",
             Kind::PlanMake => "Make Video from Plan",
+            Kind::Essay => "Video Essay from Recordings",
             Kind::Explain => "Explainer Video",
         }
     }
@@ -177,7 +185,7 @@ impl Kind {
             Kind::Clips => "Long video",
             Kind::Tv => "Your clip",
             Kind::Repair => "Video folder",
-            Kind::PlanMake => "Plans file",
+            Kind::PlanMake | Kind::Essay => "Plans file",
             _ => "Video",
         }
     }
@@ -292,6 +300,11 @@ struct Draft {
     tall_frame: bool,
     frame_opacity: f64,
     frame_blur: f64,
+    /// Video Essay from Recordings: how far to go (plan | video), notes on the plan, whose lines get captions, the game's level under the voice (dB).
+    essay_to: &'static str,
+    essay_notes: String,
+    essay_captions: &'static str,
+    essay_game_db: f64,
     fresh: bool,
     /// Video from Topic: what the creator is looking for (research and script follow it).
     hints: String,
@@ -520,7 +533,7 @@ impl Draft {
             mono: false,
             normalize: false,
             captions: kind == Kind::Topic,
-            import: !matches!(kind, Kind::Split | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Explain),
+            import: !matches!(kind, Kind::Split | Kind::Audio | Kind::Script | Kind::Voice | Kind::Topic | Kind::Explain | Kind::Essay),
             error: String::new(),
             describe: "local",
             ambience: true,
@@ -530,7 +543,7 @@ impl Draft {
             audience: String::new(),
             notes: String::new(),
             language: "hinglish",
-            seconds: if kind == Kind::Explain { 360.0 } else { 60.0 },
+            seconds: if matches!(kind, Kind::Explain | Kind::Essay) { 360.0 } else { 60.0 },
             style: String::new(),
             style_sources: Vec::new(),
             style_links: String::new(),
@@ -554,6 +567,10 @@ impl Draft {
             tall_frame: false,
             frame_opacity: 35.0,
             frame_blur: 50.0,
+            essay_to: "plan",
+            essay_notes: String::new(),
+            essay_captions: "voice",
+            essay_game_db: -24.0,
             fresh: false,
             hints: String::new(),
             plan_pick: String::new(),
@@ -745,6 +762,14 @@ impl Draft {
         }
         if let Some(v) = p.get("frameBlur").and_then(Value::as_f64) {
             d.frame_blur = v.clamp(0.0, 100.0).round();
+        }
+        d.essay_to = pick("essayTo", &ESSAY_STEPS.map(|a| a.0), d.essay_to);
+        d.essay_captions = pick("essayCaptions", &ESSAY_CAPTIONS.map(|a| a.0), d.essay_captions);
+        if let Some(v) = p.get("essayNotes").and_then(Value::as_str) {
+            d.essay_notes = v.to_string();
+        }
+        if let Some(v) = p.get("gameSound").and_then(Value::as_f64) {
+            d.essay_game_db = v.clamp(-60.0, 0.0).round();
         }
         d.fresh = flag("fresh", d.fresh);
         if let Some(v) = s("hints") {
@@ -953,6 +978,10 @@ impl Draft {
         m.insert("tallFrame".into(), json!(self.tall_frame));
         m.insert("frameOpacity".into(), json!(self.frame_opacity));
         m.insert("frameBlur".into(), json!(self.frame_blur));
+        m.insert("essayTo".into(), json!(self.essay_to));
+        m.insert("essayNotes".into(), json!(self.essay_notes));
+        m.insert("essayCaptions".into(), json!(self.essay_captions));
+        m.insert("gameSound".into(), json!(self.essay_game_db));
         m.insert("fresh".into(), json!(self.fresh));
         m.insert("hints".into(), json!(self.hints));
         m.insert("pick".into(), json!(self.plan_pick));
@@ -1506,6 +1535,48 @@ impl Draft {
                     push(&mut a, "--captions", self.explain_captions);
                     push(&mut a, "--clips", self.explain_clips);
                     if !self.music.trim().is_empty() {
+                        push(&mut a, "--music", self.music.trim());
+                    }
+                }
+            }
+            Kind::Essay => {
+                if self.topic.trim().is_empty() {
+                    return Err("Say what the essay is about: a question, a comparison, an argument.".into());
+                }
+                if !(60.0..=2400.0).contains(&self.seconds) {
+                    return Err("Length must be 1 to 40 minutes.".into());
+                }
+                let video = self.essay_to == "video";
+                if video && self.voice.trim().is_empty() {
+                    return Err("Choose the voice for the video (or go only as far as the plan).".into());
+                }
+                a = vec!["essay".into(), self.topic.trim().into(), "--plans".into(), self.input.trim().into()];
+                push(&mut a, "--minutes", &format!("{}", (self.seconds / 6.0).round() / 10.0));
+                push(&mut a, "--language", self.language);
+                push(&mut a, "--to", self.essay_to);
+                if !self.essay_notes.trim().is_empty() {
+                    push(&mut a, "--notes", self.essay_notes.trim());
+                }
+                if self.fresh {
+                    a.push("--fresh".into());
+                }
+                if video {
+                    push(&mut a, "--voice", self.voice.trim());
+                    if !self.voice.starts_with("mac") {
+                        push(&mut a, "--takes", &format!("{}", self.takes.round()));
+                        push(&mut a, "--speech-pace", self.speech_pace);
+                    }
+                    if self.tall_frame {
+                        a.push("--tall".into());
+                        push(&mut a, "--frame-opacity", &format!("{}", self.frame_opacity.clamp(0.0, 100.0).round()));
+                        push(&mut a, "--frame-blur", &format!("{}", self.frame_blur.clamp(0.0, 100.0).round()));
+                    }
+                    push(&mut a, "--captions", self.essay_captions);
+                    push(&mut a, "--game-sound", &format!("{}", self.essay_game_db.clamp(-60.0, 0.0).round()));
+                    if !self.music.trim().is_empty() {
+                        if !exists(&self.music) {
+                            return Err("The music file does not exist.".into());
+                        }
                         push(&mut a, "--music", self.music.trim());
                     }
                 }
@@ -2142,6 +2213,9 @@ const EXPLAIN_LOOKS: [(&str, &str); 3] = [
 ];
 const EXPLAIN_CAPTIONS: [(&str, &str); 4] =
     [("auto", "As the look has them"), ("sentence", "A line at the bottom"), ("words", "Big, word by word"), ("none", "No captions")];
+const ESSAY_STEPS: [(&str, &str); 2] = [("plan", "The plan (to read and change first)"), ("video", "The video")];
+const ESSAY_CAPTIONS: [(&str, &str); 3] =
+    [("voice", "Your lines only (the game usually shows its own subtitles)"), ("all", "Your lines and the game's lines"), ("none", "No captions")];
 const TOPIC_IMAGE_EXT: [&str; 8] = ["jpg", "jpeg", "png", "webp", "heic", "tif", "tiff", "bmp"];
 const EXPLAIN_SOURCES: [(&str, &str); 3] = [
     ("any", "From any public page: one sentence, marked, with credit"),
@@ -2205,6 +2279,7 @@ fn default_output(d: &Draft) -> String {
         Kind::Hooks => String::new(),    // the library has one place (Application Support/EI/hooks)
         Kind::Repair => String::new(),   // a copy next to the folder ("<folder> - fixed")
         Kind::PlanMake => String::new(), // a folder per video in "videos" next to the plans file
+        Kind::Essay => String::new(),    // a folder per essay in "essays" next to the plans file
         Kind::Explain => String::new(),  // the engine names the folder after what is explained (Movies/EI/Explainers/…)
         Kind::Package => movies_dir().join("Thumbnails").to_string_lossy().to_string(),
         // the folder chosen last time (a playlist gets a folder of its own inside it)
@@ -3497,6 +3572,10 @@ fn draft_job(d: &mut Draft) -> Result<(String, Vec<Vec<String>>, PathBuf), Strin
             };
             format!("{} ({what}): {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>())
         }
+        Kind::Essay => {
+            let what = if !d.essay_notes.trim().is_empty() { "your notes" } else { d.essay_to };
+            format!("{} ({what}): {}", d.kind.title(), d.topic.trim().chars().take(40).collect::<String>())
+        }
         Kind::PlanMake => {
             let corrected = !d.plan_fix.trim().is_empty() || !d.plan_caption_fix.trim().is_empty();
             let n = plan_picks(&d.plan_pick).len();
@@ -4019,6 +4098,117 @@ fn saved_explainers() -> Vec<(String, String, String)> {
     found.into_iter().map(|f| f.1).take(60).collect()
 }
 
+/// The Video Essay from Recordings rows. Returns true when the music file should be chosen.
+fn essay_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> bool {
+    let mut choose_music = false;
+    ui.label("The idea");
+    let r = ui.add(
+        egui::TextEdit::multiline(&mut d.topic)
+            .hint_text("a question, a comparison, an argument, in your own words or pasted, e.g.\nJin broke his code to save others. Is Atsu breaking hers only to avenge the past?")
+            .desired_rows(4)
+            .desired_width(430.0),
+    );
+    elems.push((format!("{p}.topic"), r.rect, d.topic.clone()));
+    ui.end_row();
+    ui.label("Length (minutes)");
+    ui.horizontal(|ui| {
+        let mut minutes = d.seconds / 60.0;
+        let r = ui.add(egui::DragValue::new(&mut minutes).range(1.0..=40.0).speed(0.1).max_decimals(0));
+        d.seconds = minutes * 60.0;
+        elems.push((format!("{p}.minutes"), r.rect, minutes.to_string()));
+        for v in [3.0, 6.0, 10.0] {
+            let label = format!("{v} min");
+            let b = ui.small_button(&label);
+            elems.push((format!("{p}.minutes.{}", v as u32), b.rect, label));
+            if b.clicked() {
+                d.seconds = v * 60.0;
+            }
+        }
+    });
+    ui.end_row();
+    ui.label("Language of your voice");
+    radio_row(ui, &mut d.language, &SCRIPT_LANGUAGES, &format!("{p}.language"), elems);
+    ui.end_row();
+    ui.label("Go as far as");
+    ui.vertical(|ui| {
+        radio_row(ui, &mut d.essay_to, &ESSAY_STEPS, &format!("{p}.to"), elems);
+        ui.label(
+            egui::RichText::new("The plan is essay.md in a folder “essays” next to the plans file. The same idea goes on with the same plan.").small().weak(),
+        );
+    });
+    ui.end_row();
+    ui.label("Your notes");
+    ui.vertical(|ui| {
+        let r = ui.add(
+            egui::TextEdit::multiline(&mut d.essay_notes)
+                .hint_text("what to change in the plan that is there, e.g.\nchapter 2: open on the duel, not the ride\nless about Jin, more about Jubei")
+                .desired_rows(3)
+                .desired_width(430.0),
+        );
+        elems.push((format!("{p}.notes"), r.rect, d.essay_notes.clone()));
+    });
+    ui.end_row();
+    if d.essay_to == "video" {
+        ui.label("Voiceover");
+        let mut voices: Vec<(String, String)> = saved_voices().into_iter().map(|v| (v.clone(), format!("{v} (your clone)"))).collect();
+        for (k, l) in MAC_VOICES {
+            voices.push((k.to_string(), l.to_string()));
+        }
+        let shown = voices.iter().find(|v| v.0 == d.voice).map(|v| v.1.clone()).unwrap_or_else(|| "Choose a voice…".into());
+        let r = egui::ComboBox::from_id_salt(format!("{p}.voice")).selected_text(shown.clone()).width(330.0).show_ui(ui, |ui| {
+            for (k, l) in &voices {
+                let o = ui.selectable_value(&mut d.voice, k.clone(), l);
+                elems.push((format!("{p}.voice.{k}"), o.rect, l.clone()));
+            }
+        });
+        elems.push((format!("{p}.voice"), r.response.rect, shown));
+        ui.end_row();
+        if !d.voice.starts_with("mac") && !d.voice.is_empty() {
+            ui.label("Takes per line");
+            let r = ui.add(egui::DragValue::new(&mut d.takes).range(1.0..=4.0).speed(0.05).max_decimals(0));
+            elems.push((format!("{p}.takes"), r.rect, d.takes.to_string()));
+            ui.end_row();
+            ui.label("Speaking pace");
+            combo_row(ui, &mut d.speech_pace, &SPEECH_PACES, &format!("{p}.speechPace"), elems);
+            ui.end_row();
+        }
+        ui.label("Shape");
+        ui.vertical(|ui| {
+            let r = ui.checkbox(&mut d.tall_frame, "Deliver it tall (9:16): the wide picture across the middle, the same picture dimmed behind it");
+            elems.push((format!("{p}.tallFrame"), r.rect, d.tall_frame.to_string()));
+            if d.tall_frame {
+                ui.horizontal(|ui| {
+                    ui.label("Picture behind shows at");
+                    let r = ui.add(egui::Slider::new(&mut d.frame_opacity, 0.0..=100.0).suffix(" %").max_decimals(0));
+                    elems.push((format!("{p}.frameOpacity"), r.rect, d.frame_opacity.to_string()));
+                    ui.label("blurred");
+                    let r = ui.add(egui::Slider::new(&mut d.frame_blur, 0.0..=100.0).suffix(" %").max_decimals(0));
+                    elems.push((format!("{p}.frameBlur"), r.rect, d.frame_blur.to_string()));
+                });
+            }
+        });
+        ui.end_row();
+        ui.label("Captions");
+        combo_row(ui, &mut d.essay_captions, &ESSAY_CAPTIONS, &format!("{p}.captions"), elems);
+        ui.end_row();
+        ui.label("Game sound under your voice");
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::Slider::new(&mut d.essay_game_db, -60.0..=-6.0).suffix(" dB").max_decimals(0));
+            elems.push((format!("{p}.gameSound"), r.rect, d.essay_game_db.to_string()));
+            ui.label(egui::RichText::new("(-60: silent; the game's own lines always play at full level)").weak());
+        });
+        ui.end_row();
+        ui.label("Music (optional)");
+        choose_music = path_row(ui, &mut d.music, &format!("{p}.music"), "a song, or any video: its sound is laid quietly under the voice", elems);
+        ui.end_row();
+    }
+    ui.label("Start over");
+    let r = ui.checkbox(&mut d.fresh, "Plan it anew (drops the plan of this idea)");
+    elems.push((format!("{p}.fresh"), r.rect, d.fresh.to_string()));
+    ui.end_row();
+    choose_music
+}
+
 /// The Explainer Video rows. Returns what should be chosen from disk (the music, or the folder of own pictures), if asked.
 fn explain_rows(ui: &mut egui::Ui, d: &mut Draft, p: &str, elems: &mut Vec<(String, egui::Rect, String)>) -> Option<Pick> {
     let mut choose = None;
@@ -4491,7 +4681,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         ui.label(d.kind.input_label());
                         let hint = match d.kind {
                             Kind::Repair => "the folder of a video made by EI (or a file in it)",
-                            Kind::PlanMake => "the plans.json made by Plan Videos",
+                            Kind::PlanMake | Kind::Essay => "the plans.json made by Plan Videos",
                             _ => "a file",
                         };
                         if path_row(ui, &mut d.input, &format!("{p}.input"), hint, &mut elems) {
@@ -4724,6 +4914,11 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                         Kind::Hooks => hooks_rows(ui, &mut d, &p, &mut elems),
                         Kind::Repair => {}
                         Kind::PlanMake => plan_rows(ui, &mut d, &p, &mut elems),
+                        Kind::Essay => {
+                            if essay_rows(ui, &mut d, &p, &mut elems) {
+                                pick = Some(Pick::Music);
+                            }
+                        }
                         Kind::Explain => {
                             if let Some(asked) = explain_rows(ui, &mut d, &p, &mut elems) {
                                 pick = Some(asked);
@@ -5320,7 +5515,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             CharacterAsk::Nothing => {}
                         }
                     }
-                    if !matches!(d.kind, Kind::Voice | Kind::Hooks | Kind::Repair | Kind::PlanMake) {
+                    if !matches!(d.kind, Kind::Voice | Kind::Hooks | Kind::Repair | Kind::PlanMake | Kind::Essay) {
                         let folder_out =
                             matches!(d.kind, Kind::Split | Kind::Clips | Kind::Audio | Kind::Topic | Kind::Tv | Kind::Download | Kind::Package | Kind::Explain) || planning;
                         ui.label(if folder_out { "Output folder" } else { "Save as" });
@@ -5385,6 +5580,9 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Kind::Explain if d.explain_to == "plan" => "Research and Plan",
                     Kind::Explain if d.explain_to == "script" => "Write the Script",
                     Kind::Explain => "Make Video",
+                    Kind::Essay if !d.essay_notes.trim().is_empty() => "Change the Plan",
+                    Kind::Essay if d.essay_to == "plan" => "Write the Plan",
+                    Kind::Essay => "Make Video",
                     Kind::PlanMake if d.plan_check => "Check Video",
                     Kind::PlanMake if !d.plan_fix.trim().is_empty() || !d.plan_caption_fix.trim().is_empty() => "Correct and Make Again",
                     Kind::PlanMake => "Make Video",
@@ -5432,7 +5630,7 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if let Some(pk) = pick {
         let video: Vec<&str> = VIDEO_EXT.to_vec();
         match pk {
-            Pick::Input if d.kind == Kind::PlanMake => {
+            Pick::Input if matches!(d.kind, Kind::PlanMake | Kind::Essay) => {
                 if let Some(f) = app.hooks.pick_open_file.as_mut().and_then(|f| f("Plans", &["json"])) {
                     d.input = f;
                 }
@@ -5570,6 +5768,10 @@ fn show_draft(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 if d.kind == Kind::Topic {
                     d.topic.clear(); // ready for the next topic
                     d.hook_line.clear();
+                }
+                if d.kind == Kind::Essay {
+                    d.essay_notes.clear(); // (the idea stays: the next step is of the same essay)
+                    d.fresh = false;
                 }
                 if d.kind == Kind::Explain {
                     // what it explains stays (the next step is of the same video); notes and the approval were for this run
@@ -6224,6 +6426,9 @@ fn description(kind: Kind) -> &'static str {
         }
         Kind::Explain => {
             "Say what you want to explain: code, a technical idea, research, a social or political question. Claude researches it and plans chapters, each claim with its source (quoted sentences are looked up in their pages). You can read and approve the plan and the script, or change them with notes. The video is drawn from the script; every chapter also works alone and is saved as a clip."
+        }
+        Kind::Essay => {
+            "A narrated video essay (a question, a comparison, an argument) from recordings Plan Videos has analysed: nothing is analysed again. Claude lays out the argument, picks the shots for each line you say, and plays the game's own lines in the clear. Read the plan first, change it with notes, then make the video in your voice."
         }
         Kind::PlanMake => {
             "Makes the video of a plan from Plan Videos. Choose the plans file and a plan, or say in your own words what video you want: it is then planned from what happens in the recordings (their analysis, kept next to them) and added to the plans. Claude reads each stretch of the plan in detail and chooses the exact cuts: no line is cut in the middle, and menus, loading, deaths and wandering are left out. Shorts and Reels are made vertical with the hook and captions; long videos are joined as they are, with chapters. The cuts are saved in the plans file and can be changed there. Every finished Short is checked against its own sound. Found something wrong in a video? Choose its plan and say what is wrong, or correct caption words (wrong => right): only that is changed, the video is made again, and the correction stays in the plan. “Only check” looks at a finished video again and writes what it finds, with every caption to read, to check.txt next to it. The recordings are never changed."
@@ -7241,6 +7446,33 @@ mod tests {
             let mut b = Draft::from_params(kind, &a.to_params());
             assert_eq!(b.engine_args().unwrap(), first, "{kind:?} keeps every setting through the queue");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn essay_arguments() {
+        let dir = std::env::temp_dir().join("ei-essay-args-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let plans = dir.join("plans.json");
+        std::fs::write(&plans, b"{}").unwrap();
+        let file = plans.to_string_lossy().to_string();
+        let mut d = Draft::from_params(Kind::Essay, &json!({"input": file, "topic": " Is Atsu the next Ghost? ", "language": "hi", "seconds": 240}));
+        assert_eq!(d.engine_args().unwrap(), ["essay", "Is Atsu the next Ghost?", "--plans", &file, "--minutes", "4", "--language", "hi", "--to", "plan"]);
+        let mut v = Draft::from_params(
+            Kind::Essay,
+            &json!({"input": file, "topic": "x", "essayTo": "video", "voice": "nxstory-a1", "tallFrame": true, "frameOpacity": 30, "frameBlur": 60,
+                    "essayCaptions": "all", "gameSound": -30, "essayNotes": "open on the duel", "fresh": true}),
+        );
+        let args = v.engine_args().unwrap().join(" ");
+        assert!(args.ends_with(
+            "--to video --notes open on the duel --fresh --voice nxstory-a1 --takes 2 --speech-pace relaxed --tall --frame-opacity 30 --frame-blur 60 --captions all --game-sound -30"
+        ), "{args}");
+        let mut back = Draft::from_params(Kind::Essay, &v.to_params());
+        assert_eq!(back.engine_args().unwrap(), v.engine_args().unwrap());
+        assert!(Draft::from_params(Kind::Essay, &json!({"input": file, "topic": " "})).engine_args().is_err());
+        assert!(Draft::from_params(Kind::Essay, &json!({"input": file, "topic": "x", "essayTo": "video"})).engine_args().is_err()); // (a video needs a voice)
+        assert!(Draft::from_params(Kind::Essay, &json!({"topic": "x"})).engine_args().is_err()); // (no plans file)
+        assert_eq!(Kind::from_command("ai.essay"), Some(Kind::Essay));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

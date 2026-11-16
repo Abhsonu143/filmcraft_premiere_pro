@@ -157,6 +157,9 @@ def run(argv: list[str]) -> dict:
     import explainer
 
     explainer.add_args(sub.add_parser("explain", help="an explainer video (coding, research, social…): researched and planned in chapters you can review, change and approve"))
+    import essay
+
+    essay.add_args(sub.add_parser("essay", help="a narrated video essay (a question, a comparison, an argument) made from your analysed recordings, in your voice"))
     import thumbnails
 
     thumbnails.add_args(sub.add_parser("package", help="thumbnails, titles, hooks and hashtags for YouTube and Instagram (English, Hindi)"))
@@ -211,6 +214,8 @@ def run(argv: list[str]) -> dict:
         return plan_make.run_args(a)
     if a.cmd == "explain":
         return explainer.run_args(a)
+    if a.cmd == "essay":
+        return essay.run_args(a)
     if a.cmd == "repair-pauses":
         return pause_repair.run_args(a)
     if a.cmd == "voiceover":

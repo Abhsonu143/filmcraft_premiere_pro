@@ -311,3 +311,29 @@ is committed and left as it is, off by default. Do not continue either without t
 - Not done yet: code other than Python is not run; no sound effects; `voice.speak` logs “emphasis left out (KeyError: 'en')”
   for a Hindi-only voice when a line has an English emphasis word; other tools' Hindi cards (`topic_video.make_card`) still use the unshaped drawing.
 - Same commit: the interface has a Devanagari fallback font (`cjk.rs`), and Voice Clone's helper jobs are quiet (`start_quiet_job`).
+
+## Video Essay from Recordings (2026-11-16)
+
+AI menu → "Video Essay from Recordings…" (`ai.essay`, CLI `ei_engine.py essay "<idea>" --plans <plans.json>`).
+An idea (a question, a comparison, an argument) becomes a narrated essay from recordings that Plan Videos
+already analysed. Nothing is analysed again.
+
+- Step 1, outline: Claude reads the idea, the game research (kept weekly) and every recording in rough steps;
+  names chapters and the stretches worth reading closely (at most 7 min each, 70 min in all).
+- Step 2, script: it reads those stretches every 5 s with every line said, and writes beats. A beat is
+  `say` (one line of the owner's voice + 1-2 shots) or `play` (a line of the game, whole, at full level).
+  What the idea claims but the recordings do not show is listed as doubts ("For you to decide or check").
+- `essay.md` to read, `essay.json` to change by hand; `--notes` changes only what the notes ask.
+  The folder is `essays/<idea>` next to the plans file; the same idea goes on with the same plan.
+- Video: voice spoken once (`voice.speak`), each line shown over its shots exactly as long as it is said,
+  game sound under the voice (`--game-sound`, dB), no second of a recording shown twice. Wide, or `--tall`.
+
+Built as units for other tools:
+- `recordings.Library(plans_files)`: the analysed recordings of one or more plans files as R1, R2 …
+  (`digests`, `detail`, `lines`, `whole`, `research`). A second plans file (Tsushima, once it is back from
+  the archive and analysed) is just one more entry in `--plans`; the window takes one file for now.
+- `pieces.render(pieces, voice, out, …)`: pieces of recordings + parts of a voice file → a video. Frame-exact
+  cuts, sound written to disk piece by piece (never a whole recording in memory), ducking, captions, music, tall frame.
+- `essay.py` only plans and calls those two, `voice.speak` and `captions.build_ass`.
+
+Not done: several plans files in the window; a review of each shot by looking at its frame before the video.
